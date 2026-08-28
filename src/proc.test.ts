@@ -121,6 +121,34 @@ describe("proc (RF-010)", () => {
     expect(await alive(pid)).toBe(false);
   });
 
+  test("cancelling in the same tick as the spawn still kills the agent", async () => {
+    // Regression: node calls setsid() in the child between fork and exec, so
+    // for a moment after spawn `-pid` names a process group that is not ours
+    // and process.kill(-pid) fails EPERM. That threw out of cancel() and left
+    // the agent running unsupervised — reachable in production whenever a
+    // cancel arrives while the run's worktree is still being set up.
+    // Looped because the window is short: one iteration would rarely hit it.
+    for (let i = 0; i < 25; i++) {
+      const dir = tmp();
+      const handle = launch(opts(dir, ["sh", "-c", "sleep 30"]));
+      const pid = handle.pid!;
+      expect(() => handle.cancel()).not.toThrow();
+      const result = await handle.exited;
+      expect(result.outcome).toBe("cancelled");
+      expect(groupAlive(pid)).toBe(false);
+      expect(await alive(pid)).toBe(false);
+    }
+  }, 30_000);
+
+  test("killGroup reports EPERM as 'not our group', never throws", async () => {
+    // The daemon's own process group is signallable by us, so it cannot stand
+    // in for the EPERM case; what matters is that the classification exists and
+    // that an unknown pid is simply reported as gone rather than raising.
+    const unused = 0x7ffffff0;
+    expect(killGroup(unused, "SIGTERM")).toBe(false);
+    expect(groupAlive(unused)).toBe(false);
+  });
+
   test("the first cause wins: a later signal does not rewrite the outcome", async () => {
     const dir = tmp();
     const handle = launch(opts(dir, ["sh", "-c", "sleep 30"]));

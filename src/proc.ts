@@ -46,8 +46,19 @@ export interface LaunchOptions {
 export const DEFAULT_KILL_GRACE_MS = 5_000;
 
 /**
- * Signal a whole process group, tolerating a group that has already gone.
- * Returns false when the group no longer exists.
+ * Signal a whole process group. Returns false when the signal did not land.
+ *
+ * Two failures are expected rather than exceptional, and both mean "there is no
+ * group of ours to signal":
+ *
+ * - ESRCH — the group is gone; the run already exited.
+ * - EPERM — `-pid` names a group we may not signal. This is the setsid window:
+ *   node calls setsid() in the child between fork and exec, so for a moment
+ *   after spawn the child is NOT yet its own group leader and `pid` refers to
+ *   some other process group entirely. Callers must fall back to signalling the
+ *   child directly, which is always correct — and sufficient, because inside
+ *   that window the child has not exec'd the agent yet and therefore has no
+ *   descendants to reap.
  */
 export function killGroup(
   pid: number,
@@ -58,7 +69,7 @@ export function killGroup(
     return true;
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
-    if (e.code === "ESRCH") return false;
+    if (e.code === "ESRCH" || e.code === "EPERM") return false;
     throw err;
   }
 }
@@ -118,15 +129,33 @@ export function launch(opts: LaunchOptions): ProcHandle {
     resolve(result);
   };
 
+  /**
+   * Signal the run: the whole group where we have one, and always the child
+   * itself. The direct kill is the fallback for the setsid window described on
+   * killGroup — without it, a cancel arriving in the moments after spawn threw
+   * EPERM and left the agent running with nobody supervising it.
+   */
+  const signalRun = (signal: NodeJS.Signals) => {
+    const pid = child.pid;
+    if (pid === undefined) return;
+    killGroup(pid, signal);
+    try {
+      child.kill(signal);
+    } catch {
+      // Already gone. The exit handler settles the run.
+    }
+  };
+
+  let terminating = false;
   const terminate = (outcome: Outcome) => {
     if (settled) return;
     pending ??= outcome;
-    const pid = child.pid;
-    if (pid === undefined) return;
-    killGroup(pid, "SIGTERM");
+    if (terminating) return;
+    terminating = true;
+    signalRun("SIGTERM");
     // Escalate: an agent that ignores SIGTERM must not survive us.
     graceTimer = setTimeout(() => {
-      if (!settled) killGroup(pid, "SIGKILL");
+      if (!settled) signalRun("SIGKILL");
     }, graceMs);
     graceTimer.unref?.();
   };
