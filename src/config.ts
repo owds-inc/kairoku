@@ -52,8 +52,14 @@ export function assertBindable(host: string): void {
   }
 }
 
+export function defaultConfigPath(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return env.HIKYAKU_CONFIG ?? join(hikyakuHome(), "config.json");
+}
+
 export function loadConfig(
-  path = join(hikyakuHome(), "config.json"),
+  path = defaultConfigPath(),
   env: Record<string, string | undefined> = process.env,
 ): Config {
   let file: Record<string, unknown> = {};

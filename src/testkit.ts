@@ -101,13 +101,13 @@ export function runRequest(pat: string, extra: Record<string, unknown> = {}) {
 
 /** Poll until `predicate` holds, or fail loudly rather than hang the suite. */
 export async function waitFor(
-  predicate: () => boolean,
+  predicate: () => boolean | Promise<boolean>,
   message: string,
   timeoutMs = 5_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await Bun.sleep(10);
   }
   throw new Error(`timed out waiting for: ${message}`);

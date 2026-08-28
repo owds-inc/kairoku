@@ -40,7 +40,18 @@ export async function run(
   command: string[],
   cwd: string,
 ): Promise<CommandResult> {
-  const proc = Bun.spawn(command, { cwd, stdout: "pipe", stderr: "pipe" });
+  let proc;
+  try {
+    proc = Bun.spawn(command, { cwd, stdout: "pipe", stderr: "pipe" });
+  } catch (err) {
+    // A missing cwd surfaces from Bun as ENOENT against the *binary*, which
+    // reads as "git is not installed". Name the directory instead.
+    throw new Error(
+      `${command[0]} could not be started in ${cwd}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
   const [stdout, stderr, code] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
