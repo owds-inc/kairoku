@@ -12,7 +12,46 @@ agents it launches, under their own credentials.
 **`SPEC.md` is the build contract.** Changes to behaviour are amendments there,
 never silent divergence here. Planning history lives in `kairoku-plan/orch/`.
 
-## Run it
+## Provisioning a machine
+
+`./hikyaku` is a bash CLI (bash, not TypeScript: setup installs bun, so a
+bun-run CLI could not bootstrap a bare machine). Run it **on** the machine
+being provisioned — nothing depends on the operator's laptop being set up.
+
+```sh
+gh auth login
+gh repo clone owds-inc/hikyaku ~/work/hikyaku
+cd ~/work/hikyaku
+./hikyaku setup     # then do the human-only steps it prints
+./hikyaku doctor    # verifies; nonzero exit if anything failed
+```
+
+`hikyaku setup` installs node 24 (nvm), bun, the claude/codex/paseo CLIs, puts
+the PATH export **above** `.bashrc`'s interactive guard, clones the kairoku
+worktree base, opens unprivileged user namespaces for codex's sandbox,
+pre-approves Kairoku MCP writes for codex, generates `~/.hikyaku/config.json`
+and a bearer token, and installs and starts the `hikyaku` systemd unit. It ends
+by printing what only a human can do: `gh auth login`, `claude /login`,
+`codex login`, the paseo password, and the slot PAT export.
+
+It is **idempotent, including on a live machine**: it installs only what is
+missing, never upgrades a runtime out from under a running agent, and rewrites
+the systemd unit only when the unit's content would actually change — so a
+rerun does not bounce a daemon that is mid-run. Steps needing `sudo` are
+skipped with instructions if there is no passwordless sudo.
+
+`hikyaku doctor` changes nothing and prints PASS / WARN / FAIL per check:
+toolchain versions, the non-interactive PATH, the userns sysctl, codex's
+approval mode, `~/.hikyaku/{config.json,token.env}` and its `600` mode, the
+systemd unit, a live `401`-without-token / `200`-with-token round trip against
+the daemon, paseo's unit, and the kairoku checkout. Any FAIL exits nonzero;
+WARN (an optional cockpit, a dirty checkout) does not.
+
+The steps and their gotcha comments come from `orch/setup-agent-vm.sh` in the
+planning repo, which pushed the same work from the Mac. This inverts that
+model so any team member can provision a machine from the machine itself.
+
+## Run the daemon
 
 ```sh
 bun install
