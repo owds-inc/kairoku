@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "start": "bun run src/server.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "prune": "bun run src/prune.ts"
   },
   "devDependencies": {
     "@types/bun": "latest",
