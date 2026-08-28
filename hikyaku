@@ -150,7 +150,9 @@ setup_userns() {
     warn "  echo kernel.apparmor_restrict_unprivileged_userns=0 | sudo tee /etc/sysctl.d/99-codex-userns.conf"
     return
   fi
-  local current; current="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo missing)"
+  local current=missing
+  local knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+  [ -r "$knob" ] && current="$(cat "$knob")"
   if [ "$current" = "0" ] && [ -f /etc/sysctl.d/99-codex-userns.conf ]; then
     skip "already 0 and persisted"
     return
@@ -395,7 +397,14 @@ cmd_doctor() {
   fi
 
   step "codex sandbox"
-  local userns; userns="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo missing)"
+  # Read /proc rather than shelling out to sysctl: sysctl lives in /usr/sbin
+  # and is not on every PATH, and a doctor that reports "absent" when the
+  # setting is fine is worse than one that does not check at all.
+  local userns=missing
+  local knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+  if [ -r "$knob" ]; then userns="$(cat "$knob")"
+  elif have sysctl; then userns="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo missing)"
+  fi
   if [ "$userns" = "0" ]; then pass "userns unrestricted" "sysctl = 0"
   elif [ "$userns" = "missing" ]; then note "userns unrestricted" "sysctl key absent on this kernel"
   else fail "userns unrestricted" "sysctl = $userns (codex sandbox will fail)"; fi
