@@ -308,20 +308,42 @@ cmd_setup() {
   setup_hikyaku
   setup_paseo
 
-  cat <<REMAINDER
+  print_remainder
+}
 
-$bold== done. What is left is human-only:$off
+# Only what is still owed. A checklist that lists steps already done teaches
+# the reader to skim it, which is how the one line that mattered gets missed.
+print_remainder() {
+  local owed=()
 
-  gh auth login                  # then rerun ./hikyaku setup for the kairoku clone
-  claude                         # then /login  (browser)
-  codex login                    # (browser)
-  nano ~/paseo.service           # set PASEO_PASSWORD, then:
+  gh auth status >/dev/null 2>&1 ||
+    owed+=("gh auth login                # then rerun ./hikyaku setup for the kairoku clone")
+  [ -d "$HOME/.claude" ] ||
+    owed+=("claude                       # then /login  (browser)")
+  [ -f "$HOME/.codex/auth.json" ] ||
+    owed+=("codex login                  # (browser)")
+  grep -q 'default_tools_approval_mode' "$HOME/.codex/config.toml" 2>/dev/null ||
+    owed+=("timeout 15 codex mcp add kairoku --url https://kairoku.io/api/mcp --bearer-token-env-var KAIROKU_PAT
+                               # the add command hangs after writing; the config still lands.
+                               # Then rerun ./hikyaku setup to pre-approve MCP writes.")
+  if [ ! -f /etc/systemd/system/paseo.service ]; then
+    owed+=("nano ~/paseo.service         # set PASEO_PASSWORD, then:
     sudo cp ~/paseo.service /etc/systemd/system/paseo.service
-    sudo systemctl daemon-reload && sudo systemctl enable --now paseo
-  export KAIROKU_PAT=…           # the slot PAT, at dispatch time — never stored here
+    sudo systemctl daemon-reload && sudo systemctl enable --now paseo")
+  fi
+  sudo_ok ||
+    owed+=("(no passwordless sudo — see the skipped steps above)")
 
-Then: ./hikyaku doctor
-REMAINDER
+  printf '\n%s== done.%s ' "$bold" "$off"
+  if [ ${#owed[@]} -eq 0 ]; then
+    printf 'Nothing human-only is outstanding on this machine.\n'
+  else
+    printf 'What is left is human-only:\n\n'
+    local item
+    for item in "${owed[@]}"; do printf '  %s\n' "$item"; done
+  fi
+  printf '\n  At dispatch time: export KAIROKU_PAT=…  (the slot PAT — never stored here)\n'
+  printf '\nThen: ./hikyaku doctor\n'
 }
 
 # ---------------------------------------------------------------- doctor
@@ -333,7 +355,11 @@ pass() { printf '   %sPASS%s  %-34s %s\n' "$green" "$off" "$1" "${2:-}"; }
 fail() { printf '   %sFAIL%s  %-34s %s\n' "$red" "$off" "$1" "${2:-}"; FAILURES=$((FAILURES + 1)); }
 note() { printf '   %sWARN%s  %-34s %s\n' "$yellow" "$off" "$1" "${2:-}"; WARNINGS=$((WARNINGS + 1)); }
 
-json_field() { sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$1" | head -1; }
+# Two shapes, kept separate on purpose: one pattern that accepted both captured
+# the whitespace before a closing brace, so `"port": 7801 }` parsed as "7801 "
+# and every URL built from it was malformed.
+json_string() { sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -1; }
+json_number() { sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -1; }
 
 cmd_doctor() {
   printf '%shikyaku doctor%s — %s (%s)\n' "$bold" "$off" "$(hostname)" "$(lan_ip)"
@@ -400,11 +426,12 @@ cmd_doctor() {
 
   if [ -f "$HIKYAKU_HOME/config.json" ] && [ -f "$HIKYAKU_HOME/token.env" ] && have curl; then
     local host port url code
-    host="$(json_field "$HIKYAKU_HOME/config.json" host)"
-    port="$(json_field "$HIKYAKU_HOME/config.json" port)"
+    host="$(json_string "$HIKYAKU_HOME/config.json" host)"
+    port="$(json_number "$HIKYAKU_HOME/config.json" port)"
     url="http://$host:$port/capacity"
 
-    code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$url" || echo 000)"
+    code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "$url" 2>/dev/null || true)"
+    code="${code:-000}"
     if [ "$code" = "401" ]; then pass "unauthenticated request refused" "401"
     else fail "unauthenticated request refused" "got $code, expected 401"; fi
 
@@ -430,7 +457,7 @@ cmd_doctor() {
   fi
 
   step "kairoku worktree base"
-  local repo; repo="$(json_field "$HIKYAKU_HOME/config.json" repoPath 2>/dev/null || true)"
+  local repo; repo="$(json_string "$HIKYAKU_HOME/config.json" repoPath 2>/dev/null || true)"
   repo="${repo:-$KAIROKU_DIR}"
   if [ -d "$repo/.git" ]; then
     pass "repo present" "$repo at $(git -C "$repo" rev-parse --short HEAD)"
