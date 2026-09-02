@@ -13,8 +13,7 @@ import { installedPlugin } from "./plugin";
 export type Check = { name: string; status: "PASS" | "WARN" | "FAIL"; detail?: string };
 
 export const NODE_MAJOR = 24;
-export const SYSTEMD_UNIT = "kairoku-daemon";
-export const LAUNCHD_LABEL = "io.kairoku.daemon";
+import { LAUNCHD_LABEL, SYSTEMD_UNIT } from "./service";
 
 const pass = (name: string, detail?: string): Check => ({ name, status: "PASS", detail });
 const warn = (name: string, detail?: string): Check => ({ name, status: "WARN", detail });

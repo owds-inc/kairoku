@@ -1,5 +1,5 @@
 /**
- * `hikyaku prune` — the ONLY thing that removes stale run worktrees.
+ * `kairoku daemon prune` — the ONLY thing that removes stale run worktrees.
  *
  * A daemon that died leaves its worktrees behind on purpose: the runner never
  * sweeps automatically (SPEC §Worktree module). This CLI enumerates, prints,

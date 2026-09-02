@@ -1,5 +1,5 @@
 /**
- * `hikyaku prune` is the ONLY path that removes a stale worktree — the daemon
+ * `kairoku daemon prune` is the ONLY path that removes a stale worktree — the daemon
  * never sweeps. These use a real git repo so the removal is real.
  */
 
@@ -31,7 +31,7 @@ async function git(args: string[], cwd: string) {
 }
 
 beforeEach(async () => {
-  root = mkdtempSync(join(tmpdir(), "hikyaku-prune-"));
+  root = mkdtempSync(join(tmpdir(), "kairoku-prune-"));
   const origin = join(root, "origin.git");
   repoPath = join(root, "base");
   worktreesDir = join(root, "worktrees");

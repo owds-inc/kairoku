@@ -6,7 +6,7 @@
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
-import { assertBindable, loadConfig, type Config } from "./config";
+import { assertBindable, loadConfig, migrateHome, type Config } from "./config";
 import { RunStore, type RefusalReason, type RunRequest } from "./runs";
 
 /** RF-006 — constant-time bearer comparison, length-independent via SHA-256. */
@@ -107,19 +107,30 @@ export function createDaemon(config: Config): Daemon {
   };
 }
 
-if (import.meta.main) {
+/**
+ * Run the daemon in the foreground until SIGTERM/SIGINT; resolves with the
+ * exit code after teardown. `kairoku daemon` and `bun run src/daemon/server.ts`
+ * both land here.
+ */
+export function serve(): Promise<number> {
+  const migrated = migrateHome();
+  if (migrated === "migrated") console.log(`migrated ~/.hikyaku to ~/.kairoku (copied; the old dir is untouched)`);
   const config = loadConfig();
   const daemon = createDaemon(config);
-  console.log(`hikyaku listening on ${daemon.url} (max ${config.maxConcurrent})`);
+  console.log(`kairoku daemon listening on ${daemon.url} (max ${config.maxConcurrent})`);
 
-  let stopping = false;
-  const shutdown = async (signal: string) => {
-    if (stopping) return;
-    stopping = true;
-    console.log(`\n${signal}: tearing down runs`);
-    await daemon.stop();
-    process.exit(0);
-  };
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
-  process.on("SIGINT", () => void shutdown("SIGINT"));
+  return new Promise((resolve) => {
+    let stopping = false;
+    const shutdown = async (signal: string) => {
+      if (stopping) return;
+      stopping = true;
+      console.log(`\n${signal}: tearing down runs`);
+      await daemon.stop();
+      resolve(0);
+    };
+    process.on("SIGTERM", () => void shutdown("SIGTERM"));
+    process.on("SIGINT", () => void shutdown("SIGINT"));
+  });
 }
+
+if (import.meta.main) process.exit(await serve());

@@ -33,7 +33,7 @@ async function git(args: string[], cwd: string) {
 }
 
 beforeEach(async () => {
-  root = mkdtempSync(join(tmpdir(), "hikyaku-wt-"));
+  root = mkdtempSync(join(tmpdir(), "kairoku-wt-"));
   const origin = join(root, "origin.git");
   repoPath = join(root, "base");
   worktreesDir = join(root, "worktrees");

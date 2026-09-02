@@ -293,7 +293,7 @@ export class RunStore {
         branch: record.worktree.branch,
       });
     } catch (err) {
-      // The branch survives regardless; a stuck worktree is `hikyaku prune`'s.
+      // The branch survives regardless; a stuck worktree is `kairoku daemon prune`'s.
       appendEvent(runsDir, record.id, "teardown", {
         removed: false,
         reason: message(err),
@@ -336,13 +336,15 @@ function classify(
 
 /**
  * The agent inherits the daemon's environment plus the caller's injected vars.
- * HIKYAKU_TOKEN is stripped: the daemon's own bearer is not an agent's to hold.
+ * The daemon's own bearer (KAIROKU_DAEMON_TOKEN, or the pre-rename
+ * HIKYAKU_TOKEN) is stripped: it is not an agent's to hold.
  */
 function childEnv(injected: Record<string, string>): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined) env[k] = v;
   }
+  delete env.KAIROKU_DAEMON_TOKEN;
   delete env.HIKYAKU_TOKEN;
   return { ...env, ...injected };
 }

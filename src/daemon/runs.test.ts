@@ -209,14 +209,16 @@ describe("runs — lifecycle (RF-002, RF-010)", () => {
   });
 
   test("injected env reaches the agent; the daemon's own bearer does not", async () => {
-    const previous = process.env.HIKYAKU_TOKEN;
-    process.env.HIKYAKU_TOKEN = "daemon-bearer-must-not-leak";
+    const previous = process.env.KAIROKU_DAEMON_TOKEN;
+    const previousLegacy = process.env.HIKYAKU_TOKEN;
+    process.env.KAIROKU_DAEMON_TOKEN = "daemon-bearer-must-not-leak";
+    process.env.HIKYAKU_TOKEN = "legacy-bearer-must-not-leak";
     try {
       const h = (active = harness({
         commandOverride: () => [
           "sh",
           "-c",
-          'echo "pat=$KAIROKU_PAT extra=$EXTRA token=[$HIKYAKU_TOKEN]"',
+          'echo "pat=$KAIROKU_PAT extra=$EXTRA token=[$KAIROKU_DAEMON_TOKEN$HIKYAKU_TOKEN]"',
         ],
       }));
       const store = new RunStore(h.config);
@@ -237,8 +239,10 @@ describe("runs — lifecycle (RF-002, RF-010)", () => {
       expect(out).toContain("token=[]");
       expect(out).not.toContain("daemon-bearer-must-not-leak");
     } finally {
-      if (previous === undefined) delete process.env.HIKYAKU_TOKEN;
-      else process.env.HIKYAKU_TOKEN = previous;
+      if (previous === undefined) delete process.env.KAIROKU_DAEMON_TOKEN;
+      else process.env.KAIROKU_DAEMON_TOKEN = previous;
+      if (previousLegacy === undefined) delete process.env.HIKYAKU_TOKEN;
+      else process.env.HIKYAKU_TOKEN = previousLegacy;
     }
   });
 

@@ -123,7 +123,7 @@ export interface StaleWorktree {
 }
 
 /**
- * Enumerate run worktrees for the `hikyaku prune` CLI — `git worktree list`
+ * Enumerate run worktrees for the `kairoku daemon prune` CLI — `git worktree list`
  * filtered by the `run/` branch prefix. No breadcrumb store needed.
  */
 export async function listRunWorktrees(
