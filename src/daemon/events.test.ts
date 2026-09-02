@@ -12,7 +12,7 @@ import {
 
 const dirs: string[] = [];
 function tmp(): string {
-  const dir = mkdtempSync(join(tmpdir(), "hikyaku-events-"));
+  const dir = mkdtempSync(join(tmpdir(), "kairoku-events-"));
   dirs.push(dir);
   return dir;
 }

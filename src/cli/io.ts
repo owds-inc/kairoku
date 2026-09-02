@@ -5,7 +5,8 @@
  * daemon's WorktreeOps.
  */
 
-import { chmodSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 
@@ -54,7 +55,7 @@ export const io: Io = {
       rl.close();
     }
   },
-  which: (bin) => Bun.which(bin),
+  which: (bin) => Bun.which(bin, { PATH: process.env.PATH }),
   async shell(argv, opts = {}) {
     const proc = Bun.spawn(argv, {
       stdin: opts.live ? "inherit" : "ignore",
@@ -82,9 +83,17 @@ export const io: Io = {
     }
   },
   writeFile(path, data, mode) {
+    mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, data);
     if (mode !== undefined) chmodSync(path, mode);
   },
   rename: renameSync,
   fetch: (url, init) => globalThis.fetch(url, init),
 };
+
+/** First line of `<bin> --version`, or null when the binary is not on PATH. */
+export async function version(io: Io, bin: string): Promise<string | null> {
+  if (!io.which(bin)) return null;
+  const r = await io.shell([bin, "--version"]);
+  return r.stdout.split("\n")[0]?.trim() ?? "";
+}

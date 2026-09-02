@@ -58,7 +58,7 @@ export interface Harness {
 export const TEST_TOKEN = "test-bearer-token";
 
 export function harness(overrides: Partial<Config> = {}): Harness {
-  const dir = mkdtempSync(join(tmpdir(), "hikyaku-test-"));
+  const dir = mkdtempSync(join(tmpdir(), "kairoku-test-"));
   const worktreesDir = join(dir, "worktrees");
   const runsDir = join(dir, "runs");
   mkdirSync(worktreesDir, { recursive: true });

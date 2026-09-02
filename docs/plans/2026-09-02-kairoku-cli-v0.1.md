@@ -456,28 +456,80 @@ and the released `kairoku.rb`'s checksums replacing the local build's in the tap
 
 ## Phase 3 — the daemon inside the binary (PR 3)
 
-*Decided shape; expanded at phase start after context7 (launchd plist keys: `Label`, `ProgramArguments`, `EnvironmentVariables`, `RunAtLoad`, `KeepAlive`, `StandardOutPath`; `launchctl bootstrap gui/$UID` vs `load`).*
+*Amended 2026-09-02 at phase end: the decided shape below is what was built. Lookups made first:
+`man launchd.plist` / `man launchctl` on this Mac (Label, ProgramArguments, EnvironmentVariables,
+RunAtLoad, KeepAlive, StandardOutPath/StandardErrorPath; `bootstrap gui/<uid>`, `bootout`,
+`kickstart -k`, `print`), the bash script's systemd unit, and the plugin docs already used in Phase 2.*
 
-### Task 13: Config moves to `~/.kairoku/`, token env renamed, shims
+### Task 13: config moves to `~/.kairoku/`, token env renamed, shims — DONE
 
-**Files:** modify `src/daemon/config.ts` (+ test), `src/daemon/events.ts`/`runs.ts`/`worktree.ts`/`prune.ts` defaults (`~/.kairoku/{runs,worktrees}`); sweep remaining `hikyaku` mentions in `src/daemon/` comments and test tmp prefixes.
-**Interfaces:** `loadConfig()` resolution order: `KAIROKU_DAEMON_CONFIG` → `HIKYAKU_CONFIG` (deprecation line on stderr) → `~/.kairoku/config.json`. Token: `KAIROKU_DAEMON_TOKEN` → `HIKYAKU_TOKEN` (deprecation line). `export function migrateHome(): "migrated" | "already" | "none"` — copies `~/.hikyaku/` → `~/.kairoku/` once (cp -R, never move) when the former exists and the latter does not, and prints what it did; `token.env` contents rewritten `HIKYAKU_TOKEN=` → `KAIROKU_DAEMON_TOKEN=`.
-**Tests:** resolution order; deprecation lines; migration happy path, no-op when both exist, no-op when neither; RF-006 unchanged.
+**Files:** `src/daemon/config.ts` — `kairokuHome(home)`, `defaultConfigPath(env, warn)`
+(`KAIROKU_DAEMON_CONFIG` → `HIKYAKU_CONFIG` with a deprecation line → `~/.kairoku/config.json`),
+`loadConfig(path, env, warn)` with the token from `KAIROKU_DAEMON_TOKEN` → `HIKYAKU_TOKEN`
+(deprecation line) → **`token.env` beside the config file** (`parseTokenEnv`/`readTokenEnv`) — the
+decision that keeps the secret out of both service files; `migrateHome(home)` copies `config.json`,
+`token.env` (line renamed, mode 600) and `runs/` from `~/.hikyaku/` once (never moves; `worktrees/`
+stays with git). `src/daemon/server.ts` — `serve(): Promise<number>` (migration notice, load, listen,
+resolves after SIGTERM/SIGINT teardown), `import.meta.main` still runs it. `src/daemon/runs.ts` strips
+both token names from agent env. All `hikyaku` tmp prefixes and comments swept. Tests:
+`config.test.ts` (resolution order, deprecation lines, token.env, migration ×2), `daemon.test.ts`
+(legacy env names start with deprecation lines), `runs.test.ts` (both tokens stripped).
 
-### Task 14: `kairoku daemon` foreground + `daemon install|start|stop|status`
+### Task 14: `kairoku daemon` + `install|start|stop|status|prune` — DONE
 
-**Files:** create `src/cli/daemon.ts` (foreground: `migrateHome()`, then `createDaemon(loadConfig())` exactly as `server.ts`'s main; service verbs), `src/cli/service.ts` (unit/plist text generation: `systemdUnit(opts): string`, `launchdPlist(opts): string`, both pure; `install` writes only when the rendered text differs from what is on disk — the bash script's cmp rule; systemd `sudo -n` gate with the printed manual steps). Service names `kairoku-daemon` (systemd, system unit under `/etc/systemd/system/`, user unit fallback when no sudo) and `io.kairoku.daemon` (`~/Library/LaunchAgents/io.kairoku.daemon.plist`). `ExecStart`/`ProgramArguments` = the running binary (`process.execPath`) `daemon`, `EnvironmentFile`/`EnvironmentVariables` from `~/.kairoku/token.env`.
-**Tests:** pure renderers snapshot-tested; "unchanged unit → no write, no restart" with a fake fs; verb → argv sequences with a fake shell.
+**Files:** `src/cli/service.ts` — `systemdUnit({scope, execPath, user, path})` (system: `User=`,
+`multi-user.target`; user: `default.target`), `launchdPlist({execPath, home, path})`
+(`io.kairoku.daemon`, `ProgramArguments [execPath, "daemon"]`, `EnvironmentVariables {HOME, PATH}`,
+`RunAtLoad`, `KeepAlive`, both std paths → `~/.kairoku/daemon.log`). `src/cli/daemon.ts` — no verb:
+`serve()` (errors → exit 1); `prune` → the daemon's prune `main`; linux verbs: scope = system when
+`sudo -n true` succeeds (unit staged in `~/.kairoku/` then `sudo cp` to
+`/etc/systemd/system/kairoku-daemon.service`) else a user unit under `~/.config/systemd/user/` with
+the `loginctl enable-linger` note; write only when the rendered text differs, `daemon-reload` only
+then, `enable --now`; an unchanged active unit is left running; start/stop/status pick the scope from
+which unit file exists. mac verbs: plist at `~/Library/LaunchAgents/`, `launchctl print gui/<uid>/…`
+decides loaded; unchanged+loaded → left alone, changed+loaded → `bootout` then rewrite, then
+`bootstrap gui/<uid> <plist>`; start = `bootstrap` or `kickstart -k`; stop = `bootout`; status prints
+`print`'s state. `servicePath(io)` = the binary's dir, `~/.bun/bin`, bun's and node's dirs,
+`/opt/homebrew/bin` (mac), the usual bins. `Io.writeFile` creates parent dirs. Tests:
+`service.test.ts` (3), `daemon.test.ts` (12: linux 5, mac 4, verbs 1, foreground 2 — the compiled
+entry serves `/capacity` from `KAIROKU_DAEMON_CONFIG` + `token.env` and exits 0 on SIGTERM; no token →
+exit 1 naming `KAIROKU_DAEMON_TOKEN`).
 
-### Task 15: `setup --daemon` and the machine steps
+### Task 15: `setup --daemon` and the machine steps — DONE
 
-**Files:** extend `src/cli/setup.ts` + test. Steps ported from the bash script, each a function `(env) => Promise<StepResult>` with `StepResult = { name; outcome: "done" | "skipped" | "manual"; detail? }`: runtimes (node ≥ 24 via nvm, bun, `npm i -g` only the missing agent CLIs), non-interactive PATH line (linux only, `~/.bashrc` line 1), kairoku checkout (`git clone <url>` — url prompted with default `https://github.com/owds-inc/kairoku.git`… **no**: the *app* checkout is the worktree base; default `https://gitlab.com/owds-inc/kairoku.git` is a guess — the prompt's default is confirmed with the lead at phase start; plain `git`, never `gh`), userns sysctl (linux, sudo-gated), codex approval mode, config + token generation (`crypto.randomBytes(32).toString("hex")`, `token.env` mode 600), service install + start, the doctor round-trip (401 without token, 200 with). Idempotency rules copied from the script: install only what is missing, never upgrade a runtime, rewrite a unit only on content change. Ends with the "what is left is human-only" list.
-**Tests:** each step's skip/done/manual branches with a fake env; the summary lists only outstanding items.
+**Files:** `src/cli/provision.ts` — `Step = {name, outcome: done|skipped|manual, detail}`;
+`runtimes` (node ≥ 24 via the nvm installer + `nvm install 24`, then `nvm which` prepended to this
+run's PATH; bun via bun.sh; `npm install -g` only the missing of claude/codex/paseo — never an upgrade),
+`shellPath` (linux: the export as `~/.bashrc` line 1, once; mac: not needed), `checkout(io, repoUrl)`
+(plain `git clone` into `~/work/kairoku`, then `bun install --cwd`; a failed clone is a manual step with
+git's stderr), `userns` (linux; no sudo → the two commands handed back; absent knob → skipped; already 0
+and persisted → skipped; else `sudo sysctl -w` + `sudo sh -c 'echo … > /etc/sysctl.d/99-codex-userns.conf'`),
+`codexConfig` (no file → manual naming `codex login`; approval set → skipped; no kairoku MCP entry →
+manual with the `codex mcp add` line; else the approve line inserted after the bearer line),
+`daemonConfig(io, repoPath, repoUrl?)` (`token.env` = 64 hex from `node:crypto`, mode 600, never
+printed; `config.json` bound to the LAN address — `hostname -I` / `ipconfig getifaddr en0`, loopback
+fallback — port 7801, `maxConcurrent` 2, `repoPath`, `repoUrl`; an existing config gets `repoUrl`
+recorded when it differs), `remainder(io, steps)` (only what is still owed: `claude` login, `codex
+login`, the MCP add, every manual step), `DEFAULT_APP_REPO` (GitHub today; DECISIONS §18 follow-up
+names the GitLab switch), `configuredRepoUrl`. `src/cli/setup.ts` — `--repo <url>`; `daemon(io,
+{yes, repo})` runs the steps, resolves the repo URL (`--repo` → config's `repoUrl` → `--yes` default →
+the prompt with the default), then `daemon install`, then `roundTrip` (from `doctor.ts`, 10 tries) and
+the human-only list. Tests: `provision.test.ts` (14), `setup.test.ts` (10; a provisioned VM fake runs
+`--daemon --yes` end to end with every step skipped, the unit written, PASS/PASS, and the token never
+printed).
 
-### Task 16: Delete the bash script; amend SPEC and README
+### Task 16: bash script deleted; SPEC and README amended — DONE
 
-**Files:** delete `hikyaku`; `SPEC.md` amendment (RF-003 path `~/.kairoku/runs/…`, RF-006 env `KAIROKU_DAEMON_TOKEN`, Config section, `kairoku prune`); README daemon/config sections.
-**Done-condition:** `kairoku daemon` started from `~/.kairoku/config.json`; two runs dispatched concurrently with curl complete (SPEC exit criterion); `kairoku doctor` PASS here; suite + tsc green with counts.
+`hikyaku` (bash) deleted. `SPEC.md`: the amendment line, RF-003 path, RF-006 token sources, the
+Config section, `kairoku daemon prune`. `README.md`: the daemon section around `setup --daemon`,
+`kairoku daemon …`, `~/.kairoku`, `KAIROKU_DAEMON_TOKEN`, the one-time migration, the module table.
+
+**Done-condition, run on this Mac (arm64), cited in the PR body:** the compiled binary's `daemon`
+started from a `KAIROKU_DAEMON_CONFIG` + `token.env` in a temp dir, two `POST /runs` in the same
+instant with distinct `KAIROKU_PAT`s (real `codex exec` in fresh `run/<id>` worktrees), both terminal,
+two `run/` branches left in the repo, `/capacity` back to 0, SIGTERM → exit 0; the launchd agent
+installed / status / stopped from a temp `HOME`; `kairoku doctor` exit 0 on this machine; suite + tsc
+with counts.
 
 ---
 

@@ -39,8 +39,8 @@ async function startDaemon(overrides: Record<string, unknown> = {}) {
   const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "server.ts")], {
     env: {
       ...process.env,
-      HIKYAKU_CONFIG: configPath,
-      HIKYAKU_TOKEN: "daemon-test-token",
+      KAIROKU_DAEMON_CONFIG: configPath,
+      KAIROKU_DAEMON_TOKEN: "daemon-test-token",
     },
     stdout: "pipe",
     stderr: "pipe",
@@ -68,7 +68,7 @@ async function reachable(port: number, timeoutMs = 8_000): Promise<boolean> {
 }
 
 describe("daemon process", () => {
-  test("starts from HIKYAKU_CONFIG and exits 0 on SIGTERM", async () => {
+  test("starts from KAIROKU_DAEMON_CONFIG and exits 0 on SIGTERM", async () => {
     const { proc, port } = await startDaemon();
     try {
       expect(await reachable(port)).toBe(true);
@@ -82,10 +82,10 @@ describe("daemon process", () => {
     }
   }, 20_000);
 
-  test("refuses to start without HIKYAKU_TOKEN", async () => {
+  test("refuses to start without KAIROKU_DAEMON_TOKEN", async () => {
     const dir = tmp();
     const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "server.ts")], {
-      env: { ...process.env, HIKYAKU_CONFIG: join(dir, "absent.json"), HIKYAKU_TOKEN: "" },
+      env: { ...process.env, KAIROKU_DAEMON_CONFIG: join(dir, "absent.json"), KAIROKU_DAEMON_TOKEN: "" },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -94,7 +94,29 @@ describe("daemon process", () => {
       new Response(proc.stderr).text(),
     ]);
     expect(exitCode).not.toBe(0);
-    expect(stderr).toContain("HIKYAKU_TOKEN");
+    expect(stderr).toContain("KAIROKU_DAEMON_TOKEN");
+  }, 20_000);
+
+  test("the pre-rename env names still work, with a deprecation line each", async () => {
+    const dir = tmp();
+    const configPath = join(dir, "config.json");
+    const port = 39_000 + Math.floor(Math.random() * 20_000);
+    writeFileSync(configPath, JSON.stringify({ listen: { host: "127.0.0.1", port }, maxConcurrent: 1 }));
+    const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "server.ts")], {
+      env: { ...process.env, KAIROKU_DAEMON_CONFIG: "", KAIROKU_DAEMON_TOKEN: "", HIKYAKU_CONFIG: configPath, HIKYAKU_TOKEN: "daemon-test-token" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      expect(await reachable(port)).toBe(true);
+      proc.kill("SIGTERM");
+      expect(await proc.exited).toBe(0);
+      const stderr = await new Response(proc.stderr).text();
+      expect(stderr).toContain("HIKYAKU_CONFIG is deprecated");
+      expect(stderr).toContain("HIKYAKU_TOKEN is deprecated");
+    } finally {
+      if (!proc.killed) proc.kill("SIGKILL");
+    }
   }, 20_000);
 
   test("refuses to start bound to a wildcard host", async () => {

@@ -7,7 +7,7 @@ import { waitFor } from "./testkit";
 
 const dirs: string[] = [];
 function tmp(): string {
-  const dir = mkdtempSync(join(tmpdir(), "hikyaku-proc-"));
+  const dir = mkdtempSync(join(tmpdir(), "kairoku-proc-"));
   dirs.push(dir);
   return dir;
 }

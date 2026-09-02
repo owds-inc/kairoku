@@ -7,14 +7,21 @@
  */
 
 import { join } from "node:path";
-import type { Io } from "./io";
+import { parseTokenEnv } from "../daemon/config";
+import { version, type Io } from "./io";
 import { installedPlugin } from "./plugin";
+
+export const usage = `usage: kairoku doctor
+
+  Verifies this machine and changes nothing. One line per check — PASS, WARN
+  or FAIL — and a nonzero exit when any check FAILs. The plugin checks run
+  everywhere; the daemon checks run where ~/.kairoku (or the pre-rename
+  ~/.hikyaku) exists.`;
 
 export type Check = { name: string; status: "PASS" | "WARN" | "FAIL"; detail?: string };
 
 export const NODE_MAJOR = 24;
-export const SYSTEMD_UNIT = "kairoku-daemon";
-export const LAUNCHD_LABEL = "io.kairoku.daemon";
+import { LAUNCHD_LABEL, SYSTEMD_UNIT } from "./service";
 
 const pass = (name: string, detail?: string): Check => ({ name, status: "PASS", detail });
 const warn = (name: string, detail?: string): Check => ({ name, status: "WARN", detail });
@@ -29,13 +36,6 @@ export function daemonHome(io: Io): string | null {
   return null;
 }
 
-/** First line of `<bin> --version`, or null when the binary is not on PATH. */
-async function version(io: Io, bin: string): Promise<string | null> {
-  if (!io.which(bin)) return null;
-  const r = await io.shell([bin, "--version"]);
-  return r.stdout.split("\n")[0]?.trim() ?? "";
-}
-
 async function http(io: Io, url: string, headers: Record<string, string>) {
   try {
     const r = await io.fetch(url, { headers, signal: AbortSignal.timeout(5000) });
@@ -43,6 +43,25 @@ async function http(io: Io, url: string, headers: Record<string, string>) {
   } catch {
     return { status: 0, body: "" };
   }
+}
+
+/**
+ * The daemon's two-request proof: 401 without the token, 200 with it. `attempts`
+ * > 1 waits for a daemon that was just started (500 ms between tries).
+ */
+export async function roundTrip(io: Io, url: string, token: string, attempts = 1): Promise<Check[]> {
+  let anon = await http(io, url, {});
+  for (let left = attempts - 1; left > 0 && anon.status === 0; left--) {
+    await new Promise((r) => setTimeout(r, 500));
+    anon = await http(io, url, {});
+  }
+  const auth = await http(io, url, { authorization: `Bearer ${token}` });
+  return [
+    anon.status === 401 ? pass("unauthenticated request refused", "401") : fail("unauthenticated request refused", `got ${anon.status}, expected 401`),
+    auth.status === 200 && auth.body.includes('"max"')
+      ? pass("authenticated request answers", auth.body)
+      : fail("authenticated request answers", `got ${auth.status}: ${auth.body || "<no response>"}`),
+  ];
 }
 
 export async function checks(io: Io): Promise<Check[]> {
@@ -143,18 +162,10 @@ export async function checks(io: Io): Promise<Check[]> {
     // reported above as present; a malformed file fails the round trip below
   }
   // The token is read and sent, never printed.
-  const token = io.readFile(tokenPath)?.match(/^(?:KAIROKU_DAEMON_TOKEN|HIKYAKU_TOKEN)=(.+)$/m)?.[1]?.trim();
+  const token = parseTokenEnv(io.readFile(tokenPath) ?? "");
   const { host, port } = config.listen ?? {};
   if (host && port && token) {
-    const url = `http://${host}:${port}/capacity`;
-    const anon = await http(io, url, {});
-    out.push(anon.status === 401 ? pass("unauthenticated request refused", "401") : fail("unauthenticated request refused", `got ${anon.status}, expected 401`));
-    const auth = await http(io, url, { authorization: `Bearer ${token}` });
-    out.push(
-      auth.status === 200 && auth.body.includes('"max"')
-        ? pass("authenticated request answers", auth.body)
-        : fail("authenticated request answers", `got ${auth.status}: ${auth.body || "<no response>"}`),
-    );
+    out.push(...(await roundTrip(io, `http://${host}:${port}/capacity`, token)));
   } else {
     out.push(fail("daemon reachable", "cannot test — listen host/port or the token is missing"));
   }
