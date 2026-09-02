@@ -121,6 +121,21 @@ describe("proc (RF-010)", () => {
     expect(await alive(pid)).toBe(false);
   });
 
+  test("a child that exits leaving a background grandchild takes the group with it", async () => {
+    // The run is over when its leader exits; nothing it forked survives it.
+    // This is the window the same-tick cancel test hits on linux, made
+    // deterministic: dash forks `sleep` rather than exec'ing it, and a
+    // grandchild forked in the instant the group is signalled misses the
+    // signal — so the exit path itself has to sweep the group.
+    const dir = tmp();
+    const handle = launch(opts(dir, ["sh", "-c", "sleep 30 & exit 0"]));
+    const pid = handle.pid!;
+    const result = await handle.exited;
+    expect(result.outcome).toBe("exited");
+    expect(result.exitCode).toBe(0);
+    expect(groupAlive(pid)).toBe(false);
+  });
+
   test("cancelling in the same tick as the spawn still kills the agent", async () => {
     // Regression: node calls setsid() in the child between fork and exec, so
     // for a moment after spawn `-pid` names a process group that is not ours
