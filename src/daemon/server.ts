@@ -1,33 +1,30 @@
 /**
- * HTTP surface (RF-001..RF-006) and the daemon entrypoint.
+ * The loopback listener (RF-005, RF-006) and the daemon entrypoint.
  *
- * Five routes, a plain route table, no framework. Every route is behind the
- * bearer check; the listener binds only to the configured host.
+ * SPEC v1, §20.3: the push API is retired. `POST /runs`, `GET /runs/:id`,
+ * `POST /runs/:id/cancel` and the inbound bearer are gone — runs start in the
+ * app, and this surface exists only so `kairoku doctor` can ask a daemon on
+ * this machine how it is doing.
+ *
+ * There is therefore nothing to authenticate: reachability on 127.0.0.1 IS the
+ * trust boundary. That is exactly why the wildcard refusal stays — an
+ * unauthenticated surface on a LAN address would be a different bargain.
  */
 
-import { createHash, timingSafeEqual } from "node:crypto";
+import { version } from "../../package.json";
 import { assertBindable, loadConfig, migrateHome, type Config } from "./config";
-import { RunStore, type RefusalReason, type RunRequest } from "./runs";
+import { startLink, type LinkStatus } from "./link";
+import { RunStore } from "./runs";
 
-/** RF-006 — constant-time bearer comparison, length-independent via SHA-256. */
-export function tokenMatches(offered: string, expected: string): boolean {
-  const a = createHash("sha256").update(offered).digest();
-  const b = createHash("sha256").update(expected).digest();
-  return timingSafeEqual(a, b);
+/** What `/status` reports about the app link. `link.ts` owns the shape. */
+export interface LinkView {
+  status(): LinkStatus;
 }
 
-function bearer(req: Request): string {
-  const header = req.headers.get("authorization") ?? "";
-  return header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
+export interface DaemonDeps {
+  readonly store?: RunStore;
+  readonly link?: LinkView;
 }
-
-const REFUSAL_STATUS: Record<RefusalReason, number> = {
-  empty_brief: 400,
-  unknown_role: 400,
-  missing_credential: 400,
-  duplicate_credential: 409,
-  capacity_full: 429,
-};
 
 export interface Daemon {
   readonly store: RunStore;
@@ -36,63 +33,28 @@ export interface Daemon {
   stop(): Promise<void>;
 }
 
-export function createDaemon(config: Config): Daemon {
-  assertBindable(config.listen.host);
-  const store = new RunStore(config);
+const notFound = () => Response.json({ error: "not_found" }, { status: 404 });
 
-  const guard =
-    (handler: (req: Request) => Response | Promise<Response>) =>
-    (req: Request): Response | Promise<Response> => {
-      if (!tokenMatches(bearer(req), config.token)) {
-        return Response.json({ error: "unauthorized" }, { status: 401 });
-      }
-      return handler(req);
-    };
+export function createDaemon(config: Config, deps: DaemonDeps = {}): Daemon {
+  assertBindable(config.listen.host);
+  const store = deps.store ?? new RunStore(config);
 
   const server = Bun.serve({
     hostname: config.listen.host,
     port: config.listen.port,
     routes: {
-      "/capacity": {
-        GET: guard(() => Response.json(store.capacity())),
-      },
-      "/runs": {
-        POST: guard(async (req) => {
-          let body: RunRequest;
-          try {
-            body = (await req.json()) as RunRequest;
-          } catch {
-            return Response.json({ reason: "empty_brief" }, { status: 400 });
-          }
-          const result = store.create(body);
-          if (!result.ok) {
-            return Response.json(
-              { reason: result.reason },
-              { status: REFUSAL_STATUS[result.reason] },
-            );
-          }
-          return Response.json({ runId: result.runId }, { status: 201 });
-        }),
-      },
-      "/runs/:id": {
-        GET: guard((req) => {
-          const id = (req as Bun.BunRequest<"/runs/:id">).params.id;
-          const view = store.view(id);
-          return view
-            ? Response.json(view)
-            : Response.json({ error: "not_found" }, { status: 404 });
-        }),
-      },
-      "/runs/:id/cancel": {
-        POST: guard((req) => {
-          const id = (req as Bun.BunRequest<"/runs/:id/cancel">).params.id;
-          return store.cancel(id)
-            ? Response.json({ cancelled: true })
-            : Response.json({ error: "not_found" }, { status: 404 });
-        }),
+      "/capacity": { GET: () => Response.json(store.capacity()) },
+      "/status": {
+        GET: () =>
+          Response.json({
+            version,
+            capacity: store.capacity(),
+            link: deps.link?.status() ?? { linked: false },
+            runs: store.list(),
+          }),
       },
     },
-    fetch: () => Response.json({ error: "not_found" }, { status: 404 }),
+    fetch: notFound,
   });
 
   const port = server.port ?? config.listen.port;
@@ -116,7 +78,9 @@ export function serve(): Promise<number> {
   const migrated = migrateHome();
   if (migrated === "migrated") console.log(`migrated ~/.hikyaku to ~/.kairoku (copied; the old dir is untouched)`);
   const config = loadConfig();
-  const daemon = createDaemon(config);
+  const store = new RunStore(config);
+  const link = startLink(store, config);
+  const daemon = createDaemon(config, { store, link });
   console.log(`kairoku daemon listening on ${daemon.url} (max ${config.maxConcurrent})`);
 
   return new Promise((resolve) => {
@@ -125,6 +89,7 @@ export function serve(): Promise<number> {
       if (stopping) return;
       stopping = true;
       console.log(`\n${signal}: tearing down runs`);
+      link.stop();
       await daemon.stop();
       resolve(0);
     };

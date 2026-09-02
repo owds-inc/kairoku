@@ -172,15 +172,14 @@ describe("kairoku daemon in the foreground", () => {
       let ok = false;
       while (Date.now() < deadline && !ok) {
         try {
-          const res = await fetch(`http://127.0.0.1:${port}/capacity`, { headers: { authorization: "Bearer cli-daemon-token" } });
+          // No bearer: the loopback listener has no inbound credential (SPEC v1).
+          const res = await fetch(`http://127.0.0.1:${port}/capacity`);
           ok = res.ok && JSON.stringify(await res.json()) === '{"running":0,"max":1}';
         } catch {
           await Bun.sleep(50);
         }
       }
       expect(ok).toBe(true);
-      const anon = await fetch(`http://127.0.0.1:${port}/capacity`);
-      expect(anon.status).toBe(401);
       proc.kill("SIGTERM");
       expect(await proc.exited).toBe(0);
     } finally {
@@ -188,16 +187,19 @@ describe("kairoku daemon in the foreground", () => {
     }
   }, 20_000);
 
-  test("without a token it exits 1 naming KAIROKU_DAEMON_TOKEN", async () => {
+  test("a config bound to a wildcard host still refuses to start (RF-006)", async () => {
+    // The listener is unauthenticated now, so the bind is the whole boundary.
     const dir = mkdtempSync(join(tmpdir(), "kairoku-cli-daemon-"));
     dirs.push(dir);
+    const configPath = join(dir, "config.json");
+    writeFileSync(configPath, JSON.stringify({ listen: { host: "0.0.0.0", port: 0 } }));
     const proc = Bun.spawn(["bun", "run", main, "daemon"], {
-      env: { ...process.env, KAIROKU_DAEMON_CONFIG: join(dir, "absent.json"), KAIROKU_DAEMON_TOKEN: "", HIKYAKU_TOKEN: "" },
+      env: { ...process.env, KAIROKU_DAEMON_CONFIG: configPath, KAIROKU_DAEMON_TOKEN: "", HIKYAKU_TOKEN: "" },
       stdout: "pipe",
       stderr: "pipe",
     });
     const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
     expect(code).toBe(1);
-    expect(stderr).toContain("KAIROKU_DAEMON_TOKEN");
+    expect(stderr).toContain("RF-006");
   }, 20_000);
 });

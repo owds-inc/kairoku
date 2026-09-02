@@ -52,9 +52,8 @@ async function reachable(port: number, timeoutMs = 8_000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/capacity`, {
-        headers: { authorization: "Bearer daemon-test-token" },
-      });
+      // No bearer: the loopback listener has no inbound credential (SPEC v1).
+      const res = await fetch(`http://127.0.0.1:${port}/capacity`);
       if (res.ok) {
         expect(await res.json()).toEqual({ running: 0, max: 1 });
         return true;
@@ -82,19 +81,29 @@ describe("daemon process", () => {
     }
   }, 20_000);
 
-  test("refuses to start without KAIROKU_DAEMON_TOKEN", async () => {
+  test("with no credential it starts anyway, unlinked, and says which piece is missing", async () => {
+    // RF-012: a rejected token stops the loop and keeps the listener up, so a
+    // MISSING token cannot be a startup error either — `doctor` has to be able
+    // to walk up to a daemon in exactly that state and be told why.
     const dir = tmp();
+    const configPath = join(dir, "config.json");
+    const port = 39_000 + Math.floor(Math.random() * 20_000);
+    writeFileSync(configPath, JSON.stringify({ listen: { host: "127.0.0.1", port }, maxConcurrent: 1 }));
     const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "server.ts")], {
-      env: { ...process.env, KAIROKU_DAEMON_CONFIG: join(dir, "absent.json"), KAIROKU_DAEMON_TOKEN: "" },
+      env: { ...process.env, KAIROKU_DAEMON_CONFIG: configPath, KAIROKU_DAEMON_TOKEN: "", HIKYAKU_TOKEN: "" },
       stdout: "pipe",
       stderr: "pipe",
     });
-    const [exitCode, stderr] = await Promise.all([
-      proc.exited,
-      new Response(proc.stderr).text(),
-    ]);
-    expect(exitCode).not.toBe(0);
-    expect(stderr).toContain("KAIROKU_DAEMON_TOKEN");
+    try {
+      expect(await reachable(port)).toBe(true);
+      const status = await (await fetch(`http://127.0.0.1:${port}/status`)).json();
+      expect(status.link).toEqual({ linked: false, runsInFlight: 0, pendingReports: 0 });
+      proc.kill("SIGTERM");
+      expect(await proc.exited).toBe(0);
+      expect(await new Response(proc.stdout).text()).toContain("not linking");
+    } finally {
+      if (!proc.killed) proc.kill("SIGKILL");
+    }
   }, 20_000);
 
   test("the pre-rename env names still work, with a deprecation line each", async () => {

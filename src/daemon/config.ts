@@ -1,12 +1,23 @@
 /**
- * Config — `~/.kairoku/config.json`, plus the bearer token from
- * KAIROKU_DAEMON_TOKEN or `token.env` beside the config file.
+ * Config — `~/.kairoku/config.json`, plus the credentials from the environment
+ * or `token.env` beside the config file.
  *
- * The token never lives in config.json (SPEC §Config). `token.env` (mode 600,
- * written by `kairoku setup --daemon`) is how the service gets it, so neither
- * the systemd unit nor the launchd plist carries a secret. The pre-rename
- * names — HIKYAKU_CONFIG, HIKYAKU_TOKEN, `~/.hikyaku/` — are honoured for one
- * version with a deprecation line; `migrateHome` copies the old dir once.
+ * `KAIROKU_DAEMON_TOKEN` KEEPS ITS NAME AND CHANGES MEANING (SPEC v1, RF-011):
+ * with the push API retired it is no longer an inbound bearer this daemon
+ * checks, it is the credential this daemon presents to the Kairoku app — the
+ * one Settings → Daemons prints. Nothing converts: an old value is simply not
+ * a token the app knows, and `doctor` says so.
+ *
+ * No credential ever lives in config.json. `token.env` (mode 600, written by
+ * `kairoku setup --daemon`) is how the service gets it, so neither the systemd
+ * unit nor the launchd plist carries a secret. The pre-rename names —
+ * HIKYAKU_CONFIG, HIKYAKU_TOKEN, `~/.hikyaku/` — are honoured for one version
+ * with a deprecation line; `migrateHome` copies the old dir once.
+ *
+ * The token is OPTIONAL. A rejected token stops the loop but keeps the
+ * listener up (RF-012), so an absent one cannot be a startup error either:
+ * `doctor` has to be able to reach a daemon in exactly that state.
+ *
  * The two optional function fields at the bottom are test seams; `loadConfig`
  * never populates them from JSON.
  */
@@ -34,7 +45,18 @@ export interface Config {
   readonly defaultTimeoutSec: number;
   /** Grace between SIGTERM and SIGKILL when killing an agent's process group. */
   readonly killGraceMs: number;
-  readonly token: string;
+
+  /** RF-011 — the app this daemon links to, no trailing slash. Absent = unlinked. */
+  readonly appUrl?: string;
+  /** RF-011 — the credential presented to the app. Absent = unlinked. */
+  readonly token?: string;
+  /**
+   * The interim `KAIROKU_PAT` for a run whose claim carried no run token.
+   * O-2 mints one per run and this goes away (§20.7).
+   */
+  readonly agentToken?: string;
+  /** The branch runs are cut from: `origin/<defaultBranch>`. */
+  readonly defaultBranch: string;
 
   /** Test-only (RF-009): substitute the role's command construction. */
   readonly commandOverride?: (spec: CommandSpec) => string[];
@@ -72,29 +94,55 @@ export function defaultConfigPath(
   return join(kairokuHome(), "config.json");
 }
 
-/** The token line of a token.env file: `KAIROKU_DAEMON_TOKEN=…` (or the pre-rename name). */
-export function parseTokenEnv(text: string): string | undefined {
-  return text.match(/^(?:KAIROKU_DAEMON_TOKEN|HIKYAKU_TOKEN)=(.+)$/m)?.[1]?.trim();
+/**
+ * Every `KEY=value` line of a token.env. It carries two names now — the app
+ * credential and the interim agent PAT — so a single-line regex would have to
+ * grow one branch per name.
+ */
+export function parseEnvFile(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of text.split("\n")) {
+    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/);
+    if (match) out[match[1]!] = match[2]!.trim();
+  }
+  return out;
 }
 
-export function readTokenEnv(path: string): string | undefined {
+/** The app credential in a token.env: `KAIROKU_DAEMON_TOKEN=…` (or the pre-rename name). */
+export function parseTokenEnv(text: string): string | undefined {
+  const env = parseEnvFile(text);
+  return env.KAIROKU_DAEMON_TOKEN || env.HIKYAKU_TOKEN || undefined;
+}
+
+export function readEnvFile(path: string): Record<string, string> {
   try {
-    return parseTokenEnv(readFileSync(path, "utf8"));
+    return parseEnvFile(readFileSync(path, "utf8"));
   } catch {
-    return undefined;
+    return {};
   }
 }
 
-function resolveToken(configPath: string, env: Record<string, string | undefined>, warn: Warn): string {
+export function readTokenEnv(path: string): string | undefined {
+  const env = readEnvFile(path);
+  return env.KAIROKU_DAEMON_TOKEN || env.HIKYAKU_TOKEN || undefined;
+}
+
+function resolveToken(
+  fromFile: Record<string, string>,
+  env: Record<string, string | undefined>,
+  warn: Warn,
+): string | undefined {
   if (env.KAIROKU_DAEMON_TOKEN) return env.KAIROKU_DAEMON_TOKEN;
   if (env.HIKYAKU_TOKEN) {
     warn("HIKYAKU_TOKEN is deprecated — set KAIROKU_DAEMON_TOKEN instead");
     return env.HIKYAKU_TOKEN;
   }
-  const tokenPath = join(dirname(configPath), "token.env");
-  const fromFile = readTokenEnv(tokenPath);
-  if (fromFile) return fromFile;
-  throw new Error(`KAIROKU_DAEMON_TOKEN is required (RF-006): set it, or write it to ${tokenPath}`);
+  return fromFile.KAIROKU_DAEMON_TOKEN || fromFile.HIKYAKU_TOKEN || undefined;
+}
+
+/** One trailing slash dropped here so no caller has to think about it again. */
+export function normaliseAppUrl(url: string): string {
+  return url.trim().replace(/\/+$/, "");
 }
 
 /**
@@ -134,7 +182,10 @@ export function loadConfig(
     if (e.code !== "ENOENT") throw err;
   }
 
-  const token = resolveToken(path, env, warn);
+  const tokenEnv = readEnvFile(join(dirname(path), "token.env"));
+  const token = resolveToken(tokenEnv, env, warn);
+  const agentToken = env.KAIROKU_AGENT_TOKEN || tokenEnv.KAIROKU_AGENT_TOKEN || undefined;
+  const appUrl = typeof file.appUrl === "string" && file.appUrl.trim() ? normaliseAppUrl(file.appUrl) : undefined;
 
   const listen = (file.listen ?? {}) as Partial<Listen>;
   const host = listen.host ?? "127.0.0.1";
@@ -150,6 +201,9 @@ export function loadConfig(
     keepWorktreeOnFailure: (file.keepWorktreeOnFailure as boolean) ?? false,
     defaultTimeoutSec: (file.defaultTimeoutSec as number) ?? DEFAULT_TIMEOUT_SEC,
     killGraceMs: (file.killGraceMs as number) ?? DEFAULT_KILL_GRACE_MS,
-    token,
+    defaultBranch: (file.defaultBranch as string) ?? "main",
+    ...(appUrl === undefined ? {} : { appUrl }),
+    ...(token === undefined ? {} : { token }),
+    ...(agentToken === undefined ? {} : { agentToken }),
   };
 }
