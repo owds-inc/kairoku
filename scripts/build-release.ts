@@ -19,7 +19,6 @@ export function formula(version: string, sha256: Record<string, string>): string
   return `class Kairoku < Formula
   desc "Set up the Kairoku Claude Code plugin and orchestration daemon"
   homepage "https://github.com/owds-inc/kairoku"
-  version "${version}"
   license "MIT"
 
   on_macos do
