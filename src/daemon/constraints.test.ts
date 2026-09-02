@@ -10,7 +10,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const srcDir = import.meta.dir;
-const repoDir = join(srcDir, "..");
+const repoDir = join(srcDir, "..", "..");
 
 /**
  * Strip block comments and whole-line comments so that prose ABOUT a rule is

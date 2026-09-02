@@ -1,9 +1,12 @@
-# hikyaku (飛脚) — dispatch runner, spec v0
+# Kairoku daemon — protocol v0
 
 *Frozen 2026-08-27 from `kairoku-plan/orch/runner-spec-seed.md` + `orch/PLAN.md` (decision C,
 ratified by Neil). The evidence base is `orch/dispatch-layer-research.md`. This file is the build
 contract for v0; changes to it are explicit amendments, never silent divergence. No dates, no
 estimates.*
+
+*Amended 2026-09-02: retitled for the Kairoku CLI repo (planning `DECISIONS.md` §19). The config dir,
+token env and service names are amended in Phase 3 of `docs/plans/2026-09-02-kairoku-cli-v0.1.md`.*
 
 ## Objective
 
@@ -17,8 +20,8 @@ their own credentials.
 ## License discipline
 
 Paseo (AGPL-3.0) is behavioral reference ONLY. Nothing from its codebase is copied, ported, or
-closely paraphrased. The API here is designed fresh. This keeps hikyaku MIT-or-proprietary and
-product-embeddable.
+closely paraphrased. The API here is designed fresh. This keeps the Kairoku daemon MIT-licensed
+and product-embeddable.
 
 ## Stack
 

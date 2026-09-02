@@ -11,7 +11,7 @@ import { join } from "node:path";
 
 const dirs: string[] = [];
 function tmp(): string {
-  const dir = mkdtempSync(join(tmpdir(), "hikyaku-daemon-"));
+  const dir = mkdtempSync(join(tmpdir(), "kairoku-daemon-"));
   dirs.push(dir);
   return dir;
 }
@@ -36,8 +36,7 @@ async function startDaemon(overrides: Record<string, unknown> = {}) {
   );
   mkdirSync(join(dir, "runs"), { recursive: true });
 
-  const proc = Bun.spawn(["bun", "run", "src/server.ts"], {
-    cwd: import.meta.dir + "/..",
+  const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "server.ts")], {
     env: {
       ...process.env,
       HIKYAKU_CONFIG: configPath,
@@ -85,8 +84,7 @@ describe("daemon process", () => {
 
   test("refuses to start without HIKYAKU_TOKEN", async () => {
     const dir = tmp();
-    const proc = Bun.spawn(["bun", "run", "src/server.ts"], {
-      cwd: import.meta.dir + "/..",
+    const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "server.ts")], {
       env: { ...process.env, HIKYAKU_CONFIG: join(dir, "absent.json"), HIKYAKU_TOKEN: "" },
       stdout: "pipe",
       stderr: "pipe",

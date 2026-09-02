@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "kairoku": {
+      "type": "http",
+      "url": "${user_config.kairoku_url}/api/mcp"
+    }
+  }
+}
