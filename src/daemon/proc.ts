@@ -172,7 +172,21 @@ export function launch(opts: LaunchOptions): ProcHandle {
     });
   });
 
-  child.on("exit", (code, signal) => {
+  child.on("exit", async (code, signal) => {
+    // The run is over; nothing it forked survives it. A grandchild forked in
+    // the instant the group was signalled missed that signal (seen on linux,
+    // where sh forks `sleep` rather than exec'ing it), and an agent that exits
+    // cleanly may leave a background process behind — either way the worktree
+    // is about to be torn down from under it. Sweep the group and wait for it
+    // to be gone, so `exited` means the whole run is gone.
+    const pid = child.pid;
+    if (pid !== undefined && groupAlive(pid)) {
+      killGroup(pid, "SIGKILL");
+      const deadline = Date.now() + graceMs;
+      while (groupAlive(pid) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    }
     settle({
       outcome: pending ?? "exited",
       exitCode: code,
