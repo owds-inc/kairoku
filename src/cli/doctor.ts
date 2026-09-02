@@ -7,7 +7,7 @@
  */
 
 import { join } from "node:path";
-import type { Io } from "./io";
+import { version, type Io } from "./io";
 import { installedPlugin } from "./plugin";
 
 export type Check = { name: string; status: "PASS" | "WARN" | "FAIL"; detail?: string };
@@ -28,13 +28,6 @@ export function daemonHome(io: Io): string | null {
   return null;
 }
 
-/** First line of `<bin> --version`, or null when the binary is not on PATH. */
-async function version(io: Io, bin: string): Promise<string | null> {
-  if (!io.which(bin)) return null;
-  const r = await io.shell([bin, "--version"]);
-  return r.stdout.split("\n")[0]?.trim() ?? "";
-}
-
 async function http(io: Io, url: string, headers: Record<string, string>) {
   try {
     const r = await io.fetch(url, { headers, signal: AbortSignal.timeout(5000) });
@@ -42,6 +35,25 @@ async function http(io: Io, url: string, headers: Record<string, string>) {
   } catch {
     return { status: 0, body: "" };
   }
+}
+
+/**
+ * The daemon's two-request proof: 401 without the token, 200 with it. `attempts`
+ * > 1 waits for a daemon that was just started (500 ms between tries).
+ */
+export async function roundTrip(io: Io, url: string, token: string, attempts = 1): Promise<Check[]> {
+  let anon = await http(io, url, {});
+  for (let left = attempts - 1; left > 0 && anon.status === 0; left--) {
+    await new Promise((r) => setTimeout(r, 500));
+    anon = await http(io, url, {});
+  }
+  const auth = await http(io, url, { authorization: `Bearer ${token}` });
+  return [
+    anon.status === 401 ? pass("unauthenticated request refused", "401") : fail("unauthenticated request refused", `got ${anon.status}, expected 401`),
+    auth.status === 200 && auth.body.includes('"max"')
+      ? pass("authenticated request answers", auth.body)
+      : fail("authenticated request answers", `got ${auth.status}: ${auth.body || "<no response>"}`),
+  ];
 }
 
 export async function checks(io: Io): Promise<Check[]> {
@@ -145,15 +157,7 @@ export async function checks(io: Io): Promise<Check[]> {
   const token = io.readFile(tokenPath)?.match(/^(?:KAIROKU_DAEMON_TOKEN|HIKYAKU_TOKEN)=(.+)$/m)?.[1]?.trim();
   const { host, port } = config.listen ?? {};
   if (host && port && token) {
-    const url = `http://${host}:${port}/capacity`;
-    const anon = await http(io, url, {});
-    out.push(anon.status === 401 ? pass("unauthenticated request refused", "401") : fail("unauthenticated request refused", `got ${anon.status}, expected 401`));
-    const auth = await http(io, url, { authorization: `Bearer ${token}` });
-    out.push(
-      auth.status === 200 && auth.body.includes('"max"')
-        ? pass("authenticated request answers", auth.body)
-        : fail("authenticated request answers", `got ${auth.status}: ${auth.body || "<no response>"}`),
-    );
+    out.push(...(await roundTrip(io, `http://${host}:${port}/capacity`, token)));
   } else {
     out.push(fail("daemon reachable", "cannot test — listen host/port or the token is missing"));
   }
