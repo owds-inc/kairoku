@@ -7,9 +7,11 @@
 
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { kairokuHome, migrateHome, parseTokenEnv } from "../daemon/config";
+import { appClient } from "../daemon/app";
+import { kairokuHome, migrateHome, normaliseAppUrl, parseTokenEnv } from "../daemon/config";
+import { version as cliVersion } from "../../package.json";
 import * as daemonCmd from "./daemon";
-import { roundTrip } from "./doctor";
+import { daemonStatus, reachable } from "./doctor";
 import type { Io } from "./io";
 import * as plugin from "./plugin";
 import {
@@ -19,14 +21,17 @@ import {
   configuredRepoUrl,
   daemonConfig,
   DEFAULT_APP_REPO,
+  DEFAULT_APP_URL,
   remainder,
   runtimes,
   shellPath,
   userns,
+  writeAppLink,
   type Step,
 } from "./provision";
 
 export const usage = `usage: kairoku setup [--plugin] [--daemon] [--all] [--yes] [--repo <url>]
+                     [--app-url <url>] [--app-token <token>]
 
   Without flags, a wizard asks what to set up.
   --plugin       install the Claude Code plugin (= kairoku plugin install)
@@ -35,7 +40,10 @@ export const usage = `usage: kairoku setup [--plugin] [--daemon] [--all] [--yes]
   --all          both
   --yes, -y      no prompts; alone it means --all
   --repo <url>   the app repo to clone as the worktree base (asked once,
-                 then remembered as repoUrl in ~/.kairoku/config.json)`;
+                 then remembered as repoUrl in ~/.kairoku/config.json)
+  --app-url      the Kairoku app this daemon reports to
+  --app-token    its daemon credential — both are printed once by
+                 Settings → Daemons in the app`;
 
 function parse(args: string[]) {
   return parseArgs({
@@ -46,6 +54,8 @@ function parse(args: string[]) {
       all: { type: "boolean" },
       yes: { type: "boolean", short: "y" },
       repo: { type: "string" },
+      "app-url": { type: "string" },
+      "app-token": { type: "string" },
       help: { type: "boolean", short: "h" },
     },
   }).values;
@@ -58,7 +68,66 @@ async function confirm(io: Io, question: string, fallback: boolean): Promise<boo
 
 const mark = { done: "✔", skipped: "–", manual: "!" } as const;
 
-export async function daemon(io: Io, opts: { yes: boolean; repo?: string }): Promise<number> {
+/**
+ * RF-011 — the app link, written and then PROVED with one heartbeat before the
+ * service is installed.
+ *
+ * Proving it here is the whole point: a token that the app refuses looks
+ * exactly like a working one in a config file, and finding that out from a
+ * service that quietly does nothing is the failure this step exists to
+ * prevent. A 401 stops setup; nothing is installed.
+ */
+async function appLink(
+  io: Io,
+  opts: { yes: boolean; appUrl?: string; appToken?: string },
+): Promise<{ step: Step; stop?: string }> {
+  const name = "app link";
+  const home = kairokuHome(io.home);
+  const configured = (() => {
+    try {
+      return (JSON.parse(io.readFile(join(home, "config.json")) ?? "{}") as { appUrl?: unknown }).appUrl;
+    } catch {
+      return undefined;
+    }
+  })();
+
+  const existingToken = parseTokenEnv(io.readFile(join(home, "token.env")) ?? "");
+  let appUrl = opts.appUrl ?? (typeof configured === "string" ? configured : undefined);
+  let token = opts.appToken ?? existingToken;
+
+  if (!opts.yes && (!appUrl || !token)) {
+    appUrl ||= (await io.ask(`Kairoku app URL [${DEFAULT_APP_URL}]: `)) || DEFAULT_APP_URL;
+    // Read, never echoed: the answer goes straight to a 0600 file.
+    token ||= await io.ask("Daemon token from Settings → Daemons (kai_…): ");
+  }
+  if (!appUrl || !token) {
+    return {
+      step: {
+        name,
+        outcome: "manual",
+        detail:
+          "not linked — mint a daemon token in the app under Settings → Daemons, then rerun:\n" +
+          "     kairoku setup --daemon --app-url <url> --app-token <kai_…>",
+      },
+    };
+  }
+
+  appUrl = normaliseAppUrl(appUrl);
+  // Written first so a failed proof still leaves the operator's own values in
+  // place to correct, rather than making them retype both.
+  writeAppLink(io, appUrl, token);
+
+  const result = await appClient({ appUrl, token, fetch: io.fetch }).heartbeat({
+    meta: { host: io.env.HOSTNAME ?? "this machine", version: cliVersion, capacity: { running: 0, max: 0 } },
+  });
+  if (!result.ok) return { step: { name, outcome: "manual", detail: result.error }, stop: result.error };
+  return { step: { name, outcome: "done", detail: `app link proved — ${appUrl} says ${result.body.liveness}` } };
+}
+
+export async function daemon(
+  io: Io,
+  opts: { yes: boolean; repo?: string; appUrl?: string; appToken?: string },
+): Promise<number> {
   io.out("== daemon");
   const steps: Step[] = [];
   const show = (s: Step) => {
@@ -83,6 +152,15 @@ export async function daemon(io: Io, opts: { yes: boolean; repo?: string }): Pro
   show(await codexConfig(io));
   for (const s of await daemonConfig(io, appCheckoutDir(io), repoUrl)) show(s);
 
+  const link = await appLink(io, { yes: opts.yes, appUrl: opts.appUrl, appToken: opts.appToken });
+  show(link.step);
+  if (link.stop) {
+    // Nothing is installed behind a link that does not work.
+    io.out(`\n== stopped: ${link.stop}`);
+    io.out("   mint a fresh token in the app under Settings → Daemons and rerun with --app-token");
+    return 1;
+  }
+
   io.out("== daemon service");
   const service = await daemonCmd.run(["install"], io);
   if (service !== 0) return service;
@@ -92,18 +170,19 @@ export async function daemon(io: Io, opts: { yes: boolean; repo?: string }): Pro
   try {
     listen = (JSON.parse(io.readFile(join(home, "config.json")) ?? "{}") as { listen?: typeof listen }).listen ?? {};
   } catch {
-    // reported by the round trip below
+    // reported by the reachability check below
   }
-  const token = parseTokenEnv(io.readFile(join(home, "token.env")) ?? "") ?? "";
-  const checks = await roundTrip(io, `http://${listen.host}:${listen.port}/capacity`, token, 10);
-  for (const c of checks) io.out(`   ${c.status}  ${c.name.padEnd(34)} ${c.detail ?? ""}`.trimEnd());
+  const statusUrl = `http://${listen.host ?? "127.0.0.1"}:${listen.port ?? 7801}/status`;
+  // Ten tries: the service was started moments ago.
+  const check = reachable(statusUrl, await daemonStatus(io, statusUrl, 10));
+  io.out(`   ${check.status}  ${check.name.padEnd(34)} ${check.detail ?? ""}`.trimEnd());
 
   const owed = remainder(io, steps);
   io.out("");
   io.out(owed.length ? "== done. What is left is human-only:\n" : "== done. Nothing human-only is outstanding on this machine.");
   for (const item of owed) io.out(`  ${item}`);
-  io.out("\n  At dispatch time: export KAIROKU_PAT=…  (the slot PAT — never stored here)\n\nThen: kairoku doctor");
-  return checks.every((c) => c.status === "PASS") ? 0 : 1;
+  io.out("\nThen: kairoku doctor");
+  return check.status === "PASS" ? 0 : 1;
 }
 
 export async function run(args: string[], io: Io): Promise<number> {
@@ -137,6 +216,13 @@ export async function run(args: string[], io: Io): Promise<number> {
     const code = await plugin.run(["install"], io);
     if (code !== 0) return code;
   }
-  if (wantDaemon) return daemon(io, { yes: Boolean(values.yes), repo: values.repo });
+  if (wantDaemon) {
+    return daemon(io, {
+      yes: Boolean(values.yes),
+      repo: values.repo,
+      appUrl: values["app-url"],
+      appToken: values["app-token"],
+    });
+  }
   return 0;
 }
