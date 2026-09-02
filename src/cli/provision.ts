@@ -187,7 +187,7 @@ export async function daemonConfig(io: Io, repoPath: string, repoUrl?: string): 
     const config = { listen: { host, port: 7801 }, maxConcurrent: 2, repoPath, ...(repoUrl ? { repoUrl } : {}) };
     io.writeFile(configPath, JSON.stringify(config, null, 2) + "\n");
     steps.push(done("config.json", `bound to ${host}:7801 (never 0.0.0.0)`));
-  } else if (repoUrl && configuredRepoUrl(io) === undefined) {
+  } else if (repoUrl && configuredRepoUrl(io) !== repoUrl) {
     io.writeFile(configPath, JSON.stringify({ ...JSON.parse(existing), repoUrl }, null, 2) + "\n");
     steps.push(done("config.json", `recorded repoUrl ${repoUrl}`));
   } else {

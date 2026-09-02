@@ -7,6 +7,7 @@
  */
 
 import { join } from "node:path";
+import { parseTokenEnv } from "../daemon/config";
 import { version, type Io } from "./io";
 import { installedPlugin } from "./plugin";
 
@@ -154,7 +155,7 @@ export async function checks(io: Io): Promise<Check[]> {
     // reported above as present; a malformed file fails the round trip below
   }
   // The token is read and sent, never printed.
-  const token = io.readFile(tokenPath)?.match(/^(?:KAIROKU_DAEMON_TOKEN|HIKYAKU_TOKEN)=(.+)$/m)?.[1]?.trim();
+  const token = parseTokenEnv(io.readFile(tokenPath) ?? "");
   const { host, port } = config.listen ?? {};
   if (host && port && token) {
     out.push(...(await roundTrip(io, `http://${host}:${port}/capacity`, token)));

@@ -73,9 +73,13 @@ export function defaultConfigPath(
 }
 
 /** The token line of a token.env file: `KAIROKU_DAEMON_TOKEN=…` (or the pre-rename name). */
+export function parseTokenEnv(text: string): string | undefined {
+  return text.match(/^(?:KAIROKU_DAEMON_TOKEN|HIKYAKU_TOKEN)=(.+)$/m)?.[1]?.trim();
+}
+
 export function readTokenEnv(path: string): string | undefined {
   try {
-    return readFileSync(path, "utf8").match(/^(?:KAIROKU_DAEMON_TOKEN|HIKYAKU_TOKEN)=(.+)$/m)?.[1]?.trim();
+    return parseTokenEnv(readFileSync(path, "utf8"));
   } catch {
     return undefined;
   }
