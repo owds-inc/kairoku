@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+# Retires at P4 (KAIR-303): sprint create/start/close/add moved into the Kairoku
+# app at this point and were removed from here (KAIR-396). list/current/issues,
+# board and rank stay — rank has no app replacement.
+"""kairoku-jira — the Jira Agile operations the Atlassian MCP server does not expose.
+
+Boards, sprints, and ranking live in Jira's Agile REST API (/rest/agile/1.0), which
+the MCP server does not surface. Everything else an agent needs — issues, comments,
+transitions, links, search — is on the MCP server and should go through it instead.
+Do not reach for this script for anything an MCP tool already covers.
+
+Configuration is resolved in this order, first hit wins:
+  1. flags:      --site --email --token --project
+  2. plugin:     CLAUDE_PLUGIN_OPTION_* (kept for compatibility; the plugin no longer
+                 declares Atlassian userConfig keys — the app holds the credentials,
+                 and this script is an env-var opt-in until sprint ops move into it)
+  3. environment: KAIROKU_ATLASSIAN_SITE / _EMAIL / _API_TOKEN, KAIROKU_JIRA_PROJECT_KEY
+  4. file:       ~/.config/kairoku/jira.json  {"site","email","token","project"}
+
+Exit codes: 0 ok · 2 not configured · 3 not found · 4 Jira API error · 64 usage.
+A caller that sees 2 should fall back to label-only sprint handling and say so.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import pathlib
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+EXIT_OK, EXIT_UNCONFIGURED, EXIT_NOT_FOUND, EXIT_API, EXIT_USAGE = 0, 2, 3, 4, 64
+
+CONFIG_FILE = pathlib.Path.home() / ".config" / "kairoku" / "jira.json"
+
+# The one place that names each config key's environment variable, so the
+# unconfigured-exit message (require(), below) can never drift from what
+# resolve_config() actually reads for it.
+ENV_VAR = {
+    "site": "KAIROKU_ATLASSIAN_SITE",
+    "email": "KAIROKU_ATLASSIAN_EMAIL",
+    "token": "KAIROKU_ATLASSIAN_API_TOKEN",
+    "project": "KAIROKU_JIRA_PROJECT_KEY",
+}
+
+
+# --- configuration -----------------------------------------------------------
+
+
+def _from_file() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def resolve_config(args: argparse.Namespace) -> dict:
+    """First hit wins across flags, plugin options, environment, then the config file."""
+    on_disk = _from_file()
+
+    def pick(flag, *env_names, key):
+        if flag:
+            return flag
+        for name in env_names:
+            value = os.environ.get(name)
+            if value:
+                return value
+        return on_disk.get(key)
+
+    site = pick(
+        args.site,
+        "CLAUDE_PLUGIN_OPTION_ATLASSIAN_SITE",
+        ENV_VAR["site"],
+        key="site",
+    )
+    return {
+        "site": site.rstrip("/") if site else None,
+        "email": pick(
+            args.email,
+            "CLAUDE_PLUGIN_OPTION_ATLASSIAN_EMAIL",
+            ENV_VAR["email"],
+            key="email",
+        ),
+        "token": pick(
+            args.token,
+            "CLAUDE_PLUGIN_OPTION_ATLASSIAN_API_TOKEN",
+            ENV_VAR["token"],
+            key="token",
+        ),
+        "project": pick(
+            args.project,
+            "CLAUDE_PLUGIN_OPTION_JIRA_PROJECT_KEY",
+            ENV_VAR["project"],
+            key="project",
+        ),
+    }
+
+
+def require(config: dict, *keys: str) -> None:
+    missing = [k for k in keys if not config.get(k)]
+    if missing:
+        die(
+            EXIT_UNCONFIGURED,
+            "not configured: missing "
+            + ", ".join(missing)
+            + ". Export "
+            + ", ".join(ENV_VAR[k] for k in missing)
+            + ", or set them in ~/.config/kairoku/jira.json. "
+            "Sprint operations are unavailable until then; everything else still works.",
+        )
+
+
+# --- transport ---------------------------------------------------------------
+
+
+def call(config: dict, method: str, path: str, body: dict | None = None, query: dict | None = None):
+    url = f"{config['site']}/rest/agile/1.0{path}"
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+
+    credentials = base64.b64encode(f"{config['email']}:{config['token']}".encode()).decode()
+    payload = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url, data=payload, method=method)
+    request.add_header("Authorization", f"Basic {credentials}")
+    request.add_header("Accept", "application/json")
+    if payload:
+        request.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")[:600]
+        if error.code in (401, 403):
+            die(
+                EXIT_UNCONFIGURED,
+                f"Jira rejected the credentials ({error.code}). Check the email and API "
+                f"token, and that the account can see {config.get('project')}.",
+            )
+        die(EXIT_API, f"{method} {path} failed: {error.code} {detail}")
+    except urllib.error.URLError as error:
+        die(EXIT_API, f"cannot reach {config['site']}: {error.reason}")
+
+
+def paged(config: dict, path: str, query: dict | None = None, field: str = "values") -> list:
+    """Walk Jira's startAt/isLast pagination and return every item."""
+    items, start = [], 0
+    while True:
+        page = call(config, "GET", path, query={**(query or {}), "startAt": start, "maxResults": 50})
+        batch = page.get(field, [])
+        items.extend(batch)
+        if page.get("isLast", True) or not batch:
+            return items
+        start += len(batch)
+
+
+# --- helpers -----------------------------------------------------------------
+
+
+def die(code: int, message: str) -> None:
+    print(f"kairoku-jira: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def emit(as_json: bool, payload, lines: list[str]) -> None:
+    if as_json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print("\n".join(lines) if lines else "(none)")
+
+
+def resolve_board(config: dict) -> dict:
+    require(config, "site", "email", "token", "project")
+    boards = paged(config, "/board", {"projectKeyOrId": config["project"]})
+    if not boards:
+        die(EXIT_NOT_FOUND, f"no board found for project {config['project']}")
+    scrum = [b for b in boards if b.get("type") == "scrum"]
+    return (scrum or boards)[0]
+
+
+def resolve_sprint(config: dict, needle: str) -> dict:
+    """Accept a sprint id, or match a name case-insensitively (exact first, then prefix)."""
+    if needle.isdigit():
+        return call(config, "GET", f"/sprint/{needle}")
+
+    board = resolve_board(config)
+    sprints = paged(config, f"/board/{board['id']}/sprint")
+    wanted = needle.strip().lower()
+    exact = [s for s in sprints if s.get("name", "").strip().lower() == wanted]
+    if exact:
+        return exact[0]
+    prefix = [s for s in sprints if s.get("name", "").strip().lower().startswith(wanted)]
+    if len(prefix) == 1:
+        return prefix[0]
+    if len(prefix) > 1:
+        names = ", ".join(s["name"] for s in prefix)
+        die(EXIT_NOT_FOUND, f"'{needle}' matches several sprints: {names}")
+    die(EXIT_NOT_FOUND, f"no sprint matching '{needle}' on board {board['id']}")
+
+
+def describe_sprint(sprint: dict) -> str:
+    window = ""
+    if sprint.get("startDate") and sprint.get("endDate"):
+        window = f"  {sprint['startDate'][:10]} → {sprint['endDate'][:10]}"
+    goal = f"  goal: {sprint['goal']}" if sprint.get("goal") else ""
+    return f"[{sprint['id']}] {sprint.get('state', '?'):<7} {sprint.get('name', '')}{window}{goal}"
+
+
+# --- commands ----------------------------------------------------------------
+
+
+def cmd_config_check(config: dict, args) -> None:
+    have = {k: bool(v) for k, v in config.items()}
+    lines = [f"{'✓' if v else '✗'} {k}" for k, v in have.items()]
+    if all(have.values()):
+        board = resolve_board(config)
+        lines.append(f"✓ board [{board['id']}] {board.get('name')}")
+        emit(args.json, {"configured": True, "board": board}, lines)
+        return
+    emit(args.json, {"configured": False, "have": have}, lines)
+    sys.exit(EXIT_UNCONFIGURED)
+
+
+def cmd_board_list(config: dict, args) -> None:
+    require(config, "site", "email", "token", "project")
+    boards = paged(config, "/board", {"projectKeyOrId": config["project"]})
+    emit(
+        args.json,
+        boards,
+        [f"[{b['id']}] {b.get('type', '?'):<6} {b.get('name', '')}" for b in boards],
+    )
+
+
+def cmd_sprint_list(config: dict, args) -> None:
+    board = resolve_board(config)
+    query = {"state": args.state} if args.state else None
+    sprints = paged(config, f"/board/{board['id']}/sprint", query)
+    emit(args.json, sprints, [describe_sprint(s) for s in sprints])
+
+
+def cmd_sprint_current(config: dict, args) -> None:
+    board = resolve_board(config)
+    active = paged(config, f"/board/{board['id']}/sprint", {"state": "active"})
+    if not active:
+        die(EXIT_NOT_FOUND, f"no active sprint on board {board['id']}")
+    emit(args.json, active[0], [describe_sprint(active[0])])
+
+
+def cmd_sprint_issues(config: dict, args) -> None:
+    sprint = resolve_sprint(config, args.sprint)
+    issues = paged(config, f"/sprint/{sprint['id']}/issue", {"fields": "summary,status,assignee"}, field="issues")
+    lines = []
+    for issue in issues:
+        fields = issue.get("fields", {})
+        assignee = (fields.get("assignee") or {}).get("displayName", "unassigned")
+        status = (fields.get("status") or {}).get("name", "?")
+        lines.append(f"{issue['key']:<12} {status:<14} {assignee:<20} {fields.get('summary', '')}")
+    emit(args.json, issues, lines)
+
+
+def cmd_rank(config: dict, args) -> None:
+    require(config, "site", "email", "token")
+    body = {"issues": args.issues}
+    if args.after:
+        body["rankAfterIssue"] = args.after
+    elif args.before:
+        body["rankBeforeIssue"] = args.before
+    else:
+        die(EXIT_USAGE, "rank needs --after KEY or --before KEY")
+    call(config, "PUT", "/issue/rank", body)
+    anchor = f"after {args.after}" if args.after else f"before {args.before}"
+    emit(args.json, {"ranked": args.issues, "anchor": anchor}, [f"ranked {', '.join(args.issues)} {anchor}"])
+
+
+# --- entry point -------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="kairoku-jira",
+        description="Jira Agile operations (boards, sprints, ranking) not exposed by the Atlassian MCP server.",
+    )
+    for flag, help_text in (
+        ("--site", "Atlassian site URL"),
+        ("--email", "Atlassian account email"),
+        ("--token", "Atlassian API token"),
+        ("--project", "Jira project key"),
+    ):
+        parser.add_argument(flag, default=None, help=help_text)
+    parser.add_argument("--json", action="store_true", help="emit raw JSON instead of lines")
+
+    sub = parser.add_subparsers(dest="group", required=True)
+
+    config_group = sub.add_parser("config", help="inspect configuration").add_subparsers(dest="cmd", required=True)
+    config_group.add_parser("check", help="report what is configured").set_defaults(func=cmd_config_check)
+
+    board_group = sub.add_parser("board", help="boards").add_subparsers(dest="cmd", required=True)
+    board_group.add_parser("list", help="list the project's boards").set_defaults(func=cmd_board_list)
+
+    sprint_group = sub.add_parser("sprint", help="sprints").add_subparsers(dest="cmd", required=True)
+
+    listing = sprint_group.add_parser("list", help="list sprints")
+    listing.add_argument("--state", help="comma-separated: active,future,closed")
+    listing.set_defaults(func=cmd_sprint_list)
+
+    sprint_group.add_parser("current", help="the active sprint").set_defaults(func=cmd_sprint_current)
+
+    issues = sprint_group.add_parser("issues", help="list a sprint's issues")
+    issues.add_argument("sprint", help="sprint id or name")
+    issues.set_defaults(func=cmd_sprint_issues)
+
+    ranking = sub.add_parser("rank", help="rank issues relative to another")
+    ranking.add_argument("issues", nargs="+", metavar="ISSUE")
+    ranking.add_argument("--after", metavar="KEY")
+    ranking.add_argument("--before", metavar="KEY")
+    ranking.set_defaults(func=cmd_rank)
+
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.func(resolve_config(args), args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -1,0 +1,12 @@
+{
+  "name": "kairoku-marketplace",
+  "description": "Kairoku — the spec-to-ship delivery harness for solo builders driving AI agents, with Kairoku, Jira and Confluence as the systems of record.",
+  "owner": { "name": "Neil Pandit" },
+  "plugins": [
+    {
+      "name": "kairoku",
+      "source": "./plugin/",
+      "description": "Kairoku's MCP tools over OAuth (no pasted tokens), the jira-ops / git-pr / kairoku-mcp protocol skills, and the implementer agent."
+    }
+  ]
+}

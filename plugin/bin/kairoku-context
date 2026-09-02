@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Session-start orientation. Local git only — no network, no API calls, so it costs
+# nothing and cannot make a session hang. Prints one line, or nothing at all.
+set -euo pipefail
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || exit 0)
+
+case "$branch" in
+  mvp/*)
+    epic="${branch#mvp/}"
+    echo "Kairoku: on epic integration branch for ${epic}. /kairoku:next for the next action."
+    ;;
+  story/* | fix/*)
+    key=$(echo "${branch#*/}" | sed -E 's/^([A-Za-z]+-[0-9]+).*/\1/')
+    echo "Kairoku: on a story branch for ${key}. Tests first; do not merge from here."
+    ;;
+  *)
+    exit 0
+    ;;
+esac
