@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { io as realIo } from "./io";
 import { run } from "./setup";
 import { DEFAULT_APP_REPO } from "./provision";
 import { fakeIo, type FakeIo } from "./testkit";
@@ -172,6 +176,64 @@ describe("kairoku setup — daemon", () => {
       expect(await run(args, io)).toBe(0);
       expect(calls(io).slice(0, 4)).toEqual(pluginInstallCalls);
       expect(io.lines.join("\n")).toContain("== daemon");
+    }
+  });
+});
+
+describe("kairoku setup — daemon migrates a pre-rename home first", () => {
+  test("~/.hikyaku is copied before anything is generated: legacy token and config survive, no new token", async () => {
+    const home = mkdtempSync(join(tmpdir(), "kairoku-setup-home-"));
+    try {
+      const old = join(home, ".hikyaku");
+      mkdirSync(join(old, "runs", "oldrun"), { recursive: true });
+      writeFileSync(join(old, "config.json"), JSON.stringify({ listen: { host: "10.0.0.5", port: 7999 }, maxConcurrent: 3, repoPath: join(home, "work", "kairoku") }));
+      writeFileSync(join(old, "token.env"), "HIKYAKU_TOKEN=legacy-token\n", { mode: 0o600 });
+      writeFileSync(join(old, "runs", "oldrun", "events.jsonl"), "{}\n");
+      mkdirSync(join(home, "work", "kairoku", ".git"), { recursive: true });
+      mkdirSync(join(home, ".codex"), { recursive: true });
+      writeFileSync(join(home, ".codex", "config.toml"), 'bearer_token_env_var = "KAIROKU_PAT"\ndefault_tools_approval_mode = "approve"\n');
+      writeFileSync(join(home, ".codex", "auth.json"), "{}");
+      mkdirSync(join(home, ".claude"));
+      writeFileSync(join(home, ".bashrc"), `export PATH="${home}/.bun/bin:$PATH"\n`);
+      // The filesystem is real (the migration copies real files); shell, prompts and fetch stay fake.
+      const io = withClaude(fakeIo({
+        platform: "linux",
+        home,
+        env: { USER: "neil", PATH: "/usr/bin:/bin" },
+        exists: realIo.exists,
+        readFile: realIo.readFile,
+        mode: realIo.mode,
+        writeFile: realIo.writeFile,
+      }));
+      for (const b of ["node", "bun", "codex", "paseo", "git"]) io.bins.add(b);
+      Object.assign(io.canned, { "node --version": { stdout: "v24.1.0\n" }, "bun --version": { stdout: "1.3.14\n" }, "sudo -n true": { code: 0 } });
+      const seen: string[] = [];
+      io.fetch = async (url, init) => {
+        const auth = new Headers(init?.headers).get("authorization") ?? "";
+        seen.push(auth);
+        if (!url.startsWith("http://10.0.0.5:7999/capacity")) return new Response("", { status: 404 });
+        return auth === "Bearer legacy-token" ? Response.json({ running: 0, max: 3 }) : new Response("", { status: 401 });
+      };
+
+      expect(await run(["--daemon", "--yes"], io)).toBe(0);
+
+      const fresh = join(home, ".kairoku");
+      expect(readFileSync(join(fresh, "token.env"), "utf8")).toBe("KAIROKU_DAEMON_TOKEN=legacy-token\n");
+      expect(statSync(join(fresh, "token.env")).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(readFileSync(join(fresh, "config.json"), "utf8"))).toMatchObject({
+        listen: { host: "10.0.0.5", port: 7999 },
+        maxConcurrent: 3,
+        repoUrl: DEFAULT_APP_REPO,
+      });
+      expect(existsSync(join(fresh, "runs", "oldrun", "events.jsonl"))).toBe(true);
+      expect(existsSync(join(old, "token.env"))).toBe(true);
+      const out = io.lines.join("\n");
+      expect(out).toContain("migrated");
+      expect(out).toContain("not shown, not regenerated");
+      expect(out).not.toContain("generated at");
+      expect(seen).toContain("Bearer legacy-token");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });

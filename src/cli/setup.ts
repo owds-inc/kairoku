@@ -7,7 +7,7 @@
 
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { kairokuHome, parseTokenEnv } from "../daemon/config";
+import { kairokuHome, migrateHome, parseTokenEnv } from "../daemon/config";
 import * as daemonCmd from "./daemon";
 import { roundTrip } from "./doctor";
 import type { Io } from "./io";
@@ -65,6 +65,12 @@ export async function daemon(io: Io, opts: { yes: boolean; repo?: string }): Pro
     steps.push(s);
     io.out(`   ${mark[s.outcome]} ${s.name} — ${s.detail}`);
   };
+  // Before anything else writes ~/.kairoku: a pre-rename ~/.hikyaku is copied
+  // first, so its token and config are what the steps below find — not a
+  // freshly minted token beside an abandoned one.
+  if (migrateHome(io.home) === "migrated") {
+    show({ name: "pre-rename config dir", outcome: "done", detail: "migrated ~/.hikyaku to ~/.kairoku (copied; the old dir is untouched)" });
+  }
   for (const s of await runtimes(io)) show(s);
   show(await shellPath(io));
 
