@@ -1,29 +1,47 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-
-const main = join(import.meta.dir, "main.ts");
-
-async function cli(...args: string[]) {
-  const proc = Bun.spawn(["bun", "run", main, ...args], { stdout: "pipe", stderr: "pipe" });
-  const [code, stdout, stderr] = await Promise.all([
-    proc.exited,
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  return { code, stdout, stderr };
-}
+import { main } from "./main";
+import { fakeIo } from "./testkit";
 
 describe("kairoku cli", () => {
   test("version prints the package version", async () => {
-    const { code, stdout } = await cli("version");
-    expect(code).toBe(0);
-    expect(stdout.trim()).toBe("kairoku 0.1.0");
+    const io = fakeIo();
+    expect(await main(["version"], io)).toBe(0);
+    expect(io.lines).toEqual(["kairoku 0.1.0"]);
+  });
+
+  test("--version and -v are aliases", async () => {
+    for (const flag of ["--version", "-v"]) {
+      const io = fakeIo();
+      expect(await main([flag], io)).toBe(0);
+      expect(io.lines).toEqual(["kairoku 0.1.0"]);
+    }
+  });
+
+  test("help, --help, -h and no arguments print usage on stdout", async () => {
+    for (const args of [["help"], ["--help"], ["-h"], []]) {
+      const io = fakeIo();
+      expect(await main(args, io)).toBe(0);
+      expect(io.lines.join("\n")).toContain("kairoku setup");
+      expect(io.lines.join("\n")).toContain("kairoku doctor");
+    }
   });
 
   test("an unknown command exits 2 with usage on stderr", async () => {
-    const { code, stderr } = await cli("frobnicate");
-    expect(code).toBe(2);
-    expect(stderr).toContain("unknown command");
-    expect(stderr).toContain("kairoku version");
+    const io = fakeIo();
+    expect(await main(["frobnicate"], io)).toBe(2);
+    expect(io.errors.join("\n")).toContain('unknown command "frobnicate"');
+    expect(io.errors.join("\n")).toContain("kairoku version");
+    expect(io.lines).toEqual([]);
+  });
+
+  test("the real entry runs: bun run main.ts version", async () => {
+    const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "main.ts"), "version"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [code, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+    expect(code).toBe(0);
+    expect(stdout.trim()).toBe("kairoku 0.1.0");
   });
 });
