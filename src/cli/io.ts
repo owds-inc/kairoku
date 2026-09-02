@@ -5,7 +5,7 @@
  * daemon's WorktreeOps.
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 
@@ -31,6 +31,9 @@ export type Io = {
   readFile(path: string): string | null;
   /** Permission bits (e.g. 0o600), or null when absent. */
   mode(path: string): number | null;
+  /** Create or replace a file; `mode` is applied either way. */
+  writeFile(path: string, data: Uint8Array | string, mode?: number): void;
+  rename(from: string, to: string): void;
   fetch(url: string, init?: RequestInit): Promise<Response>;
 };
 
@@ -78,5 +81,10 @@ export const io: Io = {
       return null;
     }
   },
+  writeFile(path, data, mode) {
+    writeFileSync(path, data);
+    if (mode !== undefined) chmodSync(path, mode);
+  },
+  rename: renameSync,
   fetch: (url, init) => globalThis.fetch(url, init),
 };

@@ -59,6 +59,18 @@ export function fakeIo(overrides: Partial<FakeIo> = {}): FakeIo {
     exists: (path) => path in fake.files,
     readFile: (path) => fake.files[path] ?? null,
     mode: (path) => fake.modes[path] ?? (path in fake.files ? 0o644 : null),
+    writeFile(path, data, mode) {
+      fake.files[path] = typeof data === "string" ? data : new TextDecoder().decode(data);
+      if (mode !== undefined) fake.modes[path] = mode;
+    },
+    rename(from, to) {
+      fake.files[to] = fake.files[from]!;
+      delete fake.files[from];
+      if (from in fake.modes) {
+        fake.modes[to] = fake.modes[from]!;
+        delete fake.modes[from];
+      }
+    },
     fetch: () => Promise.reject(new Error("unscripted fetch")),
     ...overrides,
   };
