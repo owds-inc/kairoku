@@ -132,33 +132,47 @@ describe("codex MCP approval mode", () => {
   });
 });
 
-describe("daemon config and token", () => {
-  test("generates token.env (600, never printed) and config.json bound to the LAN address", async () => {
+describe("daemon config", () => {
+  test("config.json binds loopback and no inbound bearer is minted (SPEC v1)", async () => {
+    // The listener used to be a LAN-bound push API behind a bearer. With the
+    // push API retired it answers `doctor` and nothing else, unauthenticated —
+    // so it belongs on 127.0.0.1 and there is no secret left to generate here.
     const io = vm();
-    io.canned["hostname -I"] = { stdout: "192.168.23.167 172.17.0.1 \n" };
     const steps = await daemonConfig(io, `${home}/work/kairoku`);
-    expect(steps.map((s) => s.outcome)).toEqual(["done", "done"]);
-    expect(io.files[`${home}/.kairoku/token.env`]).toMatch(/^KAIROKU_DAEMON_TOKEN=[0-9a-f]{64}\n$/);
-    expect(io.modes[`${home}/.kairoku/token.env`]).toBe(0o600);
-    expect(JSON.stringify(io.lines) + JSON.stringify(steps)).not.toContain(io.files[`${home}/.kairoku/token.env`]!.slice(21, 60));
+    expect(steps.map((s) => s.outcome)).toEqual(["done"]);
+    expect(io.files[`${home}/.kairoku/token.env`]).toBeUndefined();
     expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!)).toEqual({
-      listen: { host: "192.168.23.167", port: 7801 },
+      listen: { host: "127.0.0.1", port: 7801 },
       maxConcurrent: 2,
       repoPath: `${home}/work/kairoku`,
     });
+    expect(calls(io).some((c) => c.startsWith("hostname") || c.startsWith("ipconfig"))).toBe(false);
+
     const again = await daemonConfig(io, `${home}/work/kairoku`);
-    expect(again.map((s) => s.outcome)).toEqual(["skipped", "skipped"]);
+    expect(again.map((s) => s.outcome)).toEqual(["skipped"]);
   });
 
-  test("on mac the address comes from ipconfig, falling back to loopback", async () => {
-    const io = fakeIo({ platform: "darwin", home: "/Users/neil" });
-    io.canned["ipconfig getifaddr en0"] = { stdout: "10.0.1.7\n" };
-    await daemonConfig(io, "/Users/neil/work/kairoku");
-    expect(JSON.parse(io.files["/Users/neil/.kairoku/config.json"]!).listen.host).toBe("10.0.1.7");
-    const off = fakeIo({ platform: "darwin", home: "/Users/neil" });
-    off.canned["ipconfig getifaddr en0"] = { code: 1 };
-    await daemonConfig(off, "/Users/neil/work/kairoku");
-    expect(JSON.parse(off.files["/Users/neil/.kairoku/config.json"]!).listen.host).toBe("127.0.0.1");
+  test("a config left bound to a LAN address from the push-API days is pulled back to loopback", async () => {
+    const io = vm();
+    io.files[`${home}/.kairoku/config.json`] = JSON.stringify({
+      listen: { host: "192.168.23.167", port: 7801 },
+      maxConcurrent: 2,
+    });
+    const steps = await daemonConfig(io, `${home}/work/kairoku`);
+    expect(steps.some((s) => s.detail.includes("127.0.0.1"))).toBe(true);
+    expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).listen).toEqual({ host: "127.0.0.1", port: 7801 });
+  });
+
+  test("repoUrl is recorded when it changes, and the rest of the file is left alone", async () => {
+    const io = vm();
+    io.files[`${home}/.kairoku/config.json`] = JSON.stringify({
+      listen: { host: "127.0.0.1", port: 7801 },
+      maxConcurrent: 4,
+    });
+    await daemonConfig(io, `${home}/work/kairoku`, "https://example.com/app.git");
+    const config = JSON.parse(io.files[`${home}/.kairoku/config.json`]!);
+    expect(config.repoUrl).toBe("https://example.com/app.git");
+    expect(config.maxConcurrent).toBe(4);
   });
 });
 

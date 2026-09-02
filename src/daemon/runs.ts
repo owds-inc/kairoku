@@ -1,16 +1,17 @@
 /**
- * Run lifecycle and the refusal set (RF-001, RF-002, RF-004, RF-005, RF-008,
- * RF-010).
+ * Run lifecycle (RF-005, RF-009, RF-010).
  *
- * State is a `Map` and nothing else — no database by design. The ledger in the
- * Kairoku app owns recovery; losing this process loses nothing that matters.
+ * State is a `Map` and nothing else — no database by design. The app owns
+ * recovery; `dispatch.ts` writes the one thing that must survive a restart.
  *
- * RF-007: nothing here talks to Kairoku, Jira or GitHub. The daemon holds no
- * credential for any of them; the agents it launches do all reporting under
- * their own identity.
+ * The refusal set went with the push API (SPEC v1, §20.3): it existed to answer
+ * an inbound `POST /runs`, and there is no inbound caller left to refuse. The
+ * daemon now chooses what to run, from what it claimed, inside its own capacity.
+ *
+ * RF-007 (amended): nothing here talks outward. Only `app.ts` does, and only to
+ * the three daemon routes.
  */
 
-import { createHash, randomBytes } from "node:crypto";
 import type { Config } from "./config";
 import { appendEvent, ensureRunDir, stdoutPath } from "./events";
 import { getRole } from "./roles";
@@ -23,68 +24,62 @@ import {
 } from "./worktree";
 
 /**
- * RF-002. `blocked` is reserved in the vocabulary but unreachable in v0:
- * `codex exec` with approval_policy "never" never parks. It is not emitted.
+ * `blocked` is reserved in the vocabulary but unreachable: `codex exec` with
+ * approval_policy "never" never parks. It is not emitted.
  */
 export type RunStatus = "running" | "idle" | "error" | "timeout";
 
-export const REFUSAL_REASONS = [
-  "capacity_full",
-  "unknown_role",
-  "missing_credential",
-  "duplicate_credential",
-  "empty_brief",
-] as const;
-export type RefusalReason = (typeof REFUSAL_REASONS)[number];
+/**
+ * RF-009 — the one role in the table, and the provider a `solo` run uses.
+ * Claude arrives in O-3 with the Agent SDK and §20.8's per-role tool policy;
+ * inventing a half-provider here that O-3 replaces would be churn.
+ */
+export const SOLO_ROLE = "executor";
 
-export interface RunRequest {
-  role?: string;
-  provider?: string;
-  model?: string;
-  brief?: string;
-  repo?: string;
-  worktree?: { base?: string };
-  env?: Record<string, string>;
-  labels?: Record<string, string>;
-  timeoutSec?: number;
+export interface StartSpec {
+  /** The dispatch id. It is the run id, the branch suffix and the runs-dir name. */
+  readonly id: string;
+  readonly brief: string;
+  /** Injected over the daemon's own environment; carries `KAIROKU_PAT`. */
+  readonly env: Record<string, string>;
+  /** What the worktree is cut from, e.g. `origin/main`. */
+  readonly base?: string;
+  readonly timeoutSec?: number;
+  /** Fired once the agent is spawned — where the `update running` report hangs. */
+  readonly onStarted?: (started: RunStarted) => void;
 }
 
-/** RF-002 response shape. */
-export interface RunView {
+export interface RunStarted {
+  readonly pid?: number;
+  readonly branch: string;
+  readonly worktree: string;
+}
+
+export interface RunResult {
+  readonly status: RunStatus;
+  readonly exitSummary: string;
+  readonly branch: string;
+  readonly worktree?: string;
+}
+
+/** One in-flight run, as `GET /status` shows it. */
+export interface RunListing {
+  readonly dispatchId: string;
   readonly status: RunStatus;
   readonly startedAt: string;
   readonly branch: string;
-  readonly exitSummary?: string;
 }
 
 interface RunRecord {
   readonly id: string;
-  readonly role: string;
-  readonly provider: string;
-  readonly model?: string;
   readonly startedAt: string;
   readonly timeoutSec: number;
-  readonly labels?: Record<string, string>;
-  /** SHA-256 of the injected KAIROKU_PAT. The value itself is never stored. */
-  readonly credHash: string;
   status: RunStatus;
   branch: string;
   exitSummary?: string;
   worktree?: Worktree;
   handle?: ProcHandle;
   cancelRequested: boolean;
-}
-
-export type CreateResult =
-  | { ok: true; runId: string }
-  | { ok: false; reason: RefusalReason };
-
-export function hashCredential(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function newRunId(): string {
-  return randomBytes(6).toString("hex");
 }
 
 export class RunStore {
@@ -113,51 +108,30 @@ export class RunStore {
     return { running: this.runningCount(), max: this.#config.maxConcurrent };
   }
 
-  /** RF-002. */
-  view(runId: string): RunView | undefined {
-    const run = this.#runs.get(runId);
-    if (!run) return undefined;
-    return {
-      status: run.status,
-      startedAt: run.startedAt,
-      branch: run.branch,
-      ...(run.exitSummary === undefined ? {} : { exitSummary: run.exitSummary }),
-    };
-  }
-
-  /** RF-001 — create or refuse. Never queues. */
-  create(req: RunRequest): CreateResult {
-    const brief = (req.brief ?? "").trim();
-    if (!brief) return { ok: false, reason: "empty_brief" };
-
-    const role = req.role ? getRole(req.role) : undefined;
-    if (!role) return { ok: false, reason: "unknown_role" };
-
-    const pat = (req.env?.KAIROKU_PAT ?? "").trim();
-    if (!pat) return { ok: false, reason: "missing_credential" };
-
-    if (this.runningCount() >= this.#config.maxConcurrent) {
-      return { ok: false, reason: "capacity_full" };
-    }
-
-    // RF-008 — mechanical distinctness, by hash. Never by value.
-    const credHash = hashCredential(pat);
-    for (const other of this.#runs.values()) {
-      if (other.status === "running" && other.credHash === credHash) {
-        return { ok: false, reason: "duplicate_credential" };
+  /** The in-flight runs, for `GET /status` and the heartbeat's capacity. */
+  list(): RunListing[] {
+    const out: RunListing[] = [];
+    for (const run of this.#runs.values()) {
+      if (run.status === "running") {
+        out.push({ dispatchId: run.id, status: run.status, startedAt: run.startedAt, branch: run.branch });
       }
     }
+    return out;
+  }
 
-    const id = newRunId();
+  /**
+   * Start one run and resolve when it reaches a terminal state.
+   *
+   * The record is registered SYNCHRONOUSLY, before the first await, so the very
+   * next `capacity()` already counts it — the claim loop gates on that number
+   * and a slot that appears free for one tick is a double claim.
+   */
+  async start(spec: StartSpec): Promise<RunResult> {
+    const id = spec.id;
     const record: RunRecord = {
       id,
-      role: req.role!,
-      provider: role.provider,
-      model: req.model,
       startedAt: new Date().toISOString(),
-      timeoutSec: req.timeoutSec ?? this.#config.defaultTimeoutSec,
-      labels: req.labels,
-      credHash,
+      timeoutSec: spec.timeoutSec ?? this.#config.defaultTimeoutSec,
       status: "running",
       branch: branchFor(id),
       cancelRequested: false,
@@ -166,19 +140,20 @@ export class RunStore {
 
     ensureRunDir(this.#config.runsDir, id);
     appendEvent(this.#config.runsDir, id, "created", {
-      role: record.role,
-      provider: record.provider,
-      model: record.model,
+      role: SOLO_ROLE,
       branch: record.branch,
+      base: spec.base,
       timeoutSec: record.timeoutSec,
     });
 
-    const supervision = this.#supervise(record, req, brief).finally(() => {
-      this.#inflight.delete(supervision);
-    });
-    this.#inflight.add(supervision);
-
-    return { ok: true, runId: id };
+    const supervision = this.#supervise(record, spec);
+    const tracked = supervision.then(
+      () => {},
+      () => {},
+    );
+    this.#inflight.add(tracked);
+    void tracked.finally(() => this.#inflight.delete(tracked));
+    return supervision;
   }
 
   /** RF-004 — group kill, teardown, `error` / "cancelled". */
@@ -202,19 +177,14 @@ export class RunStore {
     await Promise.allSettled([...this.#inflight]);
   }
 
-  async #supervise(
-    record: RunRecord,
-    req: RunRequest,
-    brief: string,
-  ): Promise<void> {
+  async #supervise(record: RunRecord, spec: StartSpec): Promise<RunResult> {
     const runsDir = this.#config.runsDir;
 
     let worktree: Worktree;
     try {
-      worktree = await this.#worktrees.create(record.id, req.worktree?.base);
+      worktree = await this.#worktrees.create(record.id, spec.base);
     } catch (err) {
-      this.#finish(record, "error", `worktree-setup-failed: ${message(err)}`);
-      return;
+      return this.#finish(record, "error", `worktree-setup-failed: ${message(err)}`);
     }
     record.worktree = worktree;
     record.branch = worktree.branch;
@@ -222,27 +192,25 @@ export class RunStore {
     // A cancel or shutdown that arrived during setup: never start the agent.
     if (record.cancelRequested || this.#shuttingDown) {
       await this.#teardown(record);
-      this.#finish(
+      return this.#finish(
         record,
         "error",
         record.cancelRequested ? "cancelled" : "daemon-shutdown",
       );
-      return;
     }
 
-    const role = getRole(record.role)!;
-    const spec = { role: record.role, model: record.model, cwd: worktree.path };
+    const commandSpec = { role: SOLO_ROLE, cwd: worktree.path };
     const command = this.#config.commandOverride
-      ? this.#config.commandOverride(spec)
-      : role.build(spec);
+      ? this.#config.commandOverride(commandSpec)
+      : getRole(SOLO_ROLE)!.build(commandSpec);
 
     let result: ProcResult;
     try {
       const handle = launch({
         command,
         cwd: worktree.path,
-        env: childEnv(req.env ?? {}),
-        stdin: brief,
+        env: childEnv(spec.env),
+        stdin: spec.brief,
         stdoutPath: stdoutPath(runsDir, record.id),
         timeoutMs: record.timeoutSec * 1000,
         killGraceMs: this.#config.killGraceMs,
@@ -255,6 +223,7 @@ export class RunStore {
         // Argv only — the brief goes over stdin and no credential is in it.
         command: command.join(" "),
       });
+      spec.onStarted?.({ pid: handle.pid, branch: record.branch, worktree: worktree.path });
       // cancel()/shutdown() may have fired between the flag check and here.
       if (record.cancelRequested) handle.cancel();
       else if (this.#shuttingDown) handle.shutdown();
@@ -263,13 +232,12 @@ export class RunStore {
     } catch (err) {
       appendEvent(runsDir, record.id, "error", { message: message(err) });
       await this.#teardown(record);
-      this.#finish(record, "error", `spawn-failed: ${message(err)}`);
-      return;
+      return this.#finish(record, "error", `spawn-failed: ${message(err)}`);
     }
 
     const [status, summary] = classify(result, record.timeoutSec);
     await this.#teardown(record, status);
-    this.#finish(record, status, summary);
+    return this.#finish(record, status, summary);
   }
 
   /** RF-010 — worktree teardown on every exit path, with the post-mortem opt-out. */
@@ -302,7 +270,7 @@ export class RunStore {
     }
   }
 
-  #finish(record: RunRecord, status: RunStatus, exitSummary: string): void {
+  #finish(record: RunRecord, status: RunStatus, exitSummary: string): RunResult {
     record.status = status;
     record.exitSummary = exitSummary;
     record.handle = undefined;
@@ -311,6 +279,12 @@ export class RunStore {
       exitSummary,
       branch: record.branch,
     });
+    return {
+      status,
+      exitSummary,
+      branch: record.branch,
+      ...(record.worktree === undefined ? {} : { worktree: record.worktree.path }),
+    };
   }
 }
 
@@ -335,9 +309,10 @@ function classify(
 }
 
 /**
- * The agent inherits the daemon's environment plus the caller's injected vars.
- * The daemon's own bearer (KAIROKU_DAEMON_TOKEN, or the pre-rename
- * HIKYAKU_TOKEN) is stripped: it is not an agent's to hold.
+ * The agent inherits the daemon's environment plus the run's injected vars.
+ * The daemon's own app credential (KAIROKU_DAEMON_TOKEN, or the pre-rename
+ * HIKYAKU_TOKEN) is stripped, and so is the interim agent-token fallback: an
+ * agent gets exactly the one PAT its run was given, never the daemon's.
  */
 function childEnv(injected: Record<string, string>): Record<string, string> {
   const env: Record<string, string> = {};
@@ -346,6 +321,7 @@ function childEnv(injected: Record<string, string>): Record<string, string> {
   }
   delete env.KAIROKU_DAEMON_TOKEN;
   delete env.HIKYAKU_TOKEN;
+  delete env.KAIROKU_AGENT_TOKEN;
   return { ...env, ...injected };
 }
 

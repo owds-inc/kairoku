@@ -28,6 +28,7 @@ function linuxDaemon(): FakeIo {
     [`${home}/.kairoku`]: "",
     [`${home}/.kairoku/config.json`]: JSON.stringify({
       listen: { host: "10.0.0.5", port: 7801 },
+      appUrl: "https://app.test",
       repoPath: `${home}/work/kairoku`,
     }),
     [`${home}/.kairoku/token.env`]: "KAIROKU_DAEMON_TOKEN=secret\n",
@@ -49,10 +50,29 @@ function linuxDaemon(): FakeIo {
     [`git -C ${home}/work/kairoku status --porcelain`]: { stdout: "" },
   });
   io.fetch = async (url, init) => {
-    if (!url.startsWith("http://10.0.0.5:7801/capacity")) return new Response("", { status: 404 });
-    const auth = new Headers(init?.headers).get("authorization");
-    if (auth === "Bearer secret") return Response.json({ running: 0, max: 2 });
-    return new Response("", { status: 401 });
+    // The loopback listener: no bearer, and `/status` is what doctor reads.
+    if (url === "http://10.0.0.5:7801/status") {
+      return Response.json({
+        version: "0.1.0",
+        capacity: { running: 1, max: 2 },
+        link: { linked: true, appUrl: "https://app.test", liveness: "online", protocol: "1", runsInFlight: 1, pendingReports: 0 },
+        runs: [{ dispatchId: "d-1", status: "running", startedAt: "t", branch: "run/d-1" }],
+      });
+    }
+    // The app: one real heartbeat, exactly as the daemon would send it.
+    if (url === "https://app.test/api/daemon/heartbeat") {
+      if (new Headers(init?.headers).get("authorization") !== "Bearer secret") {
+        return Response.json({ error: "unauthorized" }, { status: 401 });
+      }
+      return Response.json({
+        daemon: { id: "daemon-1", name: "vm-1" },
+        liveness: "online",
+        heartbeatIntervalMs: 30_000,
+        protocol: "1",
+        runs: [],
+      });
+    }
+    return new Response("", { status: 404 });
   };
   return io;
 }
@@ -98,13 +118,17 @@ describe("kairoku doctor", () => {
       "config.json": "PASS",
       "token.env": "PASS",
       "daemon service": "PASS",
-      "unauthenticated request refused": "PASS",
-      "authenticated request answers": "PASS",
+      "daemon reachable": "PASS",
+      "app link": "PASS",
+      "runs in flight": "PASS",
       "paseo.service": "PASS",
       "repo present": "PASS",
       "repo clean": "PASS",
     });
-    expect(byName(list, "authenticated request answers")?.detail).toContain('"max":2');
+    expect(byName(list, "app link")?.detail).toContain("https://app.test");
+    // The protocol version is echoed when the app sends one.
+    expect(byName(list, "app link")?.detail).toContain("protocol 1");
+    expect(byName(list, "runs in flight")?.detail).toBe("1");
     expect(await run([], io)).toBe(0);
     expect(io.lines.some((l) => /^\s*PASS\s+daemon service/.test(l))).toBe(true);
     expect(io.lines.at(-1)).toContain("all checks passed");
@@ -127,14 +151,34 @@ describe("kairoku doctor", () => {
     expect(byName(await checks(io), "userns unrestricted")?.status).toBe("FAIL");
   });
 
-  test("a daemon that answers without a token fails the 401 check", async () => {
+  test("a token the app refuses is named as exactly that, without printing it", async () => {
     const io = linuxDaemon();
-    io.fetch = async () => Response.json({ running: 0, max: 2 });
+    io.files["/home/tester/.kairoku/token.env"] = "KAIROKU_DAEMON_TOKEN=a-stale-token\n";
     const list = await checks(io);
-    expect(byName(list, "unauthenticated request refused")).toMatchObject({
-      status: "FAIL",
-      detail: expect.stringContaining("expected 401"),
-    });
+    const link = byName(list, "app link")!;
+    expect(link.status).toBe("FAIL");
+    expect(link.detail).toContain("token not accepted by https://app.test");
+    expect(JSON.stringify(list)).not.toContain("a-stale-token");
+    expect(await run([], io)).toBe(1);
+  });
+
+  test("no appUrl is a FAIL that names the command that fixes it", async () => {
+    const io = linuxDaemon();
+    io.files["/home/tester/.kairoku/config.json"] = JSON.stringify({ listen: { host: "10.0.0.5", port: 7801 } });
+    const link = byName(await checks(io), "app link")!;
+    expect(link.status).toBe("FAIL");
+    expect(link.detail).toContain("kairoku setup --daemon");
+  });
+
+  test("a daemon that is not listening fails reachability but the app link is still checked", async () => {
+    const io = linuxDaemon();
+    const app = io.fetch;
+    io.fetch = async (url, init) =>
+      url.startsWith("http://10.0.0.5") ? Promise.reject(new Error("refused")) : app(url, init);
+    const list = await checks(io);
+    expect(byName(list, "daemon reachable")?.status).toBe("FAIL");
+    expect(byName(list, "app link")?.status).toBe("PASS");
+    expect(byName(list, "runs in flight")?.status).toBe("WARN");
   });
 
   test("a dirty checkout is a WARN, a missing one a FAIL", async () => {
@@ -171,6 +215,6 @@ describe("kairoku doctor", () => {
     io.modes[`${home}/.hikyaku/token.env`] = 0o600;
     const list = await checks(io);
     expect(byName(list, "config.json")).toMatchObject({ status: "PASS", detail: expect.stringContaining(".hikyaku") });
-    expect(byName(list, "authenticated request answers")?.status).toBe("PASS");
+    expect(byName(list, "app link")?.status).toBe("PASS");
   });
 });

@@ -2,7 +2,14 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertBindable, defaultConfigPath, loadConfig, migrateHome, DEFAULT_TIMEOUT_SEC } from "./config";
+import {
+  assertBindable,
+  defaultConfigPath,
+  loadConfig,
+  migrateHome,
+  parseEnvFile,
+  DEFAULT_TIMEOUT_SEC,
+} from "./config";
 
 const dirs: string[] = [];
 function tmp(): string {
@@ -36,13 +43,12 @@ describe("config", () => {
     expect(defaultConfigPath({}, w.warn)).toMatch(/\.kairoku\/config\.json$/);
   });
 
-  test("RF-006: the token comes from the environment or token.env beside the config, never config.json", () => {
+  test("RF-011: the app credential comes from the environment or token.env, never config.json", () => {
     const dir = tmp();
     const path = join(dir, "config.json");
     writeFileSync(path, JSON.stringify({ token: "from-the-file" }));
     const w = warnings();
 
-    expect(() => loadConfig(path, {}, w.warn)).toThrow(/KAIROKU_DAEMON_TOKEN/);
     expect(loadConfig(path, { KAIROKU_DAEMON_TOKEN: "new", HIKYAKU_TOKEN: "old" }, w.warn).token).toBe("new");
     expect(w.lines).toEqual([]);
     expect(loadConfig(path, { HIKYAKU_TOKEN: "old" }, w.warn).token).toBe("old");
@@ -52,6 +58,39 @@ describe("config", () => {
     expect(loadConfig(path, {}, w.warn).token).toBe("from-token-env");
     writeFileSync(join(dir, "token.env"), "# generated\nHIKYAKU_TOKEN=legacy-token-env\n");
     expect(loadConfig(path, {}, w.warn).token).toBe("legacy-token-env");
+  });
+
+  test("RF-011: a daemon with no credential still loads — the listener outlives a rejected token", () => {
+    // The 401 rule (SPEC v1 RF-012) keeps the listener up when the app refuses
+    // the token, so a missing one cannot be a startup error either: `doctor`
+    // has to be able to reach a daemon in exactly that state and say so.
+    const config = loadConfig(join(tmp(), "config.json"), {});
+    expect(config.token).toBeUndefined();
+    expect(config.appUrl).toBeUndefined();
+  });
+
+  test("RF-011: appUrl and defaultBranch come from config.json; the agent-token fallback from token.env", () => {
+    const dir = tmp();
+    const path = join(dir, "config.json");
+    writeFileSync(path, JSON.stringify({ appUrl: "https://kairoku.io/", defaultBranch: "trunk" }));
+    writeFileSync(join(dir, "token.env"), "KAIROKU_DAEMON_TOKEN=daemon\nKAIROKU_AGENT_TOKEN=agent\n");
+
+    const config = loadConfig(path, {});
+    // The trailing slash is dropped once, here, so no caller has to think about it.
+    expect(config.appUrl).toBe("https://kairoku.io");
+    expect(config.defaultBranch).toBe("trunk");
+    expect(config.token).toBe("daemon");
+    expect(config.agentToken).toBe("agent");
+
+    expect(loadConfig(join(tmp(), "absent.json"), {}).defaultBranch).toBe("main");
+  });
+
+  test("parseEnvFile reads every KEY=value line and ignores comments and blanks", () => {
+    expect(parseEnvFile("# generated\n\nA=1\nB = two \nnot a line\nC=has=equals\n")).toEqual({
+      A: "1",
+      B: "two",
+      C: "has=equals",
+    });
   });
 
   test("a missing config file is fine; defaults apply", () => {

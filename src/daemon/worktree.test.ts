@@ -12,6 +12,8 @@ import {
   copyEnvFiles,
   gitWorktreeOps,
   listRunWorktrees,
+  originFullName,
+  parseRepoFullName,
   run,
   DEFAULT_BASE,
   RUN_BRANCH_PREFIX,
@@ -177,5 +179,37 @@ describe("worktree", () => {
     await expect(ops.create("x")).rejects.toThrow(
       /git could not be started in .*absent-checkout/,
     );
+  });
+});
+
+describe("§20.9 — the checkout's own owner/name", () => {
+  test("both remote URL forms parse, .git goes, and a nested group keeps its path", () => {
+    for (const url of [
+      "https://github.com/owds-inc/kairoku.git",
+      "https://github.com/owds-inc/kairoku",
+      "git@github.com:owds-inc/kairoku.git",
+      "ssh://git@github.com/owds-inc/kairoku.git",
+      "  https://user@github.com/owds-inc/kairoku.git\n",
+    ]) {
+      expect({ [url]: parseRepoFullName(url) }).toEqual({ [url]: "owds-inc/kairoku" });
+    }
+    expect(parseRepoFullName("https://gitlab.com/group/sub/thing.git")).toBe("group/sub/thing");
+    // Nothing that is not a two-segment path is guessed at.
+    for (const junk of ["", "kairoku", "https://github.com/lonely", "not a url"]) {
+      expect({ [junk]: parseRepoFullName(junk) }).toEqual({ [junk]: undefined });
+    }
+  });
+
+  test("a real checkout answers with its origin; a directory that is not one answers undefined", async () => {
+    const checkout = join(root, "named-checkout");
+    mkdirSync(checkout, { recursive: true });
+    await run(["git", "init", "-q"], checkout);
+    await run(["git", "remote", "add", "origin", "https://example.invalid/owds-inc/kairoku.git"], checkout);
+    expect(await originFullName(checkout)).toBe("owds-inc/kairoku");
+
+    const plain = join(root, "plain-checkout");
+    mkdirSync(plain, { recursive: true });
+    expect(await originFullName(plain)).toBeUndefined();
+    expect(await originFullName(join(root, "absent"))).toBeUndefined();
   });
 });

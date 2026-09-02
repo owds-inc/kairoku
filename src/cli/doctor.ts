@@ -7,16 +7,18 @@
  */
 
 import { join } from "node:path";
-import { parseTokenEnv } from "../daemon/config";
-import { version, type Io } from "./io";
+import { appClient } from "../daemon/app";
+import { normaliseAppUrl, parseTokenEnv } from "../daemon/config";
+import { version as binVersion, type Io } from "./io";
 import { installedPlugin } from "./plugin";
+import { version as cliVersion } from "../../package.json";
 
 export const usage = `usage: kairoku doctor
 
   Verifies this machine and changes nothing. One line per check — PASS, WARN
   or FAIL — and a nonzero exit when any check FAILs. The plugin checks run
   everywhere; the daemon checks run where ~/.kairoku (or the pre-rename
-  ~/.hikyaku) exists.`;
+  ~/.hikyaku) exists, and they include one real heartbeat to the app.`;
 
 export type Check = { name: string; status: "PASS" | "WARN" | "FAIL"; detail?: string };
 
@@ -36,39 +38,81 @@ export function daemonHome(io: Io): string | null {
   return null;
 }
 
-async function http(io: Io, url: string, headers: Record<string, string>) {
-  try {
-    const r = await io.fetch(url, { headers, signal: AbortSignal.timeout(5000) });
-    return { status: r.status, body: await r.text() };
-  } catch {
-    return { status: 0, body: "" };
-  }
+/** What `GET /status` answers; only the fields doctor reads are named. */
+export interface DaemonStatus {
+  version?: string;
+  capacity?: { running: number; max: number };
+  link?: { linked?: boolean; liveness?: string; stopped?: string };
+  runs?: unknown[];
 }
 
 /**
- * The daemon's two-request proof: 401 without the token, 200 with it. `attempts`
- * > 1 waits for a daemon that was just started (500 ms between tries).
+ * Ask the local listener for its status.
+ *
+ * There is no bearer any more (SPEC v1, RF-006): reachability on the daemon's
+ * own address IS the trust boundary, so this is a plain GET. `attempts` > 1
+ * waits for a daemon that was just started (500 ms between tries).
  */
-export async function roundTrip(io: Io, url: string, token: string, attempts = 1): Promise<Check[]> {
-  let anon = await http(io, url, {});
-  for (let left = attempts - 1; left > 0 && anon.status === 0; left--) {
-    await new Promise((r) => setTimeout(r, 500));
-    anon = await http(io, url, {});
+export async function daemonStatus(io: Io, url: string, attempts = 1): Promise<DaemonStatus | null> {
+  for (let left = attempts; left > 0; left--) {
+    try {
+      const r = await io.fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (r.ok) return (await r.json()) as DaemonStatus;
+    } catch {
+      // not listening yet
+    }
+    if (left > 1) await new Promise((r) => setTimeout(r, 500));
   }
-  const auth = await http(io, url, { authorization: `Bearer ${token}` });
-  return [
-    anon.status === 401 ? pass("unauthenticated request refused", "401") : fail("unauthenticated request refused", `got ${anon.status}, expected 401`),
-    auth.status === 200 && auth.body.includes('"max"')
-      ? pass("authenticated request answers", auth.body)
-      : fail("authenticated request answers", `got ${auth.status}: ${auth.body || "<no response>"}`),
-  ];
+  return null;
+}
+
+export function reachable(url: string, status: DaemonStatus | null): Check {
+  return status && status.capacity
+    ? pass("daemon reachable", `${url} — ${status.capacity.running}/${status.capacity.max} running`)
+    : fail("daemon reachable", `${url} did not answer — is the service running? (kairoku daemon status)`);
+}
+
+/**
+ * RF-011 — the app link, proved rather than assumed: one real heartbeat with
+ * this machine's credential. A configured token that the app refuses is the
+ * failure that matters, and it is invisible from the config file alone.
+ *
+ * The token is read and sent. It is never printed, and the 401 message from
+ * `app.ts` deliberately carries only the app URL.
+ */
+export async function appLink(
+  io: Io,
+  appUrl: string | undefined,
+  token: string | undefined,
+  status: DaemonStatus | null,
+): Promise<Check[]> {
+  if (!appUrl) return [fail("app link", "no appUrl in config.json — run `kairoku setup --daemon`")];
+  if (!token) return [fail("app link", "no KAIROKU_DAEMON_TOKEN — run `kairoku setup --daemon`")];
+
+  const result = await appClient({ appUrl: normaliseAppUrl(appUrl), token, fetch: io.fetch }).heartbeat({
+    meta: {
+      host: io.env.HOSTNAME ?? "this machine",
+      version: cliVersion,
+      capacity: status?.capacity ?? { running: 0, max: 0 },
+    },
+  });
+
+  const runs = status?.runs?.length;
+  const inFlight =
+    runs === undefined
+      ? warn("runs in flight", "unknown — the daemon is not answering")
+      : pass("runs in flight", String(runs));
+
+  if (!result.ok) return [fail("app link", result.error), inFlight];
+  const protocol = result.body.protocol ? `, protocol ${result.body.protocol}` : "";
+  return [pass("app link", `${normaliseAppUrl(appUrl)} — ${result.body.liveness}${protocol}`), inFlight];
 }
 
 export async function checks(io: Io): Promise<Check[]> {
   const out: Check[] = [];
 
   // -- the plugin, everywhere
-  const claude = await version(io, "claude");
+  const claude = await binVersion(io, "claude");
   if (claude === null) {
     out.push(fail("claude installed", "not on PATH"));
   } else {
@@ -88,14 +132,14 @@ export async function checks(io: Io): Promise<Check[]> {
     return out;
   }
 
-  const node = await version(io, "node");
+  const node = await binVersion(io, "node");
   const major = Number(node?.replace(/^v/, "").split(".")[0]);
   out.push(major >= NODE_MAJOR ? pass(`node ≥ ${NODE_MAJOR}`, node!) : fail(`node ≥ ${NODE_MAJOR}`, `found ${node ?? "none"}`));
   for (const bin of ["bun", "codex"]) {
-    const v = await version(io, bin);
+    const v = await binVersion(io, bin);
     out.push(v === null ? fail(`${bin} installed`, "not on PATH") : pass(`${bin} installed`, v));
   }
-  const paseo = await version(io, "paseo");
+  const paseo = await binVersion(io, "paseo");
   out.push(paseo === null ? warn("paseo installed", "absent (cockpit is optional)") : pass("paseo installed", paseo));
 
   if (io.platform === "linux") {
@@ -155,20 +199,23 @@ export async function checks(io: Io): Promise<Check[]> {
     out.push(r.code === 0 ? pass("daemon service", `${LAUNCHD_LABEL} loaded`) : fail("daemon service", `${LAUNCHD_LABEL} not loaded`));
   }
 
-  let config: { listen?: { host?: string; port?: number }; repoPath?: string } = {};
+  let config: { listen?: { host?: string; port?: number }; appUrl?: string; repoPath?: string } = {};
   try {
     config = JSON.parse(configText ?? "{}");
   } catch {
-    // reported above as present; a malformed file fails the round trip below
+    // reported above as present; a malformed file fails the two checks below
   }
   // The token is read and sent, never printed.
   const token = parseTokenEnv(io.readFile(tokenPath) ?? "");
   const { host, port } = config.listen ?? {};
-  if (host && port && token) {
-    out.push(...(await roundTrip(io, `http://${host}:${port}/capacity`, token)));
-  } else {
-    out.push(fail("daemon reachable", "cannot test — listen host/port or the token is missing"));
-  }
+  const statusUrl = host && port ? `http://${host}:${port}/status` : undefined;
+  const status = statusUrl ? await daemonStatus(io, statusUrl) : null;
+  out.push(
+    statusUrl
+      ? reachable(statusUrl, status)
+      : fail("daemon reachable", "cannot test — listen host/port is missing from config.json"),
+  );
+  out.push(...(await appLink(io, config.appUrl, token, status)));
 
   if (io.platform === "linux") {
     if (io.exists("/etc/systemd/system/paseo.service")) {

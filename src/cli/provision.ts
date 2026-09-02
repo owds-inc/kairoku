@@ -6,7 +6,6 @@
  * hands back the exact commands when it cannot do a step itself.
  */
 
-import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { kairokuHome } from "../daemon/config";
 import { version, type Io } from "./io";
@@ -26,6 +25,13 @@ export const NODE_MAJOR = 24;
  * persisted as `repoUrl` in config.json, so a rerun never asks again.
  */
 export const DEFAULT_APP_REPO = "https://github.com/bikerwhocodes/kairoku.git";
+
+/**
+ * Where Settings → Daemons lives for the hosted app. The snippet it prints is
+ * `KAIROKU_URL=<origin>` + `KAIROKU_DAEMON_TOKEN=<kai_…>`, so this is only the
+ * default the prompt offers — a self-hosted app types its own.
+ */
+export const DEFAULT_APP_URL = "https://kairoku.io";
 
 export const CODEX_MCP_ADD =
   "timeout 15 codex mcp add kairoku --url https://kairoku.io/api/mcp --bearer-token-env-var KAIROKU_PAT";
@@ -155,12 +161,6 @@ export async function codexConfig(io: Io): Promise<Step> {
   return done(name, 'default_tools_approval_mode = "approve"');
 }
 
-/** The machine's LAN address — what the daemon binds (never 0.0.0.0). */
-export async function lanIp(io: Io): Promise<string> {
-  const r = io.platform === "linux" ? await io.shell(["hostname", "-I"]) : await io.shell(["ipconfig", "getifaddr", "en0"]);
-  return (r.code === 0 && r.stdout.trim().split(/\s+/)[0]) || "127.0.0.1";
-}
-
 export function configuredRepoUrl(io: Io): string | undefined {
   try {
     const parsed = JSON.parse(io.readFile(join(kairokuHome(io.home), "config.json")) ?? "{}") as { repoUrl?: unknown };
@@ -170,30 +170,64 @@ export function configuredRepoUrl(io: Io): string | undefined {
   }
 }
 
+export const LOOPBACK = "127.0.0.1";
+
+/**
+ * `~/.kairoku/config.json`.
+ *
+ * It mints NO credential. The bearer this used to generate belonged to the
+ * push API, which is retired (SPEC v1, §20.3); the only credential a daemon
+ * holds now is the app's, and that comes from Settings → Daemons through
+ * `setup`'s app-link step.
+ *
+ * And the listener moves to loopback for the same reason: it answers `doctor`
+ * and nothing else, unauthenticated. A config still bound to a LAN address
+ * from the push-API days is pulled back — leaving it there would publish an
+ * unauthenticated surface on the network.
+ */
 export async function daemonConfig(io: Io, repoPath: string, repoUrl?: string): Promise<Step[]> {
-  const dir = kairokuHome(io.home);
-  const tokenPath = join(dir, "token.env");
-  const configPath = join(dir, "config.json");
-  const steps: Step[] = [];
-  if (io.exists(tokenPath)) {
-    steps.push(skipped("bearer token", "already present (not shown, not regenerated)"));
-  } else {
-    io.writeFile(tokenPath, `KAIROKU_DAEMON_TOKEN=${randomBytes(32).toString("hex")}\n`, 0o600);
-    steps.push(done("bearer token", `generated at ${tokenPath}, mode 600, never printed`));
-  }
+  const configPath = join(kairokuHome(io.home), "config.json");
   const existing = io.readFile(configPath);
   if (existing === null) {
-    const host = await lanIp(io);
-    const config = { listen: { host, port: 7801 }, maxConcurrent: 2, repoPath, ...(repoUrl ? { repoUrl } : {}) };
+    const config = { listen: { host: LOOPBACK, port: 7801 }, maxConcurrent: 2, repoPath, ...(repoUrl ? { repoUrl } : {}) };
     io.writeFile(configPath, JSON.stringify(config, null, 2) + "\n");
-    steps.push(done("config.json", `bound to ${host}:7801 (never 0.0.0.0)`));
-  } else if (repoUrl && configuredRepoUrl(io) !== repoUrl) {
-    io.writeFile(configPath, JSON.stringify({ ...JSON.parse(existing), repoUrl }, null, 2) + "\n");
-    steps.push(done("config.json", `recorded repoUrl ${repoUrl}`));
-  } else {
-    steps.push(skipped("config.json", "already present"));
+    return [done("config.json", `bound to ${LOOPBACK}:7801 (the listener answers doctor only)`)];
   }
-  return steps;
+
+  let config: Record<string, unknown>;
+  try {
+    config = JSON.parse(existing) as Record<string, unknown>;
+  } catch {
+    return [manual("config.json", `${configPath} is not valid JSON — fix or delete it, then rerun`)];
+  }
+
+  const listen = (config.listen ?? {}) as { host?: string; port?: number };
+  const changes: string[] = [];
+  if (listen.host && listen.host !== LOOPBACK) {
+    config.listen = { ...listen, host: LOOPBACK };
+    changes.push(`rebound ${listen.host} → ${LOOPBACK} (the push API is retired)`);
+  }
+  if (repoUrl && config.repoUrl !== repoUrl) {
+    config.repoUrl = repoUrl;
+    changes.push(`recorded repoUrl ${repoUrl}`);
+  }
+  if (changes.length === 0) return [skipped("config.json", "already present")];
+  io.writeFile(configPath, JSON.stringify(config, null, 2) + "\n");
+  return [done("config.json", changes.join("; "))];
+}
+
+/** Write the app URL and the credential. The token is written, never printed. */
+export function writeAppLink(io: Io, appUrl: string, token: string): void {
+  const dir = kairokuHome(io.home);
+  io.writeFile(join(dir, "token.env"), `KAIROKU_DAEMON_TOKEN=${token}\n`, 0o600);
+  const configPath = join(dir, "config.json");
+  let config: Record<string, unknown> = {};
+  try {
+    config = JSON.parse(io.readFile(configPath) ?? "{}") as Record<string, unknown>;
+  } catch {
+    config = {};
+  }
+  io.writeFile(configPath, JSON.stringify({ ...config, appUrl }, null, 2) + "\n");
 }
 
 /**

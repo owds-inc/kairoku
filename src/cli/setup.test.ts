@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { io as realIo } from "./io";
 import { run } from "./setup";
-import { DEFAULT_APP_REPO } from "./provision";
+import { DEFAULT_APP_REPO, DEFAULT_APP_URL } from "./provision";
 import { fakeIo, type FakeIo } from "./testkit";
 
 const calls = (io: FakeIo) => io.calls.map((c) => c.join(" "));
@@ -40,21 +40,36 @@ function provisionedVm(): FakeIo {
     [`${home}/.codex/config.toml`]: 'bearer_token_env_var = "KAIROKU_PAT"\ndefault_tools_approval_mode = "approve"\n',
     [`${home}/.codex/auth.json`]: "{}",
     [`${home}/.claude`]: "",
-    [`${home}/.kairoku/token.env`]: "KAIROKU_DAEMON_TOKEN=secret-token\n",
+    [`${home}/.kairoku/token.env`]: "KAIROKU_DAEMON_TOKEN=kai_secret_token\n",
     [`${home}/.kairoku/config.json`]: JSON.stringify({
-      listen: { host: "10.0.0.5", port: 7801 },
+      listen: { host: "127.0.0.1", port: 7801 },
+      appUrl: "https://app.test",
       maxConcurrent: 2,
       repoPath: `${home}/work/kairoku`,
       repoUrl: "https://example.com/app.git",
     }),
   });
   io.modes[`${home}/.kairoku/token.env`] = 0o600;
-  io.fetch = async (url, init) => {
-    if (!url.startsWith("http://10.0.0.5:7801/capacity")) return new Response("", { status: 404 });
-    const auth = new Headers(init?.headers).get("authorization");
-    return auth === "Bearer secret-token" ? Response.json({ running: 0, max: 2 }) : new Response("", { status: 401 });
-  };
+  io.fetch = appAndDaemon(io);
   return io;
+}
+
+/** The tokens this fake app has actually minted. Anything else is a 401. */
+const APP_TOKENS = ["kai_secret_token", "kai_fresh_token", "kai_pasted_token"];
+
+/** The app answering a heartbeat, and the local listener answering `/status`. */
+function appAndDaemon(_io: FakeIo): FakeIo["fetch"] {
+  return async (url, init) => {
+    if (url === "http://127.0.0.1:7801/status") {
+      return Response.json({ version: "0.1.0", capacity: { running: 0, max: 2 }, link: { linked: true }, runs: [] });
+    }
+    if (url.endsWith("/api/daemon/heartbeat")) {
+      const offered = new Headers(init?.headers).get("authorization")?.replace("Bearer ", "") ?? "";
+      if (!APP_TOKENS.includes(offered)) return Response.json({ error: "unauthorized" }, { status: 401 });
+      return Response.json({ daemon: { id: "d", name: "vm" }, liveness: "online", heartbeatIntervalMs: 30_000, protocol: "1", runs: [] });
+    }
+    return new Response("", { status: 404 });
+  };
 }
 
 describe("kairoku setup — plugin", () => {
@@ -114,16 +129,15 @@ describe("kairoku setup — daemon", () => {
     expect(await run(["--daemon", "--yes"], io)).toBe(0);
     expect(io.questions).toEqual([]);
     const out = io.lines.join("\n");
-    for (const skipped of ["not upgrading", "already above the interactive guard", `already at ${home}/work/kairoku`, "already 0 and persisted", "already set", "not shown, not regenerated"]) {
+    for (const skipped of ["not upgrading", "already above the interactive guard", `already at ${home}/work/kairoku`, "already 0 and persisted", "already set"]) {
       expect(out).toContain(skipped);
     }
     expect(out).toContain("unit written to /etc/systemd/system/kairoku-daemon.service");
     expect(calls(io)).toContain("sudo systemctl enable --now kairoku-daemon");
-    expect(out).toMatch(/PASS\s+unauthenticated request refused/);
-    expect(out).toMatch(/PASS\s+authenticated request answers/);
+    expect(out).toMatch(/PASS\s+daemon reachable/);
+    expect(out).toContain("app link proved");
     expect(out).toContain("Nothing human-only is outstanding");
-    expect(out).toContain("KAIROKU_PAT");
-    expect(out).not.toContain("secret-token");
+    expect(out).not.toContain("kai_secret_token");
     expect(calls(io).some((c) => c.startsWith("git clone"))).toBe(false);
   });
 
@@ -149,19 +163,73 @@ describe("kairoku setup — daemon", () => {
     expect(asked.questions[0]).toContain(DEFAULT_APP_REPO);
     expect(calls(asked)).toContain(`git clone ${DEFAULT_APP_REPO} ${home}/work/kairoku`);
     expect(JSON.parse(asked.files[`${home}/.kairoku/config.json`]!).repoUrl).toBe(DEFAULT_APP_REPO);
-    expect(JSON.parse(asked.files[`${home}/.kairoku/config.json`]!).listen).toEqual({ host: "10.0.0.5", port: 7801 });
+    expect(JSON.parse(asked.files[`${home}/.kairoku/config.json`]!).listen).toEqual({ host: "127.0.0.1", port: 7801 });
   });
 
-  test("a failing service install stops with its code; a failing round trip exits 1", async () => {
+  test("a failing service install stops with its code; an unreachable daemon exits 1", async () => {
     const io = provisionedVm();
     io.canned["sudo systemctl enable --now kairoku-daemon"] = { code: 1 };
     expect(await run(["--daemon", "--yes"], io)).toBe(1);
-    expect(io.lines.join("\n")).not.toContain("unauthenticated request");
+    expect(io.lines.join("\n")).not.toContain("daemon reachable");
 
-    const open = provisionedVm();
-    open.fetch = async () => Response.json({ running: 0, max: 2 });
-    expect(await run(["--daemon", "--yes"], open)).toBe(1);
-    expect(open.lines.join("\n")).toMatch(/FAIL\s+unauthenticated request refused/);
+    const deaf = provisionedVm();
+    const inner = deaf.fetch;
+    deaf.fetch = async (url, init) => (url.startsWith("http://127.0.0.1") ? Promise.reject(new Error("refused")) : inner(url, init));
+    expect(await run(["--daemon", "--yes"], deaf)).toBe(1);
+    expect(deaf.lines.join("\n")).toMatch(/FAIL\s+daemon reachable/);
+  });
+
+  test("the app link is proved with one heartbeat BEFORE the service is installed", async () => {
+    const io = provisionedVm();
+    expect(await run(["--daemon", "--yes"], io)).toBe(0);
+    const order = io.lines.join("\n");
+    expect(order.indexOf("app link proved")).toBeLessThan(order.indexOf("== daemon service"));
+  });
+
+  test("a 401 stops setup with the exact message, and no service is installed", async () => {
+    const io = provisionedVm();
+    io.files[`${home}/.kairoku/token.env`] = "KAIROKU_DAEMON_TOKEN=kai_a_stale_token\n";
+    expect(await run(["--daemon", "--yes"], io)).toBe(1);
+    expect(io.lines.join("\n")).toContain("token not accepted by https://app.test");
+    expect(io.lines.join("\n")).not.toContain("kai_a_stale_token");
+    expect(calls(io).some((c) => c.includes("systemctl enable"))).toBe(false);
+  });
+
+  test("--app-url and --app-token set the link without a prompt; the token lands 0600, never printed", async () => {
+    const io = provisionedVm();
+    delete io.files[`${home}/.kairoku/token.env`];
+    delete io.modes[`${home}/.kairoku/token.env`];
+    io.files[`${home}/.kairoku/config.json`] = JSON.stringify({ listen: { host: "127.0.0.1", port: 7801 }, maxConcurrent: 2, repoUrl: "https://example.com/app.git" });
+
+    expect(await run(["--daemon", "--yes", "--app-url", "https://app.test/", "--app-token", "kai_fresh_token"], io)).toBe(0);
+    expect(io.questions).toEqual([]);
+    expect(io.files[`${home}/.kairoku/token.env`]).toBe("KAIROKU_DAEMON_TOKEN=kai_fresh_token\n");
+    expect(io.modes[`${home}/.kairoku/token.env`]).toBe(0o600);
+    // The trailing slash is normalised once, in config.
+    expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).appUrl).toBe("https://app.test");
+    expect(io.lines.join("\n") + io.errors.join("\n")).not.toContain("kai_fresh_token");
+  });
+
+  test("the wizard asks for the app URL and the token, offering the default origin", async () => {
+    const io = provisionedVm();
+    delete io.files[`${home}/.kairoku/token.env`];
+    io.files[`${home}/.kairoku/config.json`] = JSON.stringify({ listen: { host: "127.0.0.1", port: 7801 }, repoUrl: "https://example.com/app.git" });
+    io.answers = ["https://app.test", "kai_pasted_token"];
+
+    expect(await run(["--daemon"], io)).toBe(0);
+    expect(io.questions[0]).toContain(DEFAULT_APP_URL);
+    expect(io.questions[1]).toMatch(/token/i);
+    expect(io.files[`${home}/.kairoku/token.env`]).toBe("KAIROKU_DAEMON_TOKEN=kai_pasted_token\n");
+  });
+
+  test("no link and no way to ask for one is a human-only step, not a failure", async () => {
+    const io = provisionedVm();
+    delete io.files[`${home}/.kairoku/token.env`];
+    io.files[`${home}/.kairoku/config.json`] = JSON.stringify({ listen: { host: "127.0.0.1", port: 7801 }, repoUrl: "https://example.com/app.git" });
+    expect(await run(["--daemon", "--yes"], io)).toBe(0);
+    const out = io.lines.join("\n");
+    expect(out).toContain("Settings → Daemons");
+    expect(out).toContain("--app-token");
   });
 
   test("the wizard's daemon answer and --all / --yes alone reach the daemon flow after the plugin", async () => {
@@ -186,7 +254,7 @@ describe("kairoku setup — daemon migrates a pre-rename home first", () => {
     try {
       const old = join(home, ".hikyaku");
       mkdirSync(join(old, "runs", "oldrun"), { recursive: true });
-      writeFileSync(join(old, "config.json"), JSON.stringify({ listen: { host: "10.0.0.5", port: 7999 }, maxConcurrent: 3, repoPath: join(home, "work", "kairoku") }));
+      writeFileSync(join(old, "config.json"), JSON.stringify({ listen: { host: "10.0.0.5", port: 7999 }, appUrl: "https://app.test", maxConcurrent: 3, repoPath: join(home, "work", "kairoku") }));
       writeFileSync(join(old, "token.env"), "HIKYAKU_TOKEN=legacy-token\n", { mode: 0o600 });
       writeFileSync(join(old, "runs", "oldrun", "events.jsonl"), "{}\n");
       mkdirSync(join(home, "work", "kairoku", ".git"), { recursive: true });
@@ -211,8 +279,13 @@ describe("kairoku setup — daemon migrates a pre-rename home first", () => {
       io.fetch = async (url, init) => {
         const auth = new Headers(init?.headers).get("authorization") ?? "";
         seen.push(auth);
-        if (!url.startsWith("http://10.0.0.5:7999/capacity")) return new Response("", { status: 404 });
-        return auth === "Bearer legacy-token" ? Response.json({ running: 0, max: 3 }) : new Response("", { status: 401 });
+        if (url === "http://127.0.0.1:7999/status") {
+          return Response.json({ version: "0.1.0", capacity: { running: 0, max: 3 }, link: { linked: true }, runs: [] });
+        }
+        if (url !== "https://app.test/api/daemon/heartbeat") return new Response("", { status: 404 });
+        return auth === "Bearer legacy-token"
+          ? Response.json({ daemon: { id: "d", name: "vm" }, liveness: "online", heartbeatIntervalMs: 30_000, runs: [] })
+          : Response.json({ error: "unauthorized" }, { status: 401 });
       };
 
       expect(await run(["--daemon", "--yes"], io)).toBe(0);
@@ -221,7 +294,8 @@ describe("kairoku setup — daemon migrates a pre-rename home first", () => {
       expect(readFileSync(join(fresh, "token.env"), "utf8")).toBe("KAIROKU_DAEMON_TOKEN=legacy-token\n");
       expect(statSync(join(fresh, "token.env")).mode & 0o777).toBe(0o600);
       expect(JSON.parse(readFileSync(join(fresh, "config.json"), "utf8"))).toMatchObject({
-        listen: { host: "10.0.0.5", port: 7999 },
+        // The LAN bind from the push-API days is pulled back to loopback.
+        listen: { host: "127.0.0.1", port: 7999 },
         maxConcurrent: 3,
         repoUrl: DEFAULT_APP_REPO,
       });
@@ -229,8 +303,8 @@ describe("kairoku setup — daemon migrates a pre-rename home first", () => {
       expect(existsSync(join(old, "token.env"))).toBe(true);
       const out = io.lines.join("\n");
       expect(out).toContain("migrated");
-      expect(out).toContain("not shown, not regenerated");
-      expect(out).not.toContain("generated at");
+      // The pre-rename token is carried over and reused as the app credential.
+      expect(out).toContain("app link proved");
       expect(seen).toContain("Bearer legacy-token");
     } finally {
       rmSync(home, { recursive: true, force: true });
