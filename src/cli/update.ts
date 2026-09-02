@@ -10,6 +10,12 @@ import type { Io } from "./io";
 
 export const REPO = "owds-inc/kairoku";
 
+export const usage = `usage: kairoku update
+
+  Replaces this binary with the latest GitHub release's asset for this
+  platform after its sha256 matches the release's checksums.txt. A Homebrew
+  install is left to \`brew upgrade kairoku\`.`;
+
 /** `kairoku-<os>-<arch>` for the four release targets; null for anything else. */
 export function assetName(platform: string, arch: string): string | null {
   const os = platform === "darwin" || platform === "linux" ? platform : null;

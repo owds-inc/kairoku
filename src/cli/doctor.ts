@@ -11,6 +11,13 @@ import { parseTokenEnv } from "../daemon/config";
 import { version, type Io } from "./io";
 import { installedPlugin } from "./plugin";
 
+export const usage = `usage: kairoku doctor
+
+  Verifies this machine and changes nothing. One line per check — PASS, WARN
+  or FAIL — and a nonzero exit when any check FAILs. The plugin checks run
+  everywhere; the daemon checks run where ~/.kairoku (or the pre-rename
+  ~/.hikyaku) exists.`;
+
 export type Check = { name: string; status: "PASS" | "WARN" | "FAIL"; detail?: string };
 
 export const NODE_MAJOR = 24;

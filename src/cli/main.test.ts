@@ -35,6 +35,31 @@ describe("kairoku cli", () => {
     expect(io.lines).toEqual([]);
   });
 
+  test("--help / -h on any command prints that command's usage and does nothing else", async () => {
+    const cases = [
+      ["update", "kairoku update"],
+      ["doctor", "kairoku doctor"],
+      ["plugin", "kairoku plugin install|update|status"],
+      ["daemon", "kairoku daemon [install|start|stop|status|prune]"],
+      ["setup", "kairoku setup [--plugin]"],
+    ] as const;
+    for (const [command, marker] of cases) {
+      for (const flag of ["--help", "-h"]) {
+        const io = fakeIo();
+        let fetched = 0;
+        io.fetch = async () => {
+          fetched++;
+          return new Response("");
+        };
+        expect(await main([command, flag], io)).toBe(0);
+        expect(io.lines.join("\n")).toContain(marker);
+        expect(io.calls).toEqual([]);
+        expect(fetched).toBe(0);
+        expect(io.errors).toEqual([]);
+      }
+    }
+  });
+
   test("the real entry runs: bun run main.ts version", async () => {
     const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "main.ts"), "version"], {
       stdout: "pipe",
