@@ -230,11 +230,17 @@ export async function findPrUrl(
  * §20.9 — one checkout per daemon. A claim for another repo is REPORTED, with
  * the reason, rather than attempted or left to time out. A repo map with
  * auto-clone is the follow-up, not a silent hang.
+ *
+ * It FAILS CLOSED. An unknown `repoFullName` (the checkout has no origin, or
+ * git could not be asked) is a mismatch, not a pass: running someone else's
+ * dispatch against this checkout's code is the failure worth refusing. A claim
+ * that names no repo at all still runs — that is the app saying "wherever you
+ * are". Comparison is case-insensitive; forges are.
  */
 function checkoutMismatch(dispatch: ClaimedDispatch, repoFullName?: string): string | undefined {
   const wanted = dispatch.repo?.fullName;
-  if (!wanted || !repoFullName) return undefined;
-  return wanted === repoFullName ? undefined : wanted;
+  if (!wanted) return undefined;
+  return wanted.toLowerCase() === repoFullName?.toLowerCase() ? undefined : wanted;
 }
 
 export function startDispatch(

@@ -7,8 +7,10 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { mkdirSync } from "node:fs";
 import { appClient } from "./app";
 import { ensureRunDir } from "./events";
+import { run as git } from "./worktree";
 import { startLink, BACKOFF_START_MS, BACKOFF_MAX_MS, type Link } from "./link";
 import { readRunStates, writeRunState } from "./dispatch";
 import { RunStore } from "./runs";
@@ -31,11 +33,33 @@ function setup(overrides: Record<string, unknown> = {}, appOptions = {}) {
   app = fakeApp(appOptions);
   const h = (active = harness({ ...overrides, appUrl: app.url, token: app.token }));
   const store = new RunStore(h.config);
+  const logs: string[] = [];
   link = startLink(store, h.config, {
     client: appClient({ appUrl: app.url, token: h.config.token! }),
     autostart: false,
+    log: (line) => logs.push(line),
   });
-  return { h, store, link: link!, app: app! };
+  return { h, store, link: link!, app: app!, logs };
+}
+
+/**
+ * A real checkout whose `origin` names `full`, so the §20.9 guard has the
+ * left-hand side production actually derives (`git remote get-url origin`).
+ * The host is deliberately not a forge: `gh`/`glab` bail out at once.
+ */
+async function checkoutOf(path: string, full: string): Promise<void> {
+  mkdirSync(path, { recursive: true });
+  await git(["git", "init", "-q"], path);
+  await git(["git", "remote", "add", "origin", `https://example.invalid/${full}.git`], path);
+}
+
+/** A link over a harness whose checkout is already on disk (see `checkoutOf`). */
+function linkTo(h: Harness, a: FakeApp, logs: string[]): Link {
+  return (link = startLink(new RunStore(h.config), h.config, {
+    client: appClient({ appUrl: a.url, token: a.token }),
+    autostart: false,
+    log: (line) => logs.push(line),
+  }));
 }
 
 const claims = (a: FakeApp) => a.calls.filter((c) => c.route === "claim").length;
@@ -242,6 +266,10 @@ describe("RF-013 — a restart is reported, never replayed", () => {
     app.queue({ id: "d-stranded", taskType: "research", brief: "look" });
     await link.beat();
     await link.poll();
+    // Let the live run settle first: this test is about what the NEXT daemon
+    // finds on disk, and a run still reporting would race the restart's report
+    // for the same row.
+    await waitFor(() => app.rows.get("d-stranded")?.status === "done", "the live run to settle");
     // Simulate the daemon dying mid-run: run.json says running, pid is gone.
     ensureRunDir(h.config.runsDir, "d-stranded");
     writeRunState(h.config.runsDir, {
@@ -261,5 +289,98 @@ describe("RF-013 — a restart is reported, never replayed", () => {
 
     expect(app.rows.get("d-stranded")?.status).toBe("failed");
     expect(app.rows.get("d-stranded")?.summary).toBe("daemon restarted");
+  });
+});
+
+describe("§20.9 — the checkout guard, wired the way production wires it", () => {
+  test("a claim for another repo is reported failed and nothing is cut", async () => {
+    const a = (app = fakeApp());
+    const h = (active = harness({ appUrl: a.url, token: a.token }));
+    await checkoutOf(h.config.repoPath, "owds-inc/kairoku");
+    const logs: string[] = [];
+    const l = linkTo(h, a, logs);
+
+    a.queue({
+      id: "d-other",
+      taskType: "research",
+      brief: "look",
+      repo: { provider: "github", fullName: "verify/repo", defaultBranch: "main" },
+    });
+    await l.beat();
+    expect(await l.poll()).toBe(true);
+
+    await waitFor(() => a.rows.get("d-other")?.status === "failed", "the mismatch to be reported");
+    expect(a.rows.get("d-other")?.summary).toBe("no checkout for verify/repo");
+    expect(h.worktrees.created).toHaveLength(0);
+  });
+
+  test("the same repo in another case is the same repo, and it runs", async () => {
+    const a = (app = fakeApp());
+    const h = (active = harness({ appUrl: a.url, token: a.token }));
+    await checkoutOf(h.config.repoPath, "owds-inc/kairoku");
+    const logs: string[] = [];
+    const l = linkTo(h, a, logs);
+
+    a.queue({
+      id: "d-same",
+      taskType: "research",
+      brief: "look",
+      repo: { provider: "github", fullName: "OWDS-Inc/Kairoku", defaultBranch: "main" },
+    });
+    await l.beat();
+    expect(await l.poll()).toBe(true);
+
+    await waitFor(() => a.rows.get("d-same")?.status === "done", "the matching repo to run");
+    expect(h.worktrees.created).toHaveLength(1);
+  });
+
+  test("an unreadable origin fails CLOSED: warned once at boot, every named repo refused", async () => {
+    // config.repoPath is not a git checkout at all, which is exactly the state
+    // a misconfigured daemon boots in.
+    const a = (app = fakeApp());
+    const h = (active = harness({ appUrl: a.url, token: a.token }));
+    const logs: string[] = [];
+    const l = linkTo(h, a, logs);
+
+    a.queue({
+      id: "d-blind",
+      taskType: "research",
+      brief: "look",
+      repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
+    });
+    await l.beat();
+    expect(await l.poll()).toBe(true);
+
+    await waitFor(() => a.rows.get("d-blind")?.status === "failed", "the fail-closed refusal");
+    expect(a.rows.get("d-blind")?.summary).toBe("no checkout for owds-inc/kairoku");
+    expect(logs.filter((line) => line.includes("origin"))).toHaveLength(1);
+    expect(h.worktrees.created).toHaveLength(0);
+  });
+});
+
+describe("a refusal the heartbeat carries back is not dropped", () => {
+  test("an {ok:false} in the beat's runs[] is logged and marked failed, like the direct 422", async () => {
+    const { link, app, h, logs } = setup({ commandOverride: () => ["sh", "-c", "sleep 0.6"] });
+    app.queue({ id: "d-piggy", taskType: "implement", brief: "Build the thing." });
+    await link.beat();
+    await link.poll();
+
+    // The app goes unwell after `running` landed, so the TERMINAL report is the
+    // one that gets queued for the beat.
+    await waitFor(() => app.rows.get("d-piggy")?.status === "running", "the running report to land");
+    app.failWith = 503;
+    await waitFor(() => link.status().pendingReports === 1, "the terminal report to be queued");
+
+    // The app recovers and answers the beat 200 overall — but refuses the
+    // carried report, because an implement run cannot report done with no counts.
+    app.failWith = 0;
+    await link.beat();
+
+    const lastBeat = app.calls.filter((c) => c.route === "heartbeat").at(-1)!.body as { runs?: unknown[] };
+    expect(lastBeat.runs).toHaveLength(1);
+    expect(link.status().pendingReports).toBe(0);
+    expect(app.rows.get("d-piggy")?.status).toBe("running");
+    expect(logs.some((line) => line.includes("d-piggy") && line.includes("pass/fail/skip/errors"))).toBe(true);
+    expect(readRunStates(h.config.runsDir).find((r) => r.dispatchId === "d-piggy")?.state).toBe("failed");
   });
 });

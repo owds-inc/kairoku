@@ -29,6 +29,7 @@ import {
 import type { Config } from "./config";
 import { startDispatch, sweepRestarts, writeRunState, type DispatchReport } from "./dispatch";
 import type { RunStore } from "./runs";
+import { originFullName } from "./worktree";
 
 export const CLAIM_INTERVAL_MS = 5_000;
 export const BACKOFF_START_MS = 30_000;
@@ -90,6 +91,24 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
   let beatTimer: ReturnType<typeof setTimeout> | undefined;
   let claimTimer: ReturnType<typeof setTimeout> | undefined;
   let booted = false;
+
+  /**
+   * §20.9 — what this daemon has a checkout OF, asked of git once at boot
+   * rather than configured twice. Unreadable is warned about here and treated
+   * as a mismatch by `startDispatch`, so a claim naming a repo is refused
+   * rather than run against the wrong code.
+   */
+  let repoFullName: string | undefined;
+  const repoKnown: Promise<unknown> = client
+    ? originFullName(config.repoPath).then((name) => {
+        repoFullName = name;
+        if (!name) {
+          log(
+            `app link: cannot read the origin remote of ${config.repoPath} — any dispatch that names a repo will be refused (§20.9)`,
+          );
+        }
+      })
+    : Promise.resolve();
 
   const status = (): LinkStatus => ({
     linked: client !== undefined,
@@ -168,6 +187,15 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     liveness = result.body.liveness;
     protocol = result.body.protocol;
     heartbeatMs = result.body.heartbeatIntervalMs > 0 ? result.body.heartbeatIntervalMs : DEFAULT_HEARTBEAT_MS;
+
+    // One outcome per carried report, in the order they were sent. A `false`
+    // one is the app refusing that run's report, and is answered exactly as the
+    // direct path answers a 422 — never dropped because the beat itself was 200.
+    (result.body.runs ?? []).forEach((outcome, i) => {
+      const carriedUpdate = carried[i];
+      if (!carriedUpdate || outcome?.ok !== false) return;
+      refused(carriedUpdate, [outcome.reason, ...(outcome.issues ?? [])].filter(Boolean).join(": "));
+    });
     return heartbeatMs;
   }
 
@@ -199,8 +227,10 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
   }
 
   async function run(dispatch: ClaimedDispatch): Promise<void> {
+    await repoKnown;
     const started = startDispatch(store, config, dispatch, {
       ...(config.agentToken === undefined ? {} : { agentToken: config.agentToken }),
+      ...(repoFullName === undefined ? {} : { repoFullName }),
       onRunning: () => void report({ dispatchId: dispatch.id, status: "running" }),
     });
     let final: DispatchReport;
@@ -237,19 +267,27 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     const result = await client.update(update);
     if (result.ok || halted(result)) return;
 
-    if (result.kind === "rejected") {
-      lastError = result.error;
-      log(`app link: the app refused the report for ${update.dispatchId} — ${result.error}`);
-      writeRunState(config.runsDir, {
-        dispatchId: update.dispatchId,
-        state: "failed",
-        startedAt: new Date().toISOString(),
-        branch: update.artifacts?.branch ?? `run/${update.dispatchId}`,
-      });
-      return;
-    }
+    if (result.kind === "rejected") return refused(update, result.error);
     lastError = result.error;
     pending.push(update);
+  }
+
+  /**
+   * The app understood a report and said no. It reads the same on both paths —
+   * the direct `update` 422 and an `{ok:false}` entry in a heartbeat's `runs[]`
+   * — so it is handled in one place: a refusal carried back by the beat that
+   * was only ever discarded is a run stuck `running` in the app with no record
+   * anywhere of why.
+   */
+  function refused(update: DispatchUpdate, reason: string): void {
+    lastError = reason;
+    log(`app link: the app refused the report for ${update.dispatchId} — ${reason}`);
+    writeRunState(config.runsDir, {
+      dispatchId: update.dispatchId,
+      state: "failed",
+      startedAt: new Date().toISOString(),
+      branch: update.artifacts?.branch ?? `run/${update.dispatchId}`,
+    });
   }
 
   // ------------------------------------------------------------- the timers

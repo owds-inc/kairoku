@@ -134,6 +134,33 @@ export function gitWorktreeOps(
   };
 }
 
+/**
+ * §20.9 — `owner/name` out of an origin remote URL. Both forms git writes are
+ * accepted (scheme URL and the scp-like one), the `.git` suffix is dropped, and
+ * a nested GitLab group keeps its whole path because that IS the name.
+ */
+export function parseRepoFullName(remoteUrl: string): string | undefined {
+  const url = remoteUrl.trim().replace(/\/+$/, "").replace(/\.git$/, "");
+  const path =
+    url.match(/^[a-z][a-z0-9+.-]*:\/\/[^/]+\/(.+)$/i)?.[1] ?? url.match(/^[^/]+@[^:/]+:(.+)$/)?.[1];
+  const segments = path?.split("/").filter(Boolean) ?? [];
+  return segments.length >= 2 ? segments.join("/") : undefined;
+}
+
+/**
+ * The `owner/name` of the configured checkout, asked of git once at boot.
+ * `undefined` means "this daemon cannot say what it has a checkout of" — the
+ * §20.9 guard treats that as a mismatch, so a wrong repo is never run.
+ */
+export async function originFullName(repoPath: string): Promise<string | undefined> {
+  try {
+    const result = await run(["git", "remote", "get-url", "origin"], repoPath);
+    return result.code === 0 ? parseRepoFullName(result.stdout) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface StaleWorktree {
   readonly path: string;
   readonly branch: string;

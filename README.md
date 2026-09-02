@@ -64,7 +64,11 @@ checkout (asked once, remembered as `repoUrl` in the config), unprivileged
 user namespaces for codex's sandbox (linux, sudo-gated), codex's MCP approval
 mode, `~/.kairoku/config.json`, the **app link** (URL + token, written to
 `token.env` mode 600 and **proved with one heartbeat before the service is
-installed**), then the service and a reachability check. It is idempotent
+installed** — note that the token is *written* before it is proved, so a token
+the app refuses stays on disk: setup exits 1 and installs no service, but a
+hand-started `kairoku daemon` will still boot, take a 401, and sit with its
+loop stopped until `kairoku setup --daemon` is re-run with a token that works),
+then the service and a reachability check. It is idempotent
 on a live machine: only what is missing gets installed, a runtime is never
 upgraded under a running agent, and the service file is rewritten only when
 its content changes. It ends with what only a human can do (`claude` login,
@@ -121,7 +125,11 @@ Outbound, and this is the whole list (`Authorization: Bearer <token>`):
 A `401` stops both timers, logs once, and leaves the listener up so `doctor` can
 say `app link: token not accepted`. `5xx` and network failures back off 30 s →
 5 min and reset on success; the daemon never claims while a heartbeat is
-failing. `constraints.test.ts` asserts mechanically that no other module in
+failing. A report the app could not take rides the next heartbeat in `runs[]`,
+and the answer's matching `runs[i]` is read: an `{ok:false}` there is logged and
+the run marked failed locally, exactly as a direct `422` is — a 200 on the beat
+is not consent for what the beat carried.
+`constraints.test.ts` asserts mechanically that no other module in
 `src/daemon/` opens an outbound client and that no host is hardcoded.
 
 Inbound, on 127.0.0.1, **no credential** — reachability is the boundary, which
@@ -196,3 +204,11 @@ one outbound module, three routes, no hardcoded host.
 - **A run left non-terminal by a daemon that died is reported failed, never
   replayed** (SPEC RF-013). Re-running a prompt whose first attempt may have
   committed, pushed or opened a PR is worse than any stuck row.
+- **One checkout per daemon, and the daemon works out which one at boot**
+  (SPEC §20.9) — `git remote get-url origin` on `repoPath`, parsed to
+  `owner/name`, compared case-insensitively against the claim's `repo.fullName`.
+  A claim for any other repo is reported `failed` with `no checkout for <name>`
+  and nothing is cut. It fails **closed**: an unreadable origin is warned about
+  once at boot and then refuses every claim that names a repo, because a guard
+  that passes when it cannot tell would run someone else's dispatch against
+  this checkout's code.

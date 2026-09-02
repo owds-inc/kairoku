@@ -73,6 +73,11 @@ Bun + TypeScript, `Bun.serve`, **zero runtime dependencies**. In-memory run stat
   able to walk up to a daemon whose token the app refused and be told exactly that, which it cannot
   do if the process exits. A dispatch id the daemon is already running is ignored if the app's
   lease re-issues it.
+  **A 200 on the beat is not consent for what the beat carried.** Each entry of the response's
+  `runs[]` pairs with the report sent in that position, and an `{ ok: false }` entry is answered
+  exactly as a direct `update` refusal is — logged once with the app's reason and issues, and the
+  run marked `failed` in its `run.json`, never retried into the same refusal. Dropping those
+  outcomes leaves a dispatch stuck `running` in the app with no record anywhere of why.
 
 - **RF-013 — the restart rule.** Each run keeps `~/.kairoku/runs/<dispatchId>/run.json`
   `{ dispatchId, state: starting|running|done|failed, pid?, startedAt, branch, worktree? }`. On
@@ -138,6 +143,19 @@ agent's final `{"kairoku": {"counts": {…}}}` block when it printed one.
 **§20.9 — one checkout per daemon.** A claim naming a repo this daemon has no checkout of is
 reported `failed` with `no checkout for <owner/name>`, immediately. Never a hang, never an attempt.
 A repo map with auto-clone is the follow-up.
+
+The left-hand side of that comparison is **derived once at boot** from
+`git -C <repoPath> remote get-url origin` — `https://host/owner/name[.git]` and
+`git@host:owner/name[.git]` both parse, the `.git` suffix is dropped, and a nested GitLab group
+keeps its whole path because that *is* the name. There is no `config.json` field for it: a second
+place to state the same fact is a second place for it to be wrong. The comparison is
+case-insensitive; forges are.
+
+It **fails closed.** If the remote cannot be read or parsed the daemon logs one warning at boot and
+every claim that *names* a repo is refused with the same `no checkout for <owner/name>`; a claim
+that names no repo at all still runs against the configured checkout, because that is the app
+saying "wherever you are". A guard that passes when it cannot tell is not a guard — it would let a
+dispatch aimed at a second repo execute against the first one's code.
 
 **The daemon reports facts; the app decides.** A `422` from `update` (invariant 7: an `implement`
 run cannot report `done` without all four counts) is logged, the run marked failed locally with the
