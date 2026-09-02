@@ -125,3 +125,52 @@ is a human gate): a daemon comes up, heartbeats, claims a queued `implement` dis
 reports `running` then `done` with a branch, counts and the jsonl path; killing it stops the beats.
 Plus every `package.json` script with counts, `bunx tsc --noEmit`, the host release build,
 `./dist/kairoku-darwin-arm64 version`, and `claude plugin validate plugin/`.
+
+---
+
+## Amended at phase end — the decided shape is what was built
+
+Lookups made first: context7 `/oven-sh/bun` for `Bun.serve`'s `routes` table, the assigned `port`
+and `server.stop(true)`; `claude --help` on this machine for the headless flags (which is how the
+Claude provider got deferred rather than half-built — see below).
+
+**Deviations from the plan above, and why:**
+
+- **No Claude provider.** The brief's done-condition says "codex or claude (whichever is
+  installed)". Codex is installed here, so the proof runs on it. Adding a Claude role now would mean
+  choosing a permission posture (`--permission-mode`) that §20.8 rules is O-3's to set, alongside the
+  Agent SDK that lane brings — a half-provider O-3 would immediately replace. RF-009 stays at one
+  role and SPEC v1 records where Claude arrives.
+- **The report is delivered twice-over, not two ways.** Item 3 asks the heartbeat to carry "the
+  reports of runs that changed since the last beat"; item 4 asks for `update running` / `update
+  done|failed`. Both are honoured by ONE code path: each transition is sent immediately through
+  `update`, and only a report a retryable failure lost is queued for the next heartbeat to carry.
+  One builder of the payload, two carriers, the beat as the retry.
+- **The listener moved to loopback and `setup` rebinds an old config.** Item 2 keeps the listener
+  and drops its auth. An unauthenticated surface on the LAN address the push API used would be a
+  worse bargain than the one it replaced, so `daemonConfig` binds `127.0.0.1` and pulls an existing
+  LAN bind back. `lanIp` is deleted.
+- **`RunStore.create` and the refusal set are deleted, not adapted.** They answered `POST /runs`.
+  Capacity became a gate on claiming; credential distinctness became RF-008-amended (issuance).
+- **The token became optional.** RF-012 keeps the listener up when the app REJECTS a token, so a
+  MISSING one cannot be a harder failure. `loadConfig` no longer throws, and the daemon says which
+  piece is missing.
+
+**Done-condition, run on this Mac against the fake app** (a real app needs a browser-minted token —
+that is the human gate below). The compiled `dist/kairoku-darwin-arm64 daemon`, a scratch git repo
+with a real `origin`, and a `Bun.serve` speaking the three routes:
+
+- heartbeat at the app's own cadence, `meta {host, version, capacity}` carried;
+- `claim` took `e2e-dispatch-1` (`implement`), cut `run/e2e-dispatch-1` from `origin/main`,
+  spawned **real `codex exec --json`**, and sent `update running`;
+- the agent wrote and committed `NOTES.md`; the daemon sent `update done` with
+  `artifacts.branch`, `artifacts.jsonl` and `counts {pass:1, fail:0, skip:0, errors:0}` parsed from
+  the agent's own report block; the worktree was torn down and the branch kept;
+- SIGTERM stopped the beats dead (9 before, 9 twelve seconds later);
+- a `run.json` left `running` with a dead pid was reported `failed` / "daemon restarted" on the next
+  boot's first beat and **never relaunched** (no worktree was cut);
+- a stale token produced exactly `token not accepted by <appUrl>`, stopped both timers, and left
+  `GET /status` answering `{"stopped": "token-rejected"}`;
+- `kairoku doctor` printed `PASS daemon reachable`, `PASS app link … online, protocol 1`,
+  `PASS runs in flight 0`;
+- no credential appeared in any log, event or status body.
