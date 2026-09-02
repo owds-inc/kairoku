@@ -5,7 +5,8 @@
  * daemon's WorktreeOps.
  */
 
-import { chmodSync, existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline/promises";
 
@@ -82,6 +83,7 @@ export const io: Io = {
     }
   },
   writeFile(path, data, mode) {
+    mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, data);
     if (mode !== undefined) chmodSync(path, mode);
   },

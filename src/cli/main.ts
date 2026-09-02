@@ -7,6 +7,7 @@
 
 import { version } from "../../package.json";
 import { io, type Io } from "./io";
+import * as daemon from "./daemon";
 import * as doctor from "./doctor";
 import * as plugin from "./plugin";
 import * as setup from "./setup";
@@ -18,6 +19,8 @@ export const usage = `kairoku ${version} — the Kairoku CLI
                                    set up the Claude Code plugin and/or the daemon;
                                    a wizard without flags
   kairoku doctor                   verify this machine, change nothing; nonzero on FAIL
+  kairoku daemon [install|start|stop|status|prune]
+                                   the orchestration daemon: foreground, or as a service
   kairoku plugin install|update|status
                                    the Claude Code plugin, through the claude CLI
   kairoku update                   replace this binary with the latest release
@@ -41,6 +44,8 @@ export async function main(argv: string[], io: Io): Promise<number> {
       return plugin.run(rest, io);
     case "doctor":
       return doctor.run(rest, io);
+    case "daemon":
+      return daemon.run(rest, io);
     case "setup":
       return setup.run(rest, io);
     case "update":
