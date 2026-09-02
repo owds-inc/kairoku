@@ -63,6 +63,23 @@ describe("worktree", () => {
     expect(DEFAULT_BASE).toBe("origin/main");
   });
 
+  test("concurrent creates against one base checkout all succeed, and so do concurrent removes", async () => {
+    // Two `git worktree add`s in the same checkout race on .git/config (the new
+    // branch's upstream is written there): the loser fails with "could not lock
+    // config file". The daemon serialises worktree creation and removal.
+    const ops = gitWorktreeOps(repoPath, worktreesDir);
+    const ids = ["c1", "c2", "c3", "c4"];
+    const made = await Promise.all(ids.map((id) => ops.create(id)));
+    for (const [i, wt] of made.entries()) {
+      expect(wt.branch).toBe(`run/${ids[i]}`);
+      expect(existsSync(join(wt.path, "README.md"))).toBe(true);
+    }
+    const { stdout } = await git(["branch", "--list", "run/*"], repoPath);
+    expect(stdout.split("\n").filter(Boolean)).toHaveLength(4);
+    await Promise.all(made.map((wt) => ops.remove(wt)));
+    expect(await listRunWorktrees(repoPath)).toEqual([]);
+  }, 30_000);
+
   test("create cuts a run/<id> worktree from origin/main and seeds it", async () => {
     const ops = gitWorktreeOps(repoPath, worktreesDir);
     const worktree = await ops.create("run1");

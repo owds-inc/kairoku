@@ -96,23 +96,40 @@ export function gitWorktreeOps(
   repoPath: string,
   worktreesDir: string,
 ): WorktreeOps {
+  // `git worktree add` writes the new branch's upstream into .git/config and
+  // `remove` rewrites .git/worktrees/; two at once collide with "could not
+  // lock config file .git/config: File exists" and the loser's run dies before
+  // it starts. One queue per base checkout serialises the git steps — the
+  // agents themselves still run concurrently, and `bun install` stays outside
+  // the queue because it never touches .git.
+  let queue: Promise<unknown> = Promise.resolve();
+  const serialised = <T>(work: () => Promise<T>): Promise<T> => {
+    const next = queue.then(work, work);
+    queue = next.catch(() => {});
+    return next;
+  };
+
   return {
     async create(runId, base = DEFAULT_BASE): Promise<Worktree> {
       const path = join(worktreesDir, runId);
       const branch = branchFor(runId);
-      await must(["git", "fetch", "origin"], repoPath);
-      await must(
-        ["git", "worktree", "add", "-b", branch, path, base],
-        repoPath,
-      );
+      await serialised(async () => {
+        await must(["git", "fetch", "origin"], repoPath);
+        await must(
+          ["git", "worktree", "add", "-b", branch, path, base],
+          repoPath,
+        );
+      });
       await must(["bun", "install"], path);
       await copyEnvFiles(repoPath, path);
       return { path, branch };
     },
 
-    async remove(worktree): Promise<void> {
+    remove(worktree): Promise<void> {
       // --force: the agent leaves uncommitted files behind routinely.
-      await must(["git", "worktree", "remove", "--force", worktree.path], repoPath);
+      return serialised(async () => {
+        await must(["git", "worktree", "remove", "--force", worktree.path], repoPath);
+      });
     },
   };
 }
