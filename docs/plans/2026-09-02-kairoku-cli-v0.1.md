@@ -372,45 +372,85 @@ Body: items 1–4 → files; instruments with counts; the app SHA the plugin was
 
 ## Phase 2 — the binary, releases, brew, install script (PR 2)
 
-*Decided shape; steps and code expanded at phase start after context7 (bun `build --compile` targets and flags, Homebrew formula DSL and `brew audit`, `claude plugin` non-interactive flags).*
+*Amended 2026-09-02 at phase end: the decided shape below is what was built. Lookups made first:
+context7 for bun `build --compile --target=bun-<os>-<arch>` + `--outfile`, the Homebrew formula
+DSL (`on_macos`/`on_linux` × `on_arm`/`on_intel`, `bin.install`, `test do`) and the plugin CLI
+(`claude plugin install <p@m> --scope user`, `plugin update <p> -y`, `plugin list --json`,
+`plugin marketplace list --json`, `marketplace update <name>`).*
 
-### Task 7: `parseArgs` dispatch and a testable shell seam
+### Task 7: `Io` seam, test fake, dispatch — DONE
 
-**Files:** Modify `src/cli/main.ts`; create `src/cli/sh.ts`; test `src/cli/main.test.ts`.
-**Interfaces (produces):**
-- `sh.ts`: `type Shell = (argv: string[], opts?: { input?: string }) => Promise<{ code: number; stdout: string; stderr: string }>`; `export const shell: Shell` (Bun.spawn); `export function which(bin: string): string | null`. Every command takes a `Shell` parameter defaulting to `shell`, so tests inject a recording fake — the same injection pattern the daemon uses for `WorktreeOps`.
-- `main.ts`: `parseArgs({ allowPositionals: true, strict: false })`, first positional selects the command; each command module exports `run(args: string[], io = { shell, stdout, stderr }): Promise<number>` and `main` exits with it. Commands: `version`, `doctor`, `setup`, `plugin`, `update` (+ `daemon` in Phase 3).
-**Tests:** dispatch to each command by name; `--help` per command; exit codes.
+**Files:** `src/cli/io.ts` (`Io`: platform/arch/home/uid/execPath/env, `out`/`err`, `ask` via
+`node:readline/promises`, `which` = `Bun.which`, `shell` = `Bun.spawn` capturing or `live`,
+`exists`/`readFile`/`mode`/`writeFile`/`rename`, `fetch`); `src/cli/testkit.ts` (`fakeIo()`: in-memory
+files/modes, `bins`, `canned` shell answers keyed by argv prefix, scripted `answers`, recorded
+`calls`/`lines`/`errors`/`questions`); `src/cli/main.ts` (`export async function main(argv, io)`,
+first argument picks the command; `version`/`--version`/`-v`, `help`/`--help`/`-h`, unknown → 2;
+`if (import.meta.main) process.exit(await main(...))`). Test: `src/cli/main.test.ts` (5).
 
-### Task 8: `plugin install|update|status`
+### Task 8: `plugin install|update|status` — DONE
 
-**Files:** create `src/cli/plugin.ts`; extend `src/cli/plugin.test.ts`.
-**Behaviour:** `install` → `claude plugin marketplace add owds-inc/kairoku` then `claude plugin install kairoku@kairoku-marketplace`; `update` → `claude plugin marketplace update kairoku-marketplace` then `claude plugin update kairoku@kairoku-marketplace`; `status` → `claude plugin list` filtered to `kairoku@`. `claude` absent → print the exact install line (`npm install -g @anthropic-ai/claude-code` and the native installer URL) and return 1. Marketplace-already-present is not an error (idempotent). Exact non-interactive flags confirmed via context7/`claude plugin … --help` at phase start.
-**Tests:** fake `Shell` records argv sequences; asserts the three sequences and the absent-`claude` message + exit 1.
+**Files:** `src/cli/plugin.ts` — `MARKETPLACE_SOURCE = "owds-inc/kairoku"`, `MARKETPLACE =
+"kairoku-marketplace"`, `PLUGIN = "kairoku@kairoku-marketplace"`; `install` = marketplace list
+(skip add when the name is registered, whatever its source) → add → plugin list (skip when
+installed) → `install --scope user`; `update` = `marketplace update` → `plugin update -y`;
+`status` from `plugin list --json`; `installedPlugin(io)` shared with doctor; no `claude` on PATH →
+`CLAUDE_MISSING` (npm and native installer lines), exit 1. Test: `src/cli/plugin.test.ts` (10).
 
-### Task 9: `doctor`
+### Task 9: `doctor` — DONE
 
-**Files:** create `src/cli/doctor.ts`; test `src/cli/doctor.test.ts`.
-**Interfaces:** `type Check = { name: string; status: "PASS" | "WARN" | "FAIL"; detail?: string }`; `export async function checks(env: DoctorEnv): Promise<Check[]>`; `run` prints one line per check and returns 1 if any FAIL. `DoctorEnv` = `{ shell, platform, home, readFile, exists, fetch }` so every check is unit-testable without the machine. Checks ported 1:1 from `cmd_doctor`: node ≥ 24, bun/claude/codex present, paseo optional (WARN), non-interactive PATH line (linux), userns sysctl (linux; WARN when the key is absent), codex `default_tools_approval_mode = "approve"`, config.json present, token.env mode 600, the service (systemd `is-active` on linux / `launchctl print` on mac — Phase 3 wires the mac half), the 401/200 round trip, paseo unit (WARN when absent), kairoku checkout present + clean (WARN when dirty). Config dir: `~/.kairoku/` with `~/.hikyaku/` fallback until Phase 3 migrates.
-**Tests:** one table-driven test per check status with a fake env; the exit code rule.
+**Files:** `src/cli/doctor.ts` — `Check = { name, status: PASS|WARN|FAIL, detail? }`,
+`checks(io)`, `run(args, io)` prints one padded line per check and a summary, exit 1 on any FAIL.
+Plugin section always (`claude installed`, `kairoku plugin installed`); daemon section only when
+`daemonHome(io)` finds `~/.kairoku` or (until Phase 3 migrates) `~/.hikyaku`, else one WARN
+`daemon configured` — so a laptop exits 0. Daemon checks ported 1:1: `node ≥ 24`, `bun`/`codex`
+installed, `paseo` (WARN), linux-only `PATH export is ~/.bashrc line 1` + `exported dirs exist` +
+`userns unrestricted` (absent key = WARN), `codex MCP writes pre-approved`, `config.json`,
+`token.env` mode 600, `daemon service` (`systemctl is-active kairoku-daemon` / `launchctl print
+gui/<uid>/io.kairoku.daemon`), the 401/200 round trip (token from `KAIROKU_DAEMON_TOKEN=` or
+`HIKYAKU_TOKEN=`), linux-only `paseo.service`, `repo present`/`repo clean`. Test:
+`src/cli/doctor.test.ts` (9).
 
-### Task 10: `setup` wizard (plugin and daemon entry points)
+### Task 10: `setup` — DONE (daemon half deferred to Phase 3, as the spec's phase order implies)
 
-**Files:** create `src/cli/setup.ts`; test `src/cli/setup.test.ts`.
-**Interfaces:** `run(args, io)` parses `--plugin`, `--daemon`, `--all`, `--yes`; without flags asks two yes/no questions via `readline/promises` (`rl.question`, injected as `io.ask`); runs `plugin.install` and/or `daemon.setup` (Phase 3; in Phase 2 the daemon branch prints "arrives in the next release" and returns 0 — stated in the PR body).
-**Tests:** flag matrix; `--yes` never calls `ask`; the prompts' answers map to the right steps (fake ask + fake shell).
+**Files:** `src/cli/setup.ts` — `parseArgs` over `--plugin --daemon --all --yes/-y --help/-h`;
+no selecting flag → two `ask` prompts (`[Y/n]` plugin, `[y/N]` daemon) unless `--yes`, which alone
+means `--all`; plugin step = `plugin.run(["install"])`, a failure stops the run; daemon step prints
+that it arrives with the next release. Test: `src/cli/setup.test.ts` (10).
 
-### Task 11: `update` (self-update)
+### Task 11: `update` — DONE
 
-**Files:** create `src/cli/update.ts`; test `src/cli/update.test.ts`.
-**Behaviour:** if `process.execPath` contains `/Cellar/` → print "installed via brew: run `brew upgrade kairoku`" and return 0. Else GET `https://api.github.com/repos/owds-inc/kairoku/releases/latest`, pick `kairoku-<os>-<arch>` + `checksums.txt`, download to a temp file next to the binary, verify sha256 (`node:crypto`), `chmod 755`, `rename` over `process.execPath`. `fetch` injected for tests. Same version → "already up to date".
-**Tests:** brew detection; asset selection per platform; checksum mismatch aborts without touching the binary; happy path against a fake fetch and a temp "binary".
+**Files:** `src/cli/update.ts` — `assetName(platform, arch)` → `kairoku-<os>-<arch>` or null;
+execPath under `/Cellar/` → "brew upgrade kairoku", exit 0; GET
+`api.github.com/repos/owds-inc/kairoku/releases/latest`; same version → "already the latest";
+download asset + `checksums.txt`, sha256 via `node:crypto` must match the asset's line; write
+`<execPath>.new` mode 755 then rename over `execPath`; every failure exits 1 without touching the
+binary. Test: `src/cli/update.test.ts` (8).
 
-### Task 12: Release build, CI, install script, formula
+### Task 12: release build, CI, install script, formula — DONE
 
-**Files:** `package.json` script `build:release`; create `scripts/build-release.ts` (4× `bun build --compile --target=bun-<os>-<arch> src/cli/main.ts --outfile dist/kairoku-<os>-<arch>` + `dist/checksums.txt` via `node:crypto`); create `.github/workflows/ci.yml` (PRs: `bun install`, `bun test`, `bunx tsc --noEmit`, host-target build) and `.github/workflows/release.yml` (`v*` tag: `build:release`, `gh release create` with the five assets); create `install.sh` (POSIX sh: `uname -s/-m` → asset name; `curl -fsSL` latest release asset + `checksums.txt`; `sha256sum`/`shasum -a 256` verify; install to `/usr/local/bin` if writable else `~/.local/bin`; print `kairoku setup`; `KAIROKU_RELEASE_BASE` env override so the test can point it at a local `Bun.serve`); PR in `owds-inc/homebrew-tap` adding `Formula/kairoku.rb` (`on_macos`/`on_linux` × `on_arm`/`on_intel` `url`+`sha256`, `bin.install`, `test do` → `assert_match version.to_s, shell_output("#{bin}/kairoku version")`).
-**Tests:** `src/cli/install-script.test.ts` runs `sh install.sh` against a local server serving a fake asset + checksum into a temp `PREFIX`; a tampered checksum fails. `scripts/build-release.ts` is verified by the done-condition, not a unit test.
-**Done-condition:** `bun run build:release` → four binaries + checksums; `./dist/kairoku-darwin-arm64 version` prints `kairoku 0.1.0`; `./dist/kairoku-darwin-arm64 setup --plugin --yes` installs the plugin here; `doctor` exits 0 on this machine; `brew audit --strict Formula/kairoku.rb` and a local `brew install --formula ./Formula/kairoku.rb` pointed at the local `dist/` assets, since release assets stay private until Neil flips visibility (stated in both PRs).
+**Files:** `scripts/build-release.ts` (`bun run build:release`: four `bun build --compile
+--target=bun-<os>-<arch>` runs → `dist/kairoku-<os>-<arch>`, `dist/checksums.txt` in sha256sum
+format, `dist/kairoku.rb` rendered by `formula(version, sha256s)` so the tap never carries a
+hand-typed hash); `.github/workflows/ci.yml` (PRs + main: `bun install`, `bun test`, `bunx tsc
+--noEmit`, host-target build + `version`); `.github/workflows/release.yml` (`v*` tag; asserts the tag
+equals `v<package.json version>`; suite, tsc, `build:release`, `gh release create` with the four
+binaries, `checksums.txt` and `kairoku.rb`); `install.sh` (POSIX sh; `uname` → asset; downloads
+from `releases/latest/download/` or `KAIROKU_RELEASE_URL`; awk match in `checksums.txt`;
+`sha256sum`/`shasum -a 256`; `/usr/local/bin` if writable else `~/.local/bin`, or
+`KAIROKU_INSTALL_DIR`; prints the PATH hint and `next: kairoku setup`); `dist/` ignored.
+`Formula/kairoku.rb` in `owds-inc/homebrew-tap` on branch `kairoku-0.1.0` (the tap's `main` seeded
+with a README first — it was empty). Test: `src/cli/install-script.test.ts` (3, against a local
+`Bun.serve` release: happy path 755 + messages, checksum mismatch, missing entry).
+
+**Done-condition, run on this Mac (arm64):** `bun run build:release` → the four Mach-O/ELF
+binaries + `checksums.txt` + `kairoku.rb`; `./dist/kairoku-darwin-arm64 version` → `kairoku 0.1.0`;
+`./dist/kairoku-darwin-arm64 setup --plugin --yes` → exit 0 (marketplace and plugin already
+present, left alone); `./dist/kairoku-darwin-arm64 doctor` → exit 0 (plugin PASS ×2, daemon WARN).
+Formula: `brew audit --strict owds-inc/tap/kairoku` + `brew style`, then a local install of a
+`file://`-URL copy pointing at `dist/`, `brew test`, `kairoku version`, uninstall — what waits on
+Neil's visibility flip and the `v0.1.0` tag is the same install against the public release assets,
+and the released `kairoku.rb`'s checksums replacing the local build's in the tap.
 
 ---
 

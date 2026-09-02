@@ -31,8 +31,9 @@ also work by hand inside Claude Code:
 /plugin install kairoku@kairoku-marketplace
 ```
 
-From a checkout: `claude plugin marketplace add /path/to/kairoku`, then the
-same install line. Plugin releases are tagged `kairoku--v<version>`.
+`kairoku plugin install|update|status` are the same steps as commands; from a
+checkout, `claude plugin marketplace add /path/to/kairoku` then the same
+install line. Plugin releases are tagged `kairoku--v<version>`.
 
 ## The daemon
 
@@ -108,6 +109,17 @@ bun run typecheck                 # tsc --noEmit — bun test never type-checks
 bun run src/cli/main.ts version   # the CLI from source
 bun run prune                     # human-run worktree cleanup; asks first
 ```
+
+### Releasing
+
+`bun run build:release` compiles `src/cli/main.ts` for darwin-arm64, darwin-x64,
+linux-x64 and linux-arm64 into `dist/kairoku-<os>-<arch>`, writes
+`dist/checksums.txt` (sha256) and renders `dist/kairoku.rb`, the Homebrew
+formula with those checksums. Pushing a `v<version>` tag that matches
+`package.json` runs `.github/workflows/release.yml`, which builds the same and
+publishes a GitHub release with the six files; `install.sh`, `kairoku update`
+and the formula in `owds-inc/homebrew-tap` all read from it (copy the released
+`kairoku.rb` into the tap's `Formula/` for each version).
 
 | Path | Holds |
 |---|---|
