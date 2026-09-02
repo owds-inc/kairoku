@@ -28,9 +28,11 @@ export const usage = `usage: kairoku daemon [install|start|stop|status|prune]
 /** PATH for the service: the binary's dir, bun, node's dir, the usual bins. */
 export function servicePath(io: Io): string {
   const node = io.which("node");
+  const bun = io.which("bun");
   const dirs = [
     dirname(io.execPath),
     join(io.home, ".bun", "bin"),
+    bun ? dirname(bun) : "",
     node ? dirname(node) : "",
     io.platform === "darwin" ? "/opt/homebrew/bin" : "",
     "/usr/local/bin",
@@ -144,7 +146,8 @@ const mac: Record<string, Verb> = {
   },
   async status(io) {
     const r = await io.shell(["launchctl", "print", target(io)]);
-    io.out(r.code === 0 ? `${LAUNCHD_LABEL}: ${r.stdout.trim()}` : `${LAUNCHD_LABEL} not loaded`);
+    const state = r.stdout.match(/state = .*/)?.[0] ?? r.stdout.trim().split("\n")[0] ?? "";
+    io.out(r.code === 0 ? `${LAUNCHD_LABEL} loaded, ${state}` : `${LAUNCHD_LABEL} not loaded`);
     return r.code;
   },
 };
