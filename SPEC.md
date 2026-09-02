@@ -5,8 +5,11 @@ ratified by Neil). The evidence base is `orch/dispatch-layer-research.md`. This 
 contract for v0; changes to it are explicit amendments, never silent divergence. No dates, no
 estimates.*
 
-*Amended 2026-09-02: retitled for the Kairoku CLI repo (planning `DECISIONS.md` §19). The config dir,
-token env and service names are amended in Phase 3 of `docs/plans/2026-09-02-kairoku-cli-v0.1.md`.*
+*Amended 2026-09-02 (planning `DECISIONS.md` §19, `docs/plans/2026-09-02-kairoku-cli-v0.1.md`): retitled
+for the Kairoku CLI repo; the config dir is `~/.kairoku/`, the token env `KAIROKU_DAEMON_TOKEN` (or
+`token.env` beside the config), the services `kairoku-daemon` (systemd) / `io.kairoku.daemon` (launchd),
+the cleanup CLI `kairoku daemon prune`. `~/.hikyaku/`, `HIKYAKU_TOKEN` and `HIKYAKU_CONFIG` are honoured
+for this one version (a deprecation line, a one-time copy of the dir). Routes and refusals unchanged.*
 
 ## Objective
 
@@ -40,12 +43,13 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   `{ status: "running"|"idle"|"error"|"timeout", startedAt, branch, exitSummary? }`.
   (`blocked` is reserved in the vocabulary but unreachable in v0: `codex exec` with
   `approval_policy: "never"` never parks. Do not fabricate it.)
-- **RF-003 — events**: per-run JSONL at `~/.hikyaku/runs/<runId>/events.jsonl` (created, started,
+- **RF-003 — events**: per-run JSONL at `~/.kairoku/runs/<runId>/events.jsonl` (created, started,
   finished, teardown, error) plus `stdout.log`. Coarse transitions are enough; no SSE in v0.
 - **RF-004 — `POST /runs/{id}/cancel`** — kills the process **group**, runs teardown, marks
   `error` with `exitSummary: "cancelled"`.
 - **RF-005 — `GET /capacity`** → `{ running, max }` (max from config).
-- **RF-006 — auth**: one bearer token per daemon (from `HIKYAKU_TOKEN` env or config), checked on
+- **RF-006 — auth**: one bearer token per daemon (`KAIROKU_DAEMON_TOKEN` env, or `token.env` beside
+  the config file, never config.json), checked on
   every request with a constant-time compare; listener binds only to the configured host (the
   VM's LAN IP), never `0.0.0.0`. No TLS inside the LAN; a reverse proxy adds it if ever needed.
 - **RF-007 — the runner never talks to Kairoku, Jira, or GitHub.** It holds no credentials for
@@ -70,14 +74,15 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
 `git fetch origin` then `git worktree add -b run/<runId> <worktreesDir>/<runId> origin/main`
 against the configured base checkout (`~/work/kairoku` by default). Setup before the agent
 starts: `bun install` + copy `.env*` from the base checkout. Teardown per RF-010. Stale worktrees
-from a dead daemon are cleaned only by the human-run `hikyaku prune` CLI (enumerate via
+from a dead daemon are cleaned only by the human-run `kairoku daemon prune` CLI (enumerate via
 `git worktree list` + the `run/` branch prefix; print, confirm, remove) — never an automatic
 sweep.
 
 ## Config
 
-`~/.hikyaku/config.json`: `{ listen, maxConcurrent, repoPath, worktreesDir?,
-keepWorktreeOnFailure? }`. Token via `HIKYAKU_TOKEN` env (systemd unit), not the file.
+`~/.kairoku/config.json` (`KAIROKU_DAEMON_CONFIG` overrides the path): `{ listen, maxConcurrent,
+repoPath, worktreesDir?, runsDir?, keepWorktreeOnFailure?, defaultTimeoutSec?, killGraceMs?, repoUrl? }`.
+Token via `KAIROKU_DAEMON_TOKEN` env or `~/.kairoku/token.env` (mode 600), never config.json.
 
 ## v0 exit criterion (the done-condition)
 

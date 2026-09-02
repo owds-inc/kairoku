@@ -47,36 +47,49 @@ comes from the agents it launches, under their own credentials.
 **`SPEC.md` is the build contract.** Changes to behaviour are amendments
 there, never silent divergence here.
 
-`kairoku daemon` (foreground) and `kairoku daemon install|start|stop|status`
-(launchd on mac, systemd on linux) arrive with Phase 3 of
-`docs/plans/2026-09-02-kairoku-cli-v0.1.md`. Until then the daemon runs from
-source and a VM is provisioned by the bash `./hikyaku` script (`./hikyaku
-setup`, `./hikyaku doctor` — see its header), which that phase deletes:
+`kairoku setup --daemon` provisions a machine for it — node ≥ 24 (nvm), bun,
+the agent CLIs (claude, codex, paseo), the non-interactive PATH line, the app
+checkout (asked once, remembered as `repoUrl` in the config), unprivileged
+user namespaces for codex's sandbox (linux, sudo-gated), codex's MCP approval
+mode, `~/.kairoku/config.json` + a `token.env` bearer (mode 600, never
+printed), the service, and the doctor's 401/200 round trip. It is idempotent
+on a live machine: only what is missing gets installed, a runtime is never
+upgraded under a running agent, and the service file is rewritten only when
+its content changes. It ends with what only a human can do (`claude` login,
+`codex login`, the codex MCP entry, any sudo step it had to skip).
 
 ```sh
-bun install
-HIKYAKU_TOKEN=… bun run start          # or: HIKYAKU_CONFIG=/path/to/config.json
+kairoku daemon                          # foreground, until SIGTERM
+kairoku daemon install|start|stop|status   # systemd unit kairoku-daemon (linux) / launchd agent io.kairoku.daemon (mac)
+kairoku daemon prune                    # remove stale run worktrees — asks first, never deletes a branch
+kairoku doctor                          # PASS/WARN/FAIL per check; nonzero on FAIL
 ```
 
-Config — `~/.hikyaku/config.json` today, `~/.kairoku/config.json` with
-`KAIROKU_DAEMON_TOKEN` from Phase 3 (migrated once, automatically). All keys
-optional:
+From source: `bun run start` (= `bun run src/daemon/server.ts`).
+
+Config — `~/.kairoku/config.json` (`KAIROKU_DAEMON_CONFIG` overrides the path).
+All keys optional:
 
 ```json
 {
   "listen": { "host": "192.168.23.167", "port": 7801 },
   "maxConcurrent": 2,
   "repoPath": "/home/neil/work/kairoku",
-  "worktreesDir": "/home/neil/.hikyaku/worktrees",
-  "runsDir": "/home/neil/.hikyaku/runs",
+  "repoUrl": "https://github.com/bikerwhocodes/kairoku.git",
+  "worktreesDir": "/home/neil/.kairoku/worktrees",
+  "runsDir": "/home/neil/.kairoku/runs",
   "keepWorktreeOnFailure": false,
   "defaultTimeoutSec": 3600,
   "killGraceMs": 5000
 }
 ```
 
-The bearer token is **not** in the file: it comes from the environment (the
-service unit). The listener refuses to bind `0.0.0.0` (RF-006).
+The bearer token is **not** in that file: `KAIROKU_DAEMON_TOKEN` in the
+environment, or `~/.kairoku/token.env` beside the config (what the service
+uses — so neither the unit nor the plist carries a secret). The listener
+refuses to bind `0.0.0.0` (RF-006). A `~/.hikyaku/` from before the rename is
+copied to `~/.kairoku/` once on first start; `HIKYAKU_TOKEN` and
+`HIKYAKU_CONFIG` still work for this version, with a deprecation line.
 
 ### API
 
@@ -97,7 +110,7 @@ Refusals — never a queue: `capacity_full` (429) · `duplicate_credential` (409
 
 ```sh
 curl -sX POST http://192.168.23.167:7801/runs \
-  -H "authorization: Bearer $HIKYAKU_TOKEN" -H 'content-type: application/json' \
+  -H "authorization: Bearer $KAIROKU_DAEMON_TOKEN" -H 'content-type: application/json' \
   -d '{"role":"executor","brief":"…","env":{"KAIROKU_PAT":"…"}}'
 ```
 
@@ -123,7 +136,10 @@ and the formula in `owds-inc/homebrew-tap` all read from it (copy the released
 
 | Path | Holds |
 |---|---|
-| `src/cli/main.ts` | the CLI entry: dispatch, `version` (the rest lands in Phase 2) |
+| `src/cli/main.ts` | the CLI entry: one command per first argument |
+| `src/cli/setup.ts`, `provision.ts` | the wizard and the machine steps |
+| `src/cli/daemon.ts`, `service.ts` | `kairoku daemon` and the systemd / launchd service files |
+| `src/cli/doctor.ts`, `plugin.ts`, `update.ts` | the other commands; `io.ts` is the seam every command is tested through |
 | `src/daemon/server.ts` | routes, bearer auth, the bind, SIGTERM wiring |
 | `src/daemon/runs.ts` | the run `Map`, the refusal set, lifecycle, teardown policy |
 | `src/daemon/roles.ts` | the fixed role table — the only place a command line is built |
@@ -147,5 +163,5 @@ supervision cases the SPEC's exit criterion names live together in
   `node:child_process` for this reason. Verified on bun 1.3.14.
 - **Teardown removes the worktree but keeps the `run/<id>` branch.** The run's
   commits are the deliverable; the v0 exit criterion requires each run's branch
-  to stay checkable from its ledger entry alone. Only `bun run prune` — run by
-  a human, after it asks — removes anything else, and it never deletes a branch.
+  to stay checkable from its ledger entry alone. Only `kairoku daemon prune` —
+  run by a human, after it asks — removes anything else, and it never deletes a branch.
