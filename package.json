@@ -9,6 +9,7 @@
     "start": "bun run src/daemon/server.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
+    "build:release": "bun run scripts/build-release.ts",
     "prune": "bun run src/daemon/prune.ts"
   },
   "devDependencies": {

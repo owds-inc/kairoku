@@ -1,0 +1,24 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: tag matches package.json
+        run: test "v$(bun -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
+      - run: bun install
+      - run: bun test
+      - run: bunx tsc --noEmit
+      - run: bun run build:release
+      - name: publish
+        run: gh release create "$GITHUB_REF_NAME" dist/kairoku-* dist/checksums.txt dist/kairoku.rb --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
