@@ -15,6 +15,7 @@ export type Io = {
   platform: NodeJS.Platform;
   arch: string;
   home: string;
+  uid: number;
   execPath: string;
   env: Record<string, string | undefined>;
   /** One line to stdout / stderr. */
@@ -37,6 +38,7 @@ export const io: Io = {
   platform: process.platform,
   arch: process.arch,
   home: homedir(),
+  uid: process.getuid?.() ?? 0,
   execPath: process.execPath,
   env: process.env,
   out: (text) => void process.stdout.write(text + "\n"),

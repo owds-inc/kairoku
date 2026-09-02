@@ -7,6 +7,7 @@
 
 import { version } from "../../package.json";
 import { io, type Io } from "./io";
+import * as doctor from "./doctor";
 import * as plugin from "./plugin";
 
 export const usage = `kairoku ${version} — the Kairoku CLI
@@ -36,6 +37,8 @@ export async function main(argv: string[], io: Io): Promise<number> {
       return 0;
     case "plugin":
       return plugin.run(rest, io);
+    case "doctor":
+      return doctor.run(rest, io);
     default:
       io.err(`kairoku: unknown command ${JSON.stringify(command)}\n\n${usage}`);
       return 2;

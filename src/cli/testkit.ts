@@ -29,6 +29,7 @@ export function fakeIo(overrides: Partial<FakeIo> = {}): FakeIo {
     platform: "darwin",
     arch: "arm64",
     home: "/home/tester",
+    uid: 501,
     execPath: "/usr/local/bin/kairoku",
     env: {},
     calls: [],
