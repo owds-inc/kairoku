@@ -7,7 +7,7 @@
  */
 
 import { join } from "node:path";
-import { appClient } from "../daemon/app";
+import { appClient, PROTOCOL_VERSION } from "../daemon/app";
 import { normaliseAppUrl, parseTokenEnv } from "../daemon/config";
 import { version as binVersion, type Io } from "./io";
 import { installedPlugin } from "./plugin";
@@ -91,6 +91,7 @@ export async function appLink(
 
   const result = await appClient({ appUrl: normaliseAppUrl(appUrl), token, fetch: io.fetch }).heartbeat({
     meta: {
+      protocol: PROTOCOL_VERSION,
       host: io.env.HOSTNAME ?? "this machine",
       version: cliVersion,
       capacity: status?.capacity ?? { running: 0, max: 0 },

@@ -3,8 +3,9 @@
  *
  * Two timers and one rule each:
  *
- *   HEARTBEAT, at whatever cadence the last response asked for (30 s by
- *   default). It carries `meta` and any report `update` could not deliver.
+ *   HEARTBEAT, every 10 s WHILE ANY RUN IS ACTIVE and at the app's own cadence
+ *   otherwise (grill Q6). It carries `meta`, one report per live run with that
+ *   run's curated events, and any terminal report `update` could not deliver.
  *   CLAIM, every 5 s, but only while there is a free slot AND the last
  *   heartbeat succeeded — claiming into a link that is not working takes a
  *   dispatch off the queue that nothing will report on.
@@ -17,17 +18,26 @@
  * so the policy is testable without waiting out a real cadence.
  */
 
-import { hostname } from "node:os";
-import { version } from "../../package.json";
 import {
   appClient,
   type AppClient,
   type AppResult,
+  type CancelInstruction,
   type ClaimedDispatch,
-  type DispatchUpdate,
+  type RunOutcome,
+  type RunReport,
 } from "./app";
 import type { Config } from "./config";
-import { startDispatch, sweepRestarts, writeRunState, type DispatchReport } from "./dispatch";
+import { EVENTS_PER_REPORT_MAX } from "./events";
+import { machineMeta } from "./models";
+import {
+  clearPendingReport,
+  pendingReports,
+  startDispatch,
+  sweepRestarts,
+  writeRunState,
+} from "./dispatch";
+import { providerRegistry, type Provider, type ProviderName } from "./providers";
 import type { RunStore } from "./runs";
 import { originFullName } from "./worktree";
 
@@ -35,8 +45,10 @@ export const CLAIM_INTERVAL_MS = 5_000;
 export const BACKOFF_START_MS = 30_000;
 export const BACKOFF_MAX_MS = 300_000;
 export const DEFAULT_HEARTBEAT_MS = 30_000;
-/** The app caps a heartbeat's piggyback at 50 reports. */
-const MAX_PIGGYBACK = 50;
+/** Grill Q6 — the fast cadence while anything is running. */
+export const ACTIVE_HEARTBEAT_MS = 10_000;
+/** The app caps a beat's `runs` at 50. */
+const MAX_RUNS_PER_BEAT = EVENTS_PER_REPORT_MAX;
 
 export interface LinkStatus {
   /** An appUrl and a credential are both configured. */
@@ -49,7 +61,7 @@ export interface LinkStatus {
   /** Set once the app refuses the credential. Both timers are off. */
   readonly stopped?: "token-rejected";
   readonly runsInFlight: number;
-  /** Reports waiting for a heartbeat to carry them. */
+  /** Terminal reports waiting for the app to accept them. */
   readonly pendingReports: number;
 }
 
@@ -67,6 +79,12 @@ export interface LinkOptions {
   /** False in tests: no timers, the caller drives `beat()`/`poll()` by hand. */
   readonly autostart?: boolean;
   readonly log?: (line: string) => void;
+  /**
+   * The providers a claimed dispatch is run through. Absent in production,
+   * where `startDispatch` builds the real registry; a test injects a fake here
+   * so that no suite in this repo can reach a model.
+   */
+  readonly providers?: Record<ProviderName, Provider>;
 }
 
 export function startLink(store: RunStore, config: Config, options: LinkOptions = {}): Link {
@@ -75,10 +93,22 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     options.client ??
     (config.appUrl && config.token ? appClient({ appUrl: config.appUrl, token: config.token }) : undefined);
 
-  /** Reports `update` could not deliver, waiting for a heartbeat to carry them. */
-  const pending: DispatchUpdate[] = [];
+  /** Terminal reports the app has not accepted, waiting for a beat to carry them. */
+  const pending: RunReport[] = [];
+  /** Reports already answered with a refusal; a second refusal is only logged. */
+  const refusedOnce = new Set<string>();
   /** Dispatch ids this daemon is already running — the lease can re-issue one. */
   const active = new Set<string>();
+
+  /**
+   * ONE registry, used for both halves. What the beat advertises and what a
+   * claimed dispatch is actually run through must be the same objects, or the
+   * composer offers a model this machine will not drive.
+   */
+  const registry = options.providers ?? providerRegistry();
+  const models = Object.fromEntries(
+    Object.entries(registry).map(([name, provider]) => [name, () => provider.models()]),
+  );
 
   let stopped: "token-rejected" | undefined;
   let lastBeatOk = false;
@@ -93,10 +123,10 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
   let booted = false;
 
   /**
-   * §20.9 — what this daemon has a checkout OF, asked of git once at boot
-   * rather than configured twice. Unreadable is warned about here and treated
-   * as a mismatch by `startDispatch`, so a claim naming a repo is refused
-   * rather than run against the wrong code.
+   * §20.9 / grill Q21 — what this daemon has a checkout OF, asked of git once at
+   * boot rather than configured twice. It is advertised in `meta.repos` so the
+   * claim query can filter, and it is the left-hand side of the guard in
+   * `startDispatch` for the race the filter cannot cover.
    */
   let repoFullName: string | undefined;
   const repoKnown: Promise<unknown> = client
@@ -104,7 +134,7 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
         repoFullName = name;
         if (!name) {
           log(
-            `app link: cannot read the origin remote of ${config.repoPath} — any dispatch that names a repo will be refused (§20.9)`,
+            `app link: cannot read the origin remote of ${config.repoPath} — this machine advertises no repos and will be offered no work (§20.9)`,
           );
         }
       })
@@ -141,14 +171,20 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
 
   /**
    * RF-013 — on the first beat, whatever the last daemon left mid-flight is
-   * reported failed. Reported, never replayed.
+   * reported failed, and whatever it could not deliver is queued again.
+   * Reported, never replayed.
    */
-  function bootReports(): void {
+  async function bootReports(): Promise<void> {
     if (booted) return;
     booted = true;
-    for (const stranded of sweepRestarts(config.runsDir)) {
+    for (const carried of pendingReports(config.runsDir)) pending.push(carried);
+    for (const stranded of await sweepRestarts(config.runsDir)) {
+      // A run whose own terminal report is already queued does not need a
+      // second, contradictory one.
+      if (pending.some((p) => p.runId === stranded.runId)) continue;
       pending.push({
         dispatchId: stranded.dispatchId,
+        runId: stranded.runId,
         status: "failed",
         summary: "daemon restarted",
         artifacts: { branch: stranded.branch },
@@ -156,22 +192,51 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     }
   }
 
+  /** One entry per live run: what it is doing, and the lines it has waiting. */
+  function liveReports(budget: number): RunReport[] {
+    const out: RunReport[] = [];
+    for (const run of store.list()) {
+      if (out.length >= budget) break;
+      const events = store.drainEvents(run.runId);
+      out.push({
+        dispatchId: run.dispatchId,
+        runId: run.runId,
+        ...(run.role === undefined ? {} : { role: run.role }),
+        state: run.state,
+        ...(events.length === 0 ? {} : { events }),
+      });
+    }
+    return out;
+  }
+
   async function beat(): Promise<number> {
     if (stopped) return 0;
     if (!client) return DEFAULT_HEARTBEAT_MS;
-    bootReports();
+    await bootReports();
+    // The FIRST beat must already advertise the repos, or the claim query has
+    // nothing to filter on for one whole cadence.
+    await repoKnown;
 
-    const carried = pending.splice(0, MAX_PIGGYBACK);
+    const carried = pending.splice(0, MAX_RUNS_PER_BEAT);
+    const live = liveReports(MAX_RUNS_PER_BEAT - carried.length);
+    const sent = [...carried, ...live];
+
     const result = await client.heartbeat({
-      meta: { host: hostname(), version, capacity: store.capacity() },
-      ...(carried.length === 0 ? {} : { runs: carried }),
+      meta: await machineMeta(config, {
+        capacity: () => store.capacity(),
+        repos: async () => (repoFullName ? [repoFullName] : []),
+        models,
+      }),
+      ...(sent.length === 0 ? {} : { runs: sent }),
     });
 
     if (halted(result)) return 0;
 
     if (!result.ok) {
-      // Nothing was delivered, so nothing is dropped: put the reports back at
-      // the front, in order, for the next attempt.
+      // Nothing was delivered, so nothing is dropped: put the terminal reports
+      // back at the front, in order, for the next attempt. The live entries are
+      // regenerated next beat; their EVENTS are the loss, which is why the
+      // local jsonl keeps everything.
       pending.unshift(...carried);
       lastBeatOk = false;
       lastError = result.error;
@@ -188,23 +253,63 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     protocol = result.body.protocol;
     heartbeatMs = result.body.heartbeatIntervalMs > 0 ? result.body.heartbeatIntervalMs : DEFAULT_HEARTBEAT_MS;
 
-    // One outcome per carried report, in the order they were sent. A `false`
-    // one is the app refusing that run's report, and is answered exactly as the
-    // direct path answers a 422 — never dropped because the beat itself was 200.
-    (result.body.runs ?? []).forEach((outcome, i) => {
-      const carriedUpdate = carried[i];
-      if (!carriedUpdate || outcome?.ok !== false) return;
-      refused(carriedUpdate, [outcome.reason, ...(outcome.issues ?? [])].filter(Boolean).join(": "));
+    settleOutcomes(sent, carried, result.body.runs ?? []);
+    obey(result.body.cancel ?? []);
+
+    // A 200 on a carried report is the app accepting it: it is off the disk now.
+    for (const delivered of carried) clearPendingReport(config.runsDir, delivered.dispatchId, delivered.runId);
+
+    // Grill Q6 — fast while anything is happening, the app's cadence otherwise.
+    return store.capacity().running > 0 ? Math.min(ACTIVE_HEARTBEAT_MS, heartbeatMs) : heartbeatMs;
+  }
+
+  /**
+   * A 200 ON THE BEAT IS NOT CONSENT FOR WHAT THE BEAT CARRIED.
+   *
+   * Pair each outcome with the report it answers BY `runId` when the app sends
+   * one, and only fall back to position when it does not. Index pairing alone
+   * is how a refusal gets attributed to the wrong run — and the app is free to
+   * reorder or to answer a subset. A length mismatch is logged rather than
+   * silently mapped.
+   */
+  function settleOutcomes(sent: RunReport[], carried: RunReport[], outcomes: RunOutcome[]): void {
+    if (outcomes.length !== sent.length) {
+      log(`app link: the app answered ${outcomes.length} of ${sent.length} reports — pairing by run id where it can`);
+    }
+    const byRunId = new Map(sent.map((report) => [report.runId, report]));
+    outcomes.forEach((outcome, i) => {
+      if (outcome?.ok !== false) return;
+      const answered = (outcome.runId && byRunId.get(outcome.runId)) || sent[i];
+      // Only a TERMINAL report can be refused into a stuck row; a live entry
+      // the app disliked is next beat's problem.
+      if (!answered || !carried.includes(answered)) {
+        if (answered) log(`app link: the app refused a progress report for ${answered.runId} — ${reasonOf(outcome)}`);
+        return;
+      }
+      refused(answered, reasonOf(outcome));
     });
-    return heartbeatMs;
+  }
+
+  const reasonOf = (outcome: RunOutcome): string =>
+    [outcome.reason, ...(outcome.issues ?? [])].filter(Boolean).join(": ") || "no reason given";
+
+  /** Grill Q5 — the app can stop a whole dispatch or one member of it. */
+  function obey(cancels: CancelInstruction[]): void {
+    for (const instruction of cancels) {
+      if (instruction.runId) {
+        if (store.cancel(instruction.runId)) log(`app link: cancelling run ${instruction.runId}`);
+      } else {
+        const stoppedCount = store.cancelDispatch(instruction.dispatchId);
+        if (stoppedCount > 0) log(`app link: cancelling ${stoppedCount} run(s) of ${instruction.dispatchId}`);
+      }
+    }
   }
 
   async function poll(): Promise<boolean> {
     if (stopped || !client) return false;
     // Never claim into a link that is not working, and never past capacity.
     if (!lastBeatOk) return false;
-    const { running, max } = store.capacity();
-    if (running >= max) return false;
+    if (store.free() === 0) return false;
 
     const result = await client.claim();
     if (halted(result)) return false;
@@ -231,62 +336,73 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     const started = startDispatch(store, config, dispatch, {
       ...(config.agentToken === undefined ? {} : { agentToken: config.agentToken }),
       ...(repoFullName === undefined ? {} : { repoFullName }),
-      onRunning: () => void report({ dispatchId: dispatch.id, status: "running" }),
+      ...(client === undefined ? {} : { agentEnv: { KAIROKU_URL: client.appUrl } }),
+      providers: registry,
+      report: (payload) => void report(payload),
     });
-    let final: DispatchReport;
     try {
-      final = await started.finished;
+      await started.finished;
     } catch (err) {
-      final = {
-        dispatchId: dispatch.id,
-        status: "failed",
-        summary: `the daemon lost the run: ${err instanceof Error ? err.message : String(err)}`,
-        artifacts: {},
-      };
+      log(`app link: the daemon lost ${dispatch.id}: ${err instanceof Error ? err.message : String(err)}`);
     }
     active.delete(dispatch.id);
-    await report({
-      dispatchId: final.dispatchId,
-      status: final.status,
-      summary: final.summary,
-      artifacts: final.artifacts,
-      ...(final.counts === undefined ? {} : { counts: final.counts }),
-    });
   }
 
   /**
    * One report, delivered now if the app will take it.
    *
-   * A `server`/`network` failure is the LINK's problem: the report is queued
-   * and the next heartbeat carries it. A `rejected` answer is the RUN's problem
-   * — the app understood and said no — so it is logged and the run marked
-   * failed locally with the app's own issues, never retried into the same 422.
+   * A `server`/`network` failure is the LINK's problem: the report is queued and
+   * the next beat carries it — and it is already on disk, so a restart carries
+   * it too. A `rejected` answer is the RUN's problem — the app understood and
+   * said no — so it is answered once and never retried into the same refusal.
    */
-  async function report(update: DispatchUpdate): Promise<void> {
+  async function report(update: RunReport): Promise<void> {
     if (stopped || !client) return;
     const result = await client.update(update);
-    if (result.ok || halted(result)) return;
-
-    if (result.kind === "rejected") return refused(update, result.error);
+    if (result.ok) {
+      clearPendingReport(config.runsDir, update.dispatchId, update.runId);
+      return;
+    }
+    if (halted(result)) return;
+    if (result.kind === "rejected") {
+      return refused(update, [result.error, ...(result.issues ?? [])].filter(Boolean).join(": "));
+    }
     lastError = result.error;
-    pending.push(update);
+    if (update.status === "done" || update.status === "failed") pending.push(update);
   }
 
   /**
    * The app understood a report and said no. It reads the same on both paths —
-   * the direct `update` 422 and an `{ok:false}` entry in a heartbeat's `runs[]`
-   * — so it is handled in one place: a refusal carried back by the beat that
-   * was only ever discarded is a run stuck `running` in the app with no record
-   * anywhere of why.
+   * a direct `update` 4xx and an `{ok:false}` entry in a beat's `runs[]` — so it
+   * is handled in one place.
+   *
+   * A REFUSED TERMINAL REPORT LEAVES THE APP ROW `running` while this daemon
+   * has stopped working on it. One FOLLOW-UP `failed` report, carrying the
+   * refusal reason, settles the row; a `failed` needs no counts, so it cannot be
+   * refused for the reason the first one was. The refused report itself is never
+   * retried, and a refused follow-up is only logged — there is nothing left to
+   * say and a third attempt is a loop.
    */
-  function refused(update: DispatchUpdate, reason: string): void {
-    lastError = reason;
-    log(`app link: the app refused the report for ${update.dispatchId} — ${reason}`);
+  function refused(update: RunReport, reason: string): void {
+    // `doctor` reads this: it must name the run it came from (O-1 verifier 3).
+    lastError = `run ${update.runId} of ${update.dispatchId}: ${reason}`;
+    log(`app link: the app refused the report for run ${update.runId} — ${reason}`);
+    clearPendingReport(config.runsDir, update.dispatchId, update.runId);
     writeRunState(config.runsDir, {
       dispatchId: update.dispatchId,
+      runId: update.runId,
       state: "failed",
       startedAt: new Date().toISOString(),
       branch: update.artifacts?.branch ?? `run/${update.dispatchId}`,
+    });
+
+    if (refusedOnce.has(update.runId) || update.status === undefined) return;
+    refusedOnce.add(update.runId);
+    void report({
+      dispatchId: update.dispatchId,
+      runId: update.runId,
+      status: "failed",
+      summary: `the app refused this run's report: ${reason}`.slice(0, 500),
     });
   }
 
