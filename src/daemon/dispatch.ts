@@ -28,6 +28,7 @@ import { readManifest, type ManifestResult } from "./manifest";
 import type { RoleName } from "./policy";
 import { productionProviders, type Provider, type ProviderName } from "./providers";
 import { qaPlan, runQa } from "./qa";
+import { materialiseRules, scanRules, type Rules, type RulesResult } from "./rules";
 import { leadRole, recipeFor, schemaFor, type MemberContext, type MemberOutcome } from "./recipes";
 import { childEnv, RunStore } from "./runs";
 import { run as execArgv } from "./worktree";
@@ -64,6 +65,8 @@ export interface DispatchDeps {
   readonly findPrUrl?: (repoPath: string, branch: string) => Promise<string | undefined>;
   /** Test seam: the base branch's manifest, instead of asking git for it. */
   readonly manifest?: () => Promise<ManifestResult | undefined>;
+  /** Test seam: the base branch's `.kairoku/rules`, instead of asking git. */
+  readonly rules?: () => Promise<RulesResult>;
   /** Test seam: docker and the init step. */
   readonly environment?: EnvironmentDeps;
   /** Test seam: the vault CLIs a `{ref}` is resolved through. */
@@ -345,6 +348,10 @@ export function startDispatch(
   // and asking git once rather than per member keeps that true even if someone
   // pushes to the base branch mid-fan-out.
   const manifest = (deps.manifest ?? (() => readManifest(config.repoPath, base)))();
+  // §21, and once per dispatch for the same reason: every member of a team is
+  // held to ONE materialised copy of the rules, even if someone pushes to the
+  // base branch mid-fan-out. The scratch dir is the dispatch's own run dir.
+  const rules = (deps.rules ?? (() => materialiseRules(config.repoPath, base, join(runDir(runsDir, id), "rules"))))();
   const timeoutSec = dispatch.limits?.runSeconds ?? config.defaultTimeoutSec;
   const lead = leadRole(name);
 
@@ -367,6 +374,7 @@ export function startDispatch(
       findPr,
       report,
       manifest,
+      rules,
       ...(deps.agentToken === undefined ? {} : { agentToken: deps.agentToken }),
       ...(deps.agentEnv === undefined ? {} : { agentEnv: deps.agentEnv }),
       ...(deps.repoFullName === undefined ? {} : { repoFullName: deps.repoFullName }),
@@ -409,6 +417,7 @@ interface MemberArgs {
   findPr: (repoPath: string, branch: string) => Promise<string | undefined>;
   report: (report: RunReport) => void;
   manifest: Promise<ManifestResult | undefined>;
+  rules: Promise<RulesResult>;
   agentToken?: string;
   agentEnv?: Record<string, string>;
   repoFullName?: string;
@@ -444,6 +453,13 @@ async function runMember(args: MemberArgs): Promise<void> {
   // given a checkout either.
   const manifest = await args.manifest;
   if (manifest && !manifest.ok) return refuse(`the repo's environment cannot be read: ${manifest.error}`);
+
+  // §21 Q25 — a repo that declares rules on a machine that cannot run them
+  // fails the run CLOSED, naming ast-grep, exactly as a `{ref}` nobody here can
+  // resolve does below. Settled before a worktree exists: a run that cannot be
+  // held to the repo's rules should not be given a checkout either.
+  const rules = await args.rules;
+  if (!rules.ok) return refuse(rules.error);
 
   // Resolved here, on this machine, and held in memory only. The values join
   // the run's masking set before the first event can be written, which is why
@@ -533,7 +549,14 @@ async function runMember(args: MemberArgs): Promise<void> {
         brief: dispatch.brief ?? "",
         worktree: cwd,
         cancelled: ctx.cancelled,
-        qa: () => runQa(cwd, { plan, env }),
+        qa: () =>
+          runQa(cwd, {
+            plan,
+            env,
+            // Layer two. Bound only when the base branch declared rules, which
+            // is what makes the gate automatic without a manifest entry.
+            ...(rules.rules === undefined ? {} : { scan: () => scanRules(rules.rules as Rules, cwd, ["."]) }),
+          }),
         runRole: async (role, prompt) => {
           ctx.setState("running", role);
           const choice = roleChoice(dispatch, role);
@@ -547,6 +570,7 @@ async function runMember(args: MemberArgs): Promise<void> {
             env,
             timeoutMs: args.timeoutSec * 1000,
             logPath: stdoutPath(runsDir, dispatchId, runId),
+            ...(rules.rules === undefined ? {} : { rules: rules.rules }),
             ...(choice.model === undefined ? {} : { model: choice.model }),
             ...(choice.effort === undefined ? {} : { effort: choice.effort }),
             ...(schemaFor(role) === undefined ? {} : { schema: schemaFor(role)! }),

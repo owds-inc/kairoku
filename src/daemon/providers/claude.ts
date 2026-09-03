@@ -30,8 +30,10 @@
  * machine where the plugin did not load.
  */
 
-import { POLICY, decide, toolSummary } from "../policy";
+import { isAbsolute, resolve } from "node:path";
+import { POLICY, decide, insideWorktree, toolSummary } from "../policy";
 import { withRoleContract } from "../roles";
+import { formatMatches, scanRules, type Rules, type ScanResult } from "../rules";
 import type { LaunchedRun, Provider, ProviderEvent, RoleRun } from "./types";
 
 /**
@@ -57,7 +59,9 @@ export interface ClaudeDeps {
 }
 
 export type HookAnswer = Record<string, unknown>;
-export type PreToolUseHook = (input: { tool_name?: unknown; tool_input?: unknown }) => Promise<HookAnswer>;
+export type HookInput = { tool_name?: unknown; tool_input?: unknown };
+export type PreToolUseHook = (input: HookInput) => Promise<HookAnswer>;
+export type PostToolUseHook = (input: HookInput) => Promise<HookAnswer>;
 
 /**
  * The unconditional gate. A denial answers the MODEL with the reason (so it can
@@ -80,6 +84,43 @@ export function preToolUseHook(run: RoleRun, onDeny: (reason: string) => void): 
   };
 }
 
+/**
+ * §21 layer one — the hook AT THE WRITE.
+ *
+ * `PostToolUse` on `Write|Edit`, so ast-grep runs on the real file after the
+ * write and no temp-file reconstruction is needed (§21 Q24). "Block" means the
+ * AGENT is stopped, not the disk: the SDK feeds `reason` back and the turn
+ * continues, which is the whole point — the implementer gets the rule's message
+ * and the defect it exists for while the fix is still one edit away.
+ *
+ * IT IS THE FAST SIGNAL, NOT THE GATE (§21 Q11). Three things pass silently
+ * here and are caught by QA instead: a file outside the worktree (not this
+ * run's to judge), a file no rule's language parses (ast-grep simply matches
+ * nothing), and a scan this daemon cannot read. The last one is deliberate — a
+ * hook that blocked every write because the scanner broke would burn the run's
+ * whole budget on a machine fault, and `qa.ts` fails closed on exactly that
+ * condition one layer down.
+ */
+export function postToolUseHook(
+  run: RoleRun,
+  scan: (rules: Rules, cwd: string, paths: string[]) => Promise<ScanResult> = scanRules,
+): PostToolUseHook {
+  return async (input) => {
+    const rules = run.rules;
+    const target = (input.tool_input as { file_path?: unknown } | null)?.file_path;
+    if (!rules || typeof target !== "string" || target === "") return {};
+    if (!insideWorktree(run.cwd, target)) return {};
+
+    const path = isAbsolute(target) ? resolve(target) : resolve(run.cwd, target);
+    const result = await scan(rules, run.cwd, [path]);
+    if (!result.ok || result.matches.length === 0) return {};
+    return {
+      decision: "block",
+      reason: `The repo's own rules refuse this write:\n\n${formatMatches(result.matches)}`,
+    };
+  };
+}
+
 /** Everything handed to `query({ options })`, built from the role and the run. */
 export function claudeQueryOptions(
   run: RoleRun,
@@ -92,8 +133,13 @@ export function claudeQueryOptions(
     env: run.env,
     permissionMode: policy.permissionMode,
     allowedTools: [...policy.allowedTools],
-    // No matcher: every tool call of every kind goes through the policy.
-    hooks: { PreToolUse: [{ hooks: [preToolUseHook(run, onDeny)] }] },
+    // No matcher on PreToolUse: every tool call of every kind goes through the
+    // policy. PostToolUse is matched to `Write|Edit` because it exists to read
+    // what was just written, and only appears when the repo declares rules.
+    hooks: {
+      PreToolUse: [{ hooks: [preToolUseHook(run, onDeny)] }],
+      ...(run.rules === undefined ? {} : { PostToolUse: [{ matcher: "Write|Edit", hooks: [postToolUseHook(run)] }] }),
+    },
     ...(deps.pluginPath === undefined ? {} : { plugins: [{ type: "local", path: deps.pluginPath }] }),
     ...(deps.claudePath === undefined ? {} : { pathToClaudeCodeExecutable: deps.claudePath }),
     ...(run.model === undefined ? {} : { model: run.model }),

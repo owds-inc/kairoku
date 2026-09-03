@@ -27,6 +27,7 @@ import {
 } from "./dispatch";
 import { reserved } from "./compose";
 import { parseManifest } from "./manifest";
+import type { Rules } from "./rules";
 import { RunStore } from "./runs";
 import { rolePrompt, rolesWithPrompts } from "./roles";
 import { ROLE_NAMES } from "./policy";
@@ -684,4 +685,51 @@ describe("dispatch — the run's environment (§20.11, O-4)", () => {
     // which is invariant 7 and not an environment problem.
     expect(r.reports.at(-1)!.summary).toContain("no test command");
   });
+});
+
+// -------------------------------------------------------------- §21 the rules
+
+const RULES: Rules = {
+  dir: "/tmp/runs/d1/rules",
+  config: "/tmp/runs/d1/rules/sgconfig.yml",
+  bin: "/opt/homebrew/bin/ast-grep",
+  ids: ["bun-spawn-resolved-path.yml"],
+  scanScript: "/tmp/runs/d1/rules/kairoku-rules-scan.sh",
+};
+
+describe("dispatch — §21 the repo's own rules", () => {
+  test("rules on the base branch reach every role turn AND the QA step", async () => {
+    const r = rig();
+    await r.run(claim(), { rules: async () => ({ ok: true, rules: RULES }) });
+    expect(r.provider.launched.length).toBeGreaterThan(0);
+    for (const launched of r.provider.launched) expect(launched.rules).toEqual(RULES);
+  });
+
+  test("no rules on the base branch leaves every turn without them", async () => {
+    const r = rig();
+    await r.run(claim(), { rules: async () => ({ ok: true }) });
+    for (const launched of r.provider.launched) expect(launched.rules).toBeUndefined();
+  });
+
+  test("rules the machine cannot check fails the run CLOSED, before a worktree is cut", async () => {
+    const r = rig();
+    await r.run(claim(), { rules: async () => ({ ok: false, error: "…and ast-grep is not installed on this machine" }) });
+    expect(r.h.worktrees.created).toEqual([]);
+    expect(r.reports).toHaveLength(1);
+    expect(r.reports[0]).toMatchObject({ status: "failed" });
+    expect(r.reports[0]!.summary).toContain("ast-grep is not installed");
+  });
+
+  test("they are read ONCE per dispatch, not once per member", async () => {
+    const r = rig({ maxConcurrent: 3 });
+    let reads = 0;
+    await r.run(claim({ items: [fakeItem(1), fakeItem(2), fakeItem(3)] }), {
+      rules: async () => {
+        reads++;
+        return { ok: true, rules: RULES };
+      },
+    });
+    expect(reads).toBe(1);
+  });
+
 });

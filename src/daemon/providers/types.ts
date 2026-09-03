@@ -14,6 +14,7 @@
 
 import type { EventKind } from "../events";
 import type { RoleName } from "../policy";
+import type { Rules } from "../rules";
 
 export type ProviderName = "claude" | "codex";
 
@@ -42,6 +43,11 @@ export interface RoleRun {
    * cannot produce a verdict has not reviewed anything.
    */
   readonly schema?: Record<string, unknown>;
+  /**
+   * §21 — the repo's own rules, as the base branch has them, materialised once
+   * per dispatch. Absent means the repo declares none, and nothing scans.
+   */
+  readonly rules?: Rules;
   readonly timeoutMs: number;
   /** Where the raw provider stream is captured, for the post-mortem. */
   readonly logPath: string;

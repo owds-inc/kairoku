@@ -108,7 +108,7 @@ export function decide(ask: ToolAsk): Decision {
   if (typeof target !== "string" || target === "") {
     return deny(`${ask.tool} named no file path, so it cannot be shown to be inside the worktree`);
   }
-  return inside(ask.worktree, target)
+  return insideWorktree(ask.worktree, target)
     ? ALLOW
     : deny(`${ask.tool} targets ${target}, outside the run's worktree`);
 }
@@ -117,12 +117,16 @@ export function decide(ask: ToolAsk): Decision {
  * A relative path is resolved AGAINST THE WORKTREE, which is the agent's cwd,
  * so `src/a.ts` is inside by construction and `../escape.ts` is not.
  *
+ * Exported because §21's PostToolUse hook asks the same question of the same
+ * path a moment later, and two copies of "is this inside the run" is exactly
+ * the drift `constraints.test.ts` exists to refuse elsewhere.
+ *
  * ponytail: lexical containment, not `realpath`. A symlink planted inside the
  * worktree that points out of it would pass; the worktree is created by the
  * daemon one commit at a time and nothing in it is attacker-controlled before
  * the agent starts. Resolve for real if untrusted checkouts ever run here.
  */
-function inside(worktree: string, target: string): boolean {
+export function insideWorktree(worktree: string, target: string): boolean {
   const root = resolve(worktree);
   const full = isAbsolute(target) ? resolve(target) : resolve(root, target);
   if (full === root) return true;
