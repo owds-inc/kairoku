@@ -2,9 +2,11 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "kairoku",
   "displayName": "Kairoku",
-  "version": "2.2.0",
-  "description": "Connect a session to the Kairoku app over MCP (OAuth browser sign-in, no pasted tokens), with the protocol skills — jira-ops, git-pr, kairoku-mcp — and the implementer agent that follow it.",
-  "author": { "name": "Neil Pandit" },
+  "version": "2.3.0",
+  "description": "Connect a session to the Kairoku app over MCP (OAuth browser sign-in, no pasted tokens), with the protocol skills — jira-ops, git-pr, kairoku-mcp — and the four orchestration role agents the daemon drives: implementer, reviewer, planner, researcher.",
+  "author": {
+    "name": "Neil Pandit"
+  },
   "homepage": "https://github.com/owds-inc/kairoku",
   "repository": "https://github.com/owds-inc/kairoku",
   "license": "MIT",
