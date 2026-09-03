@@ -108,9 +108,22 @@ All keys optional:
 waits for a slot rather than being refused, and two overlapping dispatches can
 never put more members on the machine than it has slots.
 
-`pluginPath` is only needed when the Kairoku plugin is somewhere the daemon
-would not look (a checkout beside the binary, or `~/.claude/plugins/…`). **A
-Claude run with no plugin fails closed**, naming what is missing, and the
+`pluginPath` is written for you by `kairoku setup --daemon` and is only worth
+setting by hand when the plugin lives somewhere unusual. Left out, the daemon
+takes the first of these that contains `.claude-plugin/plugin.json`: the
+`installPath` `claude plugin list --json` reports for `kairoku@kairoku-marketplace`;
+`~/.claude/plugins/cache/<marketplace>/kairoku/<version>` (where Claude Code
+unpacks a plugin), newest version first; and, only when running from a checkout
+rather than a released binary, `plugin/` beside the source. A `pluginPath` that
+no longer exists — a plugin update moves the version directory — is skipped
+rather than trusted. `kairoku doctor` prints the one it will use:
+
+```
+PASS  kairoku plugin installed           2.3.0 enabled
+PASS  kairoku plugin path                /Users/you/.claude/plugins/cache/kairoku-marketplace/kairoku/2.3.0
+```
+
+**A Claude run with no plugin fails closed**, naming what is missing, and the
 machine advertises no Claude models: the role agents and the `mcp__kairoku__*`
 tools are the plugin, so a "run" without it would be a model with the role's
 prose and none of its reach. Codex roles are unaffected — their contracts ship

@@ -13,11 +13,12 @@
  * SDK was actually handed.
  */
 
-import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { productionProviders } from "./index";
+import { pickPlugin } from "../../cli/plugin";
+import { productionProviders, resolvePluginPath } from "./index";
 import type { RoleRun } from "./types";
 
 const run = (over: Partial<RoleRun> = {}): RoleRun => ({
@@ -96,5 +97,76 @@ describe("productionProviders — what the SDK is actually handed", () => {
     expect(exit.summary).toContain("plugin");
     expect(events.at(-1)).toEqual({ kind: "error", text: expect.stringContaining("plugin") });
     expect(await providers.claude.models()).toEqual([]);
+  });
+});
+
+/**
+ * WHERE A RELEASED BINARY FINDS THE PLUGIN.
+ *
+ * The refusal above is only correct if the lookup is. It was not: candidate 1
+ * was computed from `import.meta.dir`, which in a `bun build --compile` binary
+ * is `/$bunfs/root` and can never resolve, and candidates 2-4 named directories
+ * `claude plugin install` does not create. A shipped daemon therefore refused
+ * every Claude run on a machine whose own `kairoku doctor` said the plugin was
+ * installed and enabled. These tests pin the layout Claude Code actually uses.
+ */
+describe("resolvePluginPath — where a RELEASED binary finds the plugin", () => {
+  let home: string;
+  const cacheDir = (h: string) => join(h, ".claude", "plugins", "cache", "kairoku-marketplace", "kairoku");
+  const plant = (dir: string) => {
+    mkdirSync(join(dir, ".claude-plugin"), { recursive: true });
+    writeFileSync(join(dir, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "kairoku" }));
+    return dir;
+  };
+  /** What `import.meta.dir` is inside a compiled binary. */
+  const bunfs = "/$bunfs/root";
+  const none = () => undefined;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "kairoku-home-"));
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  test("the cache layout `claude plugin install` really writes, highest version by semver", () => {
+    // 2.10.0 > 2.2.0 by semver and < by string order, which is the bug a
+    // lexicographic sort would ship the day the minor reaches double digits.
+    plant(join(cacheDir(home), "2.2.0"));
+    plant(join(cacheDir(home), "2.10.0"));
+    expect(resolvePluginPath({ home, moduleDir: bunfs, installed: none })).toBe(join(cacheDir(home), "2.10.0"));
+  });
+
+  test("a version directory with no .claude-plugin/plugin.json is not a plugin", () => {
+    mkdirSync(join(cacheDir(home), "2.11.0"), { recursive: true });
+    plant(join(cacheDir(home), "2.2.0"));
+    expect(resolvePluginPath({ home, moduleDir: bunfs, installed: none })).toBe(join(cacheDir(home), "2.2.0"));
+  });
+
+  test("the installPath `claude plugin list --json` reports wins over the cache scan", () => {
+    plant(join(cacheDir(home), "2.2.0"));
+    const elsewhere = plant(join(home, "elsewhere", "plugin"));
+    expect(resolvePluginPath({ home, moduleDir: bunfs, installed: () => elsewhere })).toBe(elsewhere);
+  });
+
+  test("the list route reuses doctor's ONE parser: another plugin's installPath is not ours", () => {
+    const foreign = JSON.stringify([{ id: "atlassian@claude-plugins-official", installPath: "/somewhere/else" }]);
+    expect(pickPlugin(foreign)).toBeNull();
+    expect(pickPlugin(JSON.stringify([{ id: "kairoku@kairoku-marketplace", installPath: "/p" }]))?.installPath).toBe("/p");
+  });
+
+  test("a compiled binary drops the repo-relative candidate; a checkout keeps it", () => {
+    expect(resolvePluginPath({ home, moduleDir: bunfs, installed: none })).toBeUndefined();
+    expect(resolvePluginPath({ home, moduleDir: import.meta.dir, installed: none })).toBe(
+      join(import.meta.dir, "..", "..", "..", "plugin"),
+    );
+  });
+
+  test("config.pluginPath wins, but a stale one falls through to the live install", () => {
+    // A plugin update moves the version directory; a pluginPath recorded by
+    // `kairoku setup --daemon` must not outlive the directory it names.
+    plant(join(cacheDir(home), "2.3.0"));
+    const configured = plant(join(home, "opt", "plugin"));
+    expect(resolvePluginPath({ configured, home, moduleDir: bunfs, installed: none })).toBe(configured);
+    rmSync(configured, { recursive: true, force: true });
+    expect(resolvePluginPath({ configured, home, moduleDir: bunfs, installed: none })).toBe(join(cacheDir(home), "2.3.0"));
   });
 });

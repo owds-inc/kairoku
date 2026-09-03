@@ -163,6 +163,23 @@ describe("daemon config", () => {
     expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).listen).toEqual({ host: "127.0.0.1", port: 7801 });
   });
 
+  test("the resolved pluginPath is recorded, and a moved one is corrected", async () => {
+    // Written at provision time so a released daemon starting cold never has to
+    // resolve the plugin at all; corrected on rerun because a plugin update
+    // moves the version directory out from under the recorded path.
+    const io = vm();
+    await daemonConfig(io, `${home}/work/kairoku`, undefined, "/plugins/kairoku/2.2.0");
+    expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).pluginPath).toBe("/plugins/kairoku/2.2.0");
+
+    const again = await daemonConfig(io, `${home}/work/kairoku`, undefined, "/plugins/kairoku/2.3.0");
+    expect(again.map((s) => s.outcome)).toEqual(["done"]);
+    expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).pluginPath).toBe("/plugins/kairoku/2.3.0");
+
+    // Nothing resolved: the recorded value is left alone rather than deleted.
+    await daemonConfig(io, `${home}/work/kairoku`);
+    expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).pluginPath).toBe("/plugins/kairoku/2.3.0");
+  });
+
   test("repoUrl is recorded when it changes, and the rest of the file is left alone", async () => {
     const io = vm();
     io.files[`${home}/.kairoku/config.json`] = JSON.stringify({

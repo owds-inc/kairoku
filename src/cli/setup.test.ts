@@ -195,6 +195,30 @@ describe("kairoku setup — daemon", () => {
     expect(calls(io).some((c) => c.includes("systemctl enable"))).toBe(false);
   });
 
+  test("--daemon records where the plugin actually is, so a released daemon never resolves it cold", async () => {
+    // The daemon is a compiled binary: it has no checkout beside it, and the
+    // path `claude plugin install` used is the one thing on this machine that
+    // knows where the plugin went. Recording it here is what makes a cold start
+    // on a fresh box hand the SDK a real plugin instead of refusing the run.
+    const io = provisionedVm();
+    const installPath = `${home}/.claude/plugins/cache/kairoku-marketplace/kairoku/2.3.0`;
+    io.canned["claude plugin list --json"] = {
+      stdout: JSON.stringify([
+        { id: "kairoku@kairoku-marketplace", version: "2.3.0", enabled: true, scope: "user", installPath },
+      ]),
+    };
+    io.files[`${installPath}/.claude-plugin/plugin.json`] = '{"name":"kairoku"}';
+
+    expect(await run(["--daemon", "--yes"], io)).toBe(0);
+    expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).pluginPath).toBe(installPath);
+  });
+
+  test("no plugin on the machine records no pluginPath — a guess would be worse than the fail-closed message", async () => {
+    const io = provisionedVm();
+    expect(await run(["--daemon", "--yes"], io)).toBe(0);
+    expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).pluginPath).toBeUndefined();
+  });
+
   test("--app-url and --app-token set the link without a prompt; the token lands 0600, never printed", async () => {
     const io = provisionedVm();
     delete io.files[`${home}/.kairoku/token.env`];

@@ -11,7 +11,7 @@ import { appClient, PROTOCOL_VERSION } from "../daemon/app";
 import { kairokuHome, migrateHome, normaliseAppUrl, parseTokenEnv } from "../daemon/config";
 import { version as cliVersion } from "../../package.json";
 import * as daemonCmd from "./daemon";
-import { daemonStatus, reachable } from "./doctor";
+import { daemonStatus, pluginPathFor, reachable } from "./doctor";
 import type { Io } from "./io";
 import * as plugin from "./plugin";
 import {
@@ -155,7 +155,7 @@ export async function daemon(
   show(await checkout(io, repoUrl));
   show(await userns(io));
   show(await codexConfig(io));
-  for (const s of await daemonConfig(io, appCheckoutDir(io), repoUrl)) show(s);
+  for (const s of await daemonConfig(io, appCheckoutDir(io), repoUrl, await pluginPathFor(io))) show(s);
 
   const link = await appLink(io, { yes: opts.yes, appUrl: opts.appUrl, appToken: opts.appToken });
   show(link.step);

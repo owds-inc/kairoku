@@ -8,9 +8,10 @@
  * quietly falling back to the other one.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { pickPlugin, PLUGIN_NAME } from "../../cli/plugin";
 import { claudeProvider, type ClaudeDeps } from "./claude";
 import { codexProvider, type CodexDeps } from "./codex";
 import type { LaunchedRun, Provider, ProviderName } from "./types";
@@ -48,9 +49,11 @@ export function isProviderName(name: string): name is ProviderName {
  */
 export function productionProviders(
   config: { readonly pluginPath?: string } = {},
-  resolve: () => string | undefined = resolvePluginPath,
+  resolve: (lookup?: PluginLookup) => string | undefined = resolvePluginPath,
 ): Record<ProviderName, Provider> {
-  const pluginPath = config.pluginPath ?? resolve();
+  // `config.pluginPath` is a CANDIDATE, not an answer: a plugin update moves the
+  // version directory, and a path recorded by `setup --daemon` must not outlive it.
+  const pluginPath = resolve({ configured: config.pluginPath });
   if (pluginPath === undefined) return { claude: refuses("claude", NO_PLUGIN), codex: codexProvider({}) };
   const claudePath = resolveClaudePath();
   return providerRegistry({
@@ -94,13 +97,30 @@ function refuses(name: ProviderName, reason: string): Provider {
   };
 }
 
+/** What `resolvePluginPath` looks at; every field has a production default. */
+export interface PluginLookup {
+  /** `config.pluginPath` — first in line, and validated like every other candidate. */
+  readonly configured?: string;
+  readonly home?: string;
+  /** This module's `import.meta.dir`; in a compiled binary it is under `/$bunfs`. */
+  readonly moduleDir?: string;
+  /** The `installPath` `claude plugin list --json` reports for the kairoku plugin. */
+  readonly installed?: () => string | undefined;
+  readonly exists?: (path: string) => boolean;
+}
+
 /**
  * The Kairoku plugin directory, which is what carries the four role agents, the
  * protocol skills and the MCP server into a Claude run.
  *
- * THE SOURCE TREE FIRST, THE INSTALLED COPY SECOND. Running from a checkout is
- * how this is developed and how the tests see it; a released binary has no
- * `plugin/` beside it, so it looks where `kairoku plugin install` put one.
+ * THE INSTALLED COPY FIRST, THE SOURCE TREE LAST. The order is the order of
+ * authority: what the operator configured, then what `claude` itself says it
+ * installed, then the layout `claude plugin install` writes on disk, and only
+ * then a checkout — which a RELEASED BINARY never has. `bun build --compile`
+ * gives `import.meta.dir` the value `/$bunfs/root`, so a candidate derived from
+ * it can only ever resolve in development; offering it in a shipped binary is
+ * how "the plugin is never handed to the SDK in production" hid behind a test
+ * suite that passed.
  *
  * `undefined` IS a failure on the Claude side: `productionProviders` refuses to
  * launch without it, because a role agent stripped of its MCP tools is not the
@@ -108,12 +128,50 @@ function refuses(name: ProviderName, reason: string): Provider {
  * regardless, so what a codex run loses without a plugin is the tools, never
  * the role.
  */
-export function resolvePluginPath(home = homedir(), moduleDir = import.meta.dir): string | undefined {
+export function resolvePluginPath({
+  configured,
+  home = homedir(),
+  moduleDir = import.meta.dir,
+  installed = installedPluginPath,
+  exists = existsSync,
+}: PluginLookup = {}): string | undefined {
   const candidates = [
-    join(dirname(dirname(moduleDir)), "..", "plugin"),
-    join(home, ".claude", "plugins", "marketplaces", "kairoku-marketplace", "plugin"),
-    join(home, ".claude", "plugins", "repos", "owds-inc", "kairoku", "plugin"),
-    join(home, ".claude", "plugins", "kairoku"),
+    configured,
+    installed(),
+    ...cachedPlugins(home),
+    // A compiled binary has no checkout beside it, and `/$bunfs` is the marker.
+    moduleDir.includes("$bunfs") ? undefined : join(dirname(dirname(moduleDir)), "..", "plugin"),
   ];
-  return candidates.find((path) => existsSync(join(path, ".claude-plugin", "plugin.json")));
+  return candidates.find((path) => path !== undefined && exists(join(path, ".claude-plugin", "plugin.json")));
 }
+
+/** `claude plugin list --json`, through the shared parser. Absent claude = no answer. */
+function installedPluginPath(): string | undefined {
+  const claude = resolveClaudePath();
+  if (claude === undefined) return undefined;
+  const r = Bun.spawnSync([claude, "plugin", "list", "--json"], { stdout: "pipe", stderr: "ignore" });
+  return (r.exitCode === 0 ? pickPlugin(r.stdout.toString()) : null)?.installPath;
+}
+
+/**
+ * `~/.claude/plugins/cache/<marketplace>/kairoku/<version>` — where Claude Code
+ * actually unpacks a plugin, newest version first. The fallback for a machine
+ * whose `claude` is not on the daemon's PATH.
+ */
+function cachedPlugins(home: string): string[] {
+  const cache = join(home, ".claude", "plugins", "cache");
+  return ls(cache).flatMap((marketplace) => {
+    const dir = join(cache, marketplace, PLUGIN_NAME);
+    return ls(dir)
+      .sort((a, b) => Bun.semver.order(b, a))
+      .map((version) => join(dir, version));
+  });
+}
+
+const ls = (dir: string): string[] => {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+};

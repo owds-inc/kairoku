@@ -211,8 +211,8 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   while MCP servers are active (#15451), and a missing report fails the run closed (#4181).
 
   **ONE PRODUCTION CONSTRUCTOR, `productionProviders(config)`.** The plugin path
-  (`config.pluginPath`, else `resolvePluginPath()`) and the resolved `claude` are resolved once,
-  there, and handed into `claudeProvider()`; `link.ts`, `dispatch.ts` and `models.ts` all build
+  (`resolvePluginPath({configured: config.pluginPath})`) and the resolved `claude` are resolved
+  once, there, and handed into `claudeProvider()`; `link.ts`, `dispatch.ts` and `models.ts` all build
   their providers through it and nothing in production calls `providerRegistry()` bare. This is a
   requirement rather than a detail because the wiring it does is invisible in a unit test and fatal
   without it: a `claudeProvider({})` is a perfectly working provider that happens to start every run
@@ -220,6 +220,23 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   FAILS THE RUN CLOSED** with a summary naming what is missing, and advertises no Claude models — a
   role agent is a plugin agent, so without the plugin there are no `mcp__kairoku__*` tools, which
   are the very tools RF-017 allows and the role contracts instruct the agent to call.
+
+  **WHERE THE PLUGIN IS LOOKED FOR (amended).** `resolvePluginPath()` returns the first candidate
+  that contains `.claude-plugin/plugin.json`, in this order: `config.pluginPath`; the `installPath`
+  that `claude plugin list --json` reports for `kairoku@kairoku-marketplace`, read through the ONE
+  parser `doctor` uses (`cli/plugin.ts`'s `pickPlugin`); `~/.claude/plugins/cache/<marketplace>/
+  kairoku/<version>`, which is where Claude Code actually unpacks a plugin, highest version by
+  semver; and only then a checkout beside the source. **`config.pluginPath` is a candidate, not an
+  answer** — it is validated like every other one, so a path recorded before a plugin update does
+  not outlive the version directory it names. **The checkout candidate is offered only when the
+  process is not a compiled binary**: `bun build --compile` gives `import.meta.dir` the value
+  `/$bunfs/root`, so a path derived from it can only ever resolve in development — offering it in a
+  shipped binary is how "the plugin is never handed to the SDK in production" hid behind a passing
+  suite. `kairoku setup --daemon` resolves the same way and RECORDS the result as `pluginPath`, so a
+  released daemon starting cold on a provisioned machine does not have to resolve anything; `kairoku
+  doctor` prints the directory a launched run will be given (`kairoku plugin path`) as a check
+  separate from `kairoku plugin installed`, because those two facts came apart in exactly the way
+  that made every Claude run on a "PASS" machine refuse.
 
 - **RF-015 — recipes.** A team is deterministic code over run records, testable against a fake
   provider, never an agent deciding whom to spawn. `solo` (implementer → QA); `build-verify`

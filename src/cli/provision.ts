@@ -184,12 +184,18 @@ export const LOOPBACK = "127.0.0.1";
  * and nothing else, unauthenticated. A config still bound to a LAN address
  * from the push-API days is pulled back — leaving it there would publish an
  * unauthenticated surface on the network.
+ *
+ * `pluginPath` is recorded here for the same reason the app link is proved
+ * here: the daemon ships as a compiled binary with no checkout beside it, and
+ * resolving the plugin at run time from a cold start is one more thing that can
+ * be wrong on a machine nobody is watching. Absent when nothing resolved — a
+ * guessed path would be worse than the fail-closed message.
  */
-export async function daemonConfig(io: Io, repoPath: string, repoUrl?: string): Promise<Step[]> {
+export async function daemonConfig(io: Io, repoPath: string, repoUrl?: string, pluginPath?: string): Promise<Step[]> {
   const configPath = join(kairokuHome(io.home), "config.json");
   const existing = io.readFile(configPath);
   if (existing === null) {
-    const config = { listen: { host: LOOPBACK, port: 7801 }, maxConcurrent: 2, repoPath, ...(repoUrl ? { repoUrl } : {}) };
+    const config = { listen: { host: LOOPBACK, port: 7801 }, maxConcurrent: 2, repoPath, ...(repoUrl ? { repoUrl } : {}), ...(pluginPath ? { pluginPath } : {}) };
     io.writeFile(configPath, JSON.stringify(config, null, 2) + "\n");
     return [done("config.json", `bound to ${LOOPBACK}:7801 (the listener answers doctor only)`)];
   }
@@ -210,6 +216,10 @@ export async function daemonConfig(io: Io, repoPath: string, repoUrl?: string): 
   if (repoUrl && config.repoUrl !== repoUrl) {
     config.repoUrl = repoUrl;
     changes.push(`recorded repoUrl ${repoUrl}`);
+  }
+  if (pluginPath && config.pluginPath !== pluginPath) {
+    config.pluginPath = pluginPath;
+    changes.push(`recorded pluginPath ${pluginPath}`);
   }
   if (changes.length === 0) return [skipped("config.json", "already present")];
   io.writeFile(configPath, JSON.stringify(config, null, 2) + "\n");
