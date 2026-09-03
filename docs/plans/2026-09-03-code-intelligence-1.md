@@ -92,7 +92,7 @@ reviewer treats any other change to it as a defect. No injection machinery.
 
 ## Task 7 — the surfaces
 
-Plugin `2.4.0`; SPEC gains **RF-020**; README's "A run's environment" gains the rules paragraph;
+Plugin `2.4.0`; SPEC gains **RF-021**; README's "A run's environment" gains the rules paragraph;
 `doctor` gains three lines — ast-grep, typescript-language-server, and the count of rules on the
 configured repo's base branch.
 

@@ -7,6 +7,14 @@ Build lanes: `planned/kairoku-cli-phase5-daemon-client.md` (the link) and
 `docs/plans/2026-09-02-kairoku-cli-phase6-teams.md`. This file is the build contract; changes
 to it are explicit amendments, never silent divergence. No dates, no estimates.*
 
+**Amended again for code intelligence (§21), same v1.** The wire did not change a fifth time.
+What changed is what a member is HELD to while it writes: the target repo's own
+`.kairoku/rules/*.yml`, read from the base branch and never the worktree, blocked at the write by
+a `PostToolUse` hook and failed in QA when a match slips past it, with the same rules mirrored into
+Codex's own config for parity, a per-run Codex MCP credential replacing the machine-wide one, and
+`typescript-language-server` installed for Claude's built-in LSP tool, WARN-only when absent. The
+amendment is marked inline: RF-021 is new.
+
 **Amended again for `StructuredOutput` (§20.4, §20.8), same v1.** The wire did not change. What
 changed is RF-017: every role's tool list now names the Agent SDK's own `StructuredOutput` tool
 (`daemon/structured-output`) — production found every schema-bearing reviewer, planner and
@@ -388,7 +396,7 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   not stop is a slot that never comes back, which is worse for the next dispatch than this one
   failing.
 
-- **RF-020 — a run is held to the REPO'S OWN RULES, in two layers (§21).** `.kairoku/rules/*.yml`
+- **RF-021 — a run is held to the REPO'S OWN RULES, in two layers (§21).** `.kairoku/rules/*.yml`
   in the target repo, in ast-grep's own rule format, read with `git ls-tree` + `git show` against
   `origin/<defaultBranch>` — **never the worktree**, for RF-019's reason and one more: a rule an
   agent can delete inside its own PR is not a rule, so a rule change takes effect after the merge
