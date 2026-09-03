@@ -623,6 +623,100 @@ describe("the flush timer (§23.2, DECISIONS.md — the Floor is live)", () => {
     await store.shutdown();
     await running;
   });
+
+  test("a carried batch plus a fresh backlog over the cap loses nothing — every event lands, in order", async () => {
+    const { link, store, app } = setup();
+    await link.beat();
+    app.runs.set("r-compound", { dispatchId: "d-compound", taskType: "implement", status: "running", events: [] });
+    const running = store.start({
+      dispatchId: "d-compound",
+      runId: "r-compound",
+      name: "r-compound",
+      execute: async (ctx) => {
+        for (let i = 0; i < 30; i++) ctx.events.push("text", `first ${i}`);
+        await Bun.sleep(60);
+        for (let i = 0; i < 30; i++) ctx.events.push("text", `second ${i}`);
+        await Bun.sleep(300);
+        return { ok: true, summary: "done" };
+      },
+    });
+    await waitFor(() => store.list().length === 1, "the run");
+    await Bun.sleep(10);
+
+    // Tick 1: update() fails with the first 30 events — they are carried, not dropped.
+    app.failWith = 503;
+    await link.flush();
+    expect(app.calls.filter((c) => c.route === "update")).toHaveLength(1);
+
+    // Before tick 2, the run emits 30 more: carried(30) + fresh(30) = 60, over the 50 cap.
+    await Bun.sleep(70);
+
+    app.failWith = 0;
+    await link.flush(); // tick 2: sends 30 carried + 20 of the fresh 30 — none sliced away
+    const afterTick2 = app.calls.filter((c) => c.route === "update");
+    expect(afterTick2).toHaveLength(2);
+    const body2 = afterTick2[1]!.body as RunReport;
+    expect(body2.events).toHaveLength(EVENTS_PER_REPORT_MAX);
+
+    await link.flush(); // tick 3: the remaining 10 fresh events, still in the store
+    const afterTick3 = app.calls.filter((c) => c.route === "update");
+    expect(afterTick3).toHaveLength(3);
+    const body3 = afterTick3[2]!.body as RunReport;
+    expect(body3.events).toHaveLength(10);
+
+    const delivered = [...body2.events!, ...body3.events!].map((e) => e.text);
+    const expected = [
+      ...Array.from({ length: 30 }, (_, i) => `first ${i}`),
+      ...Array.from({ length: 30 }, (_, i) => `second ${i}`),
+    ];
+    expect(delivered).toEqual(expected); // all 60, none dropped, order preserved
+
+    await store.shutdown();
+    await running;
+  });
+
+  test("a carried batch already at the cap sends alone; the store still holds the fresh events", async () => {
+    const { link, store, app } = setup();
+    await link.beat();
+    app.runs.set("r-cap", { dispatchId: "d-cap", taskType: "implement", status: "running", events: [] });
+    const running = store.start({
+      dispatchId: "d-cap",
+      runId: "r-cap",
+      name: "r-cap",
+      execute: async (ctx) => {
+        for (let i = 0; i < EVENTS_PER_REPORT_MAX; i++) ctx.events.push("text", `line ${i}`);
+        await Bun.sleep(60);
+        ctx.events.push("text", "fresh one");
+        await Bun.sleep(300);
+        return { ok: true, summary: "done" };
+      },
+    });
+    await waitFor(() => store.list().length === 1, "the run");
+    await Bun.sleep(10);
+
+    app.failWith = 503;
+    await link.flush(); // drains all 50, fails — carried is now already at the cap
+    expect(app.calls.filter((c) => c.route === "update")).toHaveLength(1);
+
+    await Bun.sleep(70); // "fresh one" lands in the store's buffer while carried sits full
+
+    app.failWith = 0;
+    await link.flush(); // room = 50 - 50 = 0: the carried batch sends alone, nothing drained
+    const afterFlush = app.calls.filter((c) => c.route === "update");
+    expect(afterFlush).toHaveLength(2);
+    const sent = afterFlush[1]!.body as RunReport;
+    expect(sent.events).toHaveLength(EVENTS_PER_REPORT_MAX);
+    expect(sent.events!.map((e) => e.text)).not.toContain("fresh one");
+
+    // The fresh event was never drained — it is still in the store, and the next flush delivers it.
+    await link.flush();
+    const afterNext = app.calls.filter((c) => c.route === "update");
+    expect(afterNext).toHaveLength(3);
+    expect((afterNext[2]!.body as RunReport).events!.map((e) => e.text)).toEqual(["fresh one"]);
+
+    await store.shutdown();
+    await running;
+  });
 });
 
 describe("RF-013 — a restart is reported, never replayed", () => {

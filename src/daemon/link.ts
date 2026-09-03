@@ -441,14 +441,24 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
    * leads the next tick's events for that run — so nothing is lost to a
    * `server`/`network` hiccup. `401` halts every timer via `halted()`,
    * exactly as it does for the beat and the claim.
+   *
+   * Room is reserved for the carried backlog BEFORE draining, never combined
+   * then truncated: a combine-then-slice would remove more from the store
+   * than the cap allows room for, and the slice discards them for good —
+   * they are already out of the buffer and not written back to
+   * `pendingFlushes`, which is overwritten with only the surviving slice. A
+   * carried batch already at the cap (`room <= 0`) sends alone and this tick
+   * drains nothing, so the store keeps buffering; every event either reaches
+   * the app or stays in the store or `pendingFlushes` — never sliced away.
    */
   async function flush(): Promise<void> {
     if (stopped || !client) return;
     if (store.capacity().running === 0) return;
     for (const run of store.list()) {
-      const drained = store.drainEvents(run.runId, EVENTS_PER_REPORT_MAX);
       const carried = pendingFlushes.get(run.runId) ?? [];
-      const events = [...carried, ...drained].slice(0, EVENTS_PER_REPORT_MAX);
+      const room = EVENTS_PER_REPORT_MAX - carried.length;
+      const drained = room > 0 ? store.drainEvents(run.runId, room) : [];
+      const events = [...carried, ...drained];
       if (events.length === 0) continue;
 
       const result = await client.update({ dispatchId: run.dispatchId, runId: run.runId, status: "running", events });
