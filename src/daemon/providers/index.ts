@@ -165,19 +165,45 @@ function installedPluginPath(): string | undefined {
  */
 function cachedPlugins(home: string): string[] {
   const cache = join(home, ".claude", "plugins", "cache");
-  return ls(cache).flatMap((marketplace) => {
-    const dir = join(cache, marketplace, PLUGIN_NAME);
-    return ls(dir)
-      // `Bun.semver.order` RAISES on a non-semver string rather than ordering
-      // it, and a throw inside `sort` escapes the resolver entirely. Finder
-      // writes `.DS_Store` into any directory a person opens, and Claude Code
-      // names the version directory with a commit hash when a marketplace entry
-      // carries no version — so filter to a total comparator's domain first,
-      // and skip a stray entry the way a directory with no manifest is skipped.
-      .filter((version) => Bun.semver.satisfies(version, "*"))
-      .sort((a, b) => Bun.semver.order(b, a))
-      .map((version) => join(dir, version));
-  });
+  // BELT AND BRACES: whatever the filesystem holds, this returns a list.
+  // `resolvePluginPath` is on the path of `doctor`, `setup --daemon`, link
+  // start and every dispatch, and none of them may die of a directory listing.
+  try {
+    return ls(cache).flatMap((marketplace) => {
+      const dir = join(cache, marketplace, PLUGIN_NAME);
+      return ls(dir)
+        .filter(orderable)
+        .sort((a, b) => Bun.semver.order(b, a))
+        .map((version) => join(dir, version));
+    });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * THE DOMAIN TEST IS THE COMPARATOR ITSELF. `Bun.semver.order` RAISES
+ * `Invalid SemVer` rather than ordering a name it does not accept, and a throw
+ * inside `sort` escapes the resolver entirely — so an entry is a version
+ * candidate only if `order` accepts it, and by construction the sort then only
+ * ever sees values its comparator takes.
+ *
+ * No predicate stands in for that. `Bun.semver.satisfies(v, "*")` looks like the
+ * domain and is not: it is true for "2.2.0.bak", "1.2.3.4" and "2.2.0~" (a valid
+ * version plus a fourth component), each of which then raises from `order` — and
+ * false for "1.0.0-beta", which `order` takes. `mv 2.2.0 2.2.0.bak` before
+ * pinning a version is the ordinary way a person keeps the old copy, alongside
+ * the `.DS_Store` Finder writes into any directory someone opens and the commit
+ * hash Claude Code uses when a marketplace entry carries no version. A stray
+ * entry is skipped the way a directory with no manifest is skipped.
+ */
+function orderable(version: string): boolean {
+  try {
+    Bun.semver.order(version, version);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const ls = (dir: string): string[] => {

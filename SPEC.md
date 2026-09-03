@@ -226,12 +226,19 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   that `claude plugin list --json` reports for `kairoku@kairoku-marketplace`, read through the ONE
   parser `doctor` uses (`cli/plugin.ts`'s `pickPlugin`); `~/.claude/plugins/cache/<marketplace>/
   kairoku/<version>`, which is where Claude Code actually unpacks a plugin, highest version by
-  semver; and only then a checkout beside the source. **A cache entry that is not a semver version
+  semver; and only then a checkout beside the source. **A cache entry the comparator does not accept
   is SKIPPED, never a throw** — `Bun.semver.order` raises `Invalid SemVer` rather than ordering one,
-  and both triggers are ordinary (Finder writes `.DS_Store` into any directory a person opens, and
-  Claude Code names the version directory with a commit hash when a marketplace entry carries no
-  version), so the entries are filtered to valid semver BEFORE they are sorted and a stray one is
-  ignored exactly like a directory with no manifest. **The candidates are evaluated LAZILY, in
+  and a throw inside `sort` escapes the resolver into `doctor`, `setup --daemon`, link start and
+  every dispatch. **The domain test IS the comparator, by construction**: an entry is a version
+  candidate only when `Bun.semver.order(entry, entry)` does not throw, so the sort only ever sees
+  values its comparator takes. No stand-in predicate — `Bun.semver.satisfies(v, "*")` is not that
+  domain (true for `2.2.0.bak`, `1.2.3.4` and `2.2.0~`, each of which then raises from `order`;
+  false for `1.0.0-beta`, which `order` accepts). The triggers are all ordinary: `mv 2.2.0 2.2.0.bak`
+  before pinning a version, the `.DS_Store` Finder writes into any directory a person opens, and the
+  commit hash Claude Code names the version directory with when a marketplace entry carries no
+  version. A stray entry is ignored exactly like a directory with no manifest, and the whole cache
+  scan is wrapped so that any throw inside it yields no candidates — `resolvePluginPath()` returns a
+  validated path or `undefined`, never a throw, whatever the filesystem holds. **The candidates are evaluated LAZILY, in
   order** — each is produced only when the one before it failed to validate, so a `config.pluginPath`
   that still exists costs no `claude plugin list --json`, a synchronous ~210 ms spawn
   `productionProviders()` would otherwise pay once per dispatch. **`config.pluginPath` is a
