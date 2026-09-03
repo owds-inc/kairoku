@@ -20,6 +20,18 @@ export function rolePrompt(role: RoleName): string {
   return PROMPTS[role];
 }
 
+/**
+ * THE ONE PLACE A PROMPT IS ASSEMBLED, for both providers.
+ *
+ * The contract comes FIRST and the run's brief second: a brief cannot talk the
+ * role out of what it may not do. It lived in `codex.ts` alone until a verifier
+ * found `claude.ts` sending the bare prompt — which is why it is a shared
+ * function now rather than a line each provider is trusted to remember.
+ */
+export function withRoleContract(role: RoleName, prompt: string): string {
+  return `${rolePrompt(role)}\n\n---\n\n${prompt}`;
+}
+
 export function rolesWithPrompts(): string[] {
   return Object.keys(PROMPTS);
 }

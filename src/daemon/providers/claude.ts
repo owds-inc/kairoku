@@ -23,9 +23,15 @@
  *   4. Structured output lands on the RESULT message as `structured_output`,
  *      never in the assistant prose — a report read out of the text is a report
  *      a model can fake, and §20.4 fails the run closed without a real one.
+ *
+ * And one fact about US rather than the SDK: the prompt that goes in is
+ * `withRoleContract(role, prompt)`, the SAME helper codex uses. The plugin
+ * carries the role AGENTS; the contract in the prompt is what survives a
+ * machine where the plugin did not load.
  */
 
 import { POLICY, decide, toolSummary } from "../policy";
+import { withRoleContract } from "../roles";
 import type { LaunchedRun, Provider, ProviderEvent, RoleRun } from "./types";
 
 /**
@@ -104,22 +110,22 @@ async function* oneTurn(prompt: string): AsyncIterable<unknown> {
   yield { type: "user", message: { role: "user", content: prompt }, parent_tool_use_id: null, session_id: "" };
 }
 
-let cachedQuery: ClaudeQuery | undefined;
-
 /**
- * The SDK, imported lazily and exactly once.
+ * The SDK, imported lazily.
  *
  * Lazy so that a machine with no Claude side still starts, doctors and runs
  * codex work: the import is the only thing in the daemon that pulls a package
  * tree, and a daemon that cannot import it should say so on the run that needed
  * it rather than failing to boot.
+ *
+ * NOT memoised. `import()` is already cached by the module registry, so a memo
+ * here bought nothing and cost the one thing that matters: it pinned the first
+ * `query` this process ever saw, which is what made `productionProviders` look
+ * untestable — a test cannot substitute a module a closure already captured.
  */
 async function sdkQuery(): Promise<ClaudeQuery> {
-  if (!cachedQuery) {
-    const sdk = (await import("@anthropic-ai/claude-agent-sdk")) as { query: unknown };
-    cachedQuery = sdk.query as ClaudeQuery;
-  }
-  return cachedQuery;
+  const sdk = (await import("@anthropic-ai/claude-agent-sdk")) as { query: unknown };
+  return sdk.query as ClaudeQuery;
 }
 
 export function claudeProvider(deps: ClaudeDeps = {}): Provider {
@@ -160,7 +166,7 @@ export function claudeProvider(deps: ClaudeDeps = {}): Provider {
       const pump = (async () => {
         try {
           handle = await open({
-            prompt: oneTurn(run.prompt),
+            prompt: oneTurn(withRoleContract(run.role, run.prompt)),
             options: claudeQueryOptions(run, deps, (reason) => emit({ kind: "deny", text: reason })),
           });
           if (interruptWanted) await handle.interrupt().catch(() => {});

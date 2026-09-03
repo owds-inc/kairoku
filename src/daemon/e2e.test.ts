@@ -265,6 +265,77 @@ describe("the done-condition, against the fake app", () => {
   );
 
   test(
+    "two overlapping dispatches never put more members on the machine than it has slots",
+    async () => {
+      // The claim loop refuses only when NOTHING is free, so one spare slot is
+      // enough to claim a three-item dispatch on top of a running one. Capacity
+      // therefore has to be enforced where a member actually starts, not by the
+      // fan-out's own bound.
+      fakeGhOnPath();
+      const { h, app: fake } = await machine({ maxConcurrent: 2 });
+      const provider = scriptedTeam();
+      provider.paused = true;
+      const config = { ...h.config, worktreeOps: seedingWorktrees(h.config.worktreesDir, () => false) };
+      const store = new RunStore(config);
+
+      const l = (link = startLink(store, config, {
+        client: appClient({ appUrl: fake.url, token: fake.token }),
+        autostart: false,
+        log: () => {},
+        providers: { claude: provider, codex: provider },
+      }));
+      expect(await l.beat()).toBeGreaterThan(0);
+
+      let peak = 0;
+      const sampler = setInterval(() => {
+        peak = Math.max(peak, store.capacity().running);
+      }, 2);
+
+      try {
+        fake.queue({
+          id: "d-first",
+          taskType: "implement",
+          target: { kind: "plan_item", id: "t1", title: "one" },
+          repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
+          team: { recipe: "build-verify", roles: {} },
+          items: [fakeItem(1)],
+        });
+        expect(await l.poll()).toBe(true);
+        await waitFor(() => store.list().length === 1, "the first dispatch's member");
+
+        // One slot free, so the app hands over a THREE-item dispatch.
+        fake.queue({
+          id: "d-second",
+          taskType: "implement",
+          target: { kind: "phase", id: "ph2", title: "Phase two" },
+          repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
+          team: { recipe: "phase-team", roles: {} },
+          items: [4, 5, 6].map((n) => fakeItem(n, { runId: `b-run-${n}` })),
+        });
+        expect(await l.poll()).toBe(true);
+        await Bun.sleep(80);
+        expect(store.capacity()).toEqual({ running: 2, max: 2 });
+
+        provider.resume();
+        await waitFor(
+          () => [...fake.runs.values()].every((row) => row.status === "done" || row.status === "failed"),
+          "all four members to settle",
+          30_000,
+        );
+        await l.beat();
+      } finally {
+        clearInterval(sampler);
+      }
+
+      // Never over the line, and nobody starved: all four ran and finished.
+      expect(peak).toBeLessThanOrEqual(2);
+      expect([...fake.runs.keys()].sort()).toEqual(["b-run-4", "b-run-5", "b-run-6", "run-1"]);
+      for (const [runId, row] of fake.runs) expect({ [runId]: row.status }).toEqual({ [runId]: "done" });
+    },
+    60_000,
+  );
+
+  test(
     "cancelling one run interrupts only that member, within one beat",
     async () => {
       fakeGhOnPath();

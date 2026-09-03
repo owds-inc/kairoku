@@ -109,14 +109,44 @@ export function qaPlan(worktree: string, read: (path: string) => string = (p) =>
   const pkg = json(read, join(worktree, "package.json"));
   const scripts = (pkg?.scripts ?? {}) as Record<string, unknown>;
   if (pkg && typeof scripts.test === "string") {
+    const run = packageManager(worktree, read);
     return {
-      check: ["lint", "build"].filter((name) => typeof scripts[name] === "string").map((name) => `bun run ${name}`),
-      test: "bun test",
+      check: ["lint", "build"].filter((name) => typeof scripts[name] === "string").map((name) => `${run} ${name}`),
+      // THE PACKAGE'S OWN SCRIPT, never `bun test` in its place. A repo whose
+      // `test` is `vitest run` or `go test ./...` would otherwise have bun's
+      // runner walk the same files and print "0 pass · 0 fail" — a summary
+      // `parseSummary` reads as a clean zero-count suite, so the member would
+      // report done citing counts no suite of this repo ever produced.
+      test: `${run} test`,
       concurrency: 1,
       source: "package.json",
     };
   }
+  // No test script is not "run something else": it is counts unavailable, which
+  // `runQa` fails closed on (invariant 7).
   return { check: [], concurrency: 1, source: "none" };
+}
+
+/** The lockfile names the installer, and the installer is what can run a script. */
+const LOCKFILES: ReadonlyArray<readonly [string, string]> = [
+  ["bun.lock", "bun run"],
+  ["bun.lockb", "bun run"],
+  ["pnpm-lock.yaml", "pnpm run"],
+  // yarn takes no `run` for a script: `yarn test`.
+  ["yarn.lock", "yarn"],
+];
+
+function packageManager(worktree: string, read: (path: string) => string): string {
+  for (const [file, run] of LOCKFILES) {
+    try {
+      read(join(worktree, file));
+      return run;
+    } catch {
+      // Not this one.
+    }
+  }
+  // npm is the fallback because it is the one every Node install already has.
+  return "npm run";
 }
 
 function json(read: (path: string) => string, path: string): Record<string, unknown> | undefined {

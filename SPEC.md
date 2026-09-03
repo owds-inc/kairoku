@@ -138,7 +138,11 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   error). What travels to the app is a CURATION of it: `{seq, ts, kind, text}` with `kind` one of
   `text|tool|ok|deny|error`, text ≤ 2 KB, tool calls summarised to a name plus 200 characters,
   every delivered value masked, at most 50 lines a beat, oldest dropped first with one line saying
-  how many. `artifacts.jsonl` is GONE from the wire: §20.12 makes the app the control panel, so
+  how many. **Every delivered batch is monotonic by `seq`, the one after a drop included**: the
+  overflow notice is numbered at DROP time, so it carries the seq of the first line it stands in for
+  and leads the survivors. That seq was never delivered — the line it belonged to was the one
+  dropped — so nothing collides. A notice numbered at drain time would sort after every line it
+  precedes, and the app renders a batch by seq. `artifacts.jsonl` is GONE from the wire: §20.12 makes the app the control panel, so
   there is nothing on the machine left to point at.
 - **RF-004 — `POST /runs/{id}/cancel`. RETIRED (§20.3)** as a route, and **REPLACED (grill Q5)** by
   the heartbeat response's `cancel[]`. Each entry names a dispatch or one run of it; the daemon
@@ -147,6 +151,13 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   app". Acting on the list is idempotent and a cancel for a run this daemon does not hold is
   ignored rather than answered.
 - **RF-005 — `GET /capacity`** → `{ running, max }` (max from config). Unauthenticated, loopback.
+  **AMENDED (teams): `maxConcurrent` is a GATE, enforced in one place — `RunStore.start()`.** A
+  member past the limit WAITS for a slot rather than being refused; it was claimed, so it is owed a
+  run. `running` counts members that hold a slot, never one still queued, because the beat and the
+  claim loop both read that number. The fan-out bounds itself by `store.free()` at launch, never by
+  `maxConcurrent`: two dispatches overlap by design (the claim loop refuses only when NOTHING is
+  free), so a fan-out that bounded itself by the machine-wide max would put a whole machine's worth
+  of members on top of the ones already running.
 - **RF-006 — the bind is the boundary.** The listener has **no inbound credential**: with the push
   API retired it answers `doctor` and nothing else, so reachability on the configured address is the
   trust boundary. It therefore binds **127.0.0.1** by default and **refuses `0.0.0.0`, `::` and an
@@ -172,8 +183,11 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   a deterministic daemon step, RF-016. For Claude the roles are the plugin's own agents
   (`plugin/agents/*.md`, canonical in this repo since §19.4); for Codex the daemon writes the same
   four contracts as prompts (`src/daemon/roles/*.md`, embedded in the binary as text imports). The
-  role contract is prepended to EVERY prompt on both providers, so a run without the plugin loses
-  the MCP tools and the skills but never the role.
+  role contract is prepended to EVERY prompt on both providers — through ONE helper,
+  `withRoleContract(role, prompt)`, which both `claude.ts` and `codex.ts` call, because a line each
+  provider is trusted to remember is a line one of them forgets. What a run without the plugin
+  loses is the MCP tools and the skills; the role survives. **On the Claude side that run does not
+  happen at all** — see RF-014.
 - **RF-010 — teardown on every exit path**: normal exit, timeout (default 3600 s, per-run override),
   cancel, and daemon shutdown (SIGTERM kills children, marks running runs, writes final events).
   Agent processes spawn in their own process group; kill is group-wide (no orphans). Worktree
@@ -196,6 +210,17 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   event stream (openai/codex#19816), the file is parsed leniently because the schema is ignored
   while MCP servers are active (#15451), and a missing report fails the run closed (#4181).
 
+  **ONE PRODUCTION CONSTRUCTOR, `productionProviders(config)`.** The plugin path
+  (`config.pluginPath`, else `resolvePluginPath()`) and the resolved `claude` are resolved once,
+  there, and handed into `claudeProvider()`; `link.ts`, `dispatch.ts` and `models.ts` all build
+  their providers through it and nothing in production calls `providerRegistry()` bare. This is a
+  requirement rather than a detail because the wiring it does is invisible in a unit test and fatal
+  without it: a `claudeProvider({})` is a perfectly working provider that happens to start every run
+  with no kairoku MCP server, no protocol skills and no role agents. **A machine with no plugin
+  FAILS THE RUN CLOSED** with a summary naming what is missing, and advertises no Claude models — a
+  role agent is a plugin agent, so without the plugin there are no `mcp__kairoku__*` tools, which
+  are the very tools RF-017 allows and the role contracts instruct the agent to call.
+
 - **RF-015 — recipes.** A team is deterministic code over run records, testable against a fake
   provider, never an agent deciding whom to spawn. `solo` (implementer → QA); `build-verify`
   (implementer → reviewer → on NOT_CLEAN re-run the implementer with the defects VERBATIM, ≤ 2 fix
@@ -211,7 +236,13 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
 - **RF-016 — the QA step is deterministic and has no model** (grill Q2). It runs the repo's
   `kairoku.json` `check[]` then `test`, or package.json's `lint`/`build`/`test` when there is no
   manifest, in the member's worktree, and parses the runner's own summary — one parser per known
-  runner (bun, vitest, jest, `go test -v`). It FAILS CLOSED in three places a plausible
+  runner (bun, vitest, jest, `go test -v`). **The package.json fallback runs the package's OWN
+  scripts, through the package manager its lockfile names** (`bun.lock`/`bun.lockb` → `bun run`,
+  `pnpm-lock.yaml` → `pnpm run`, `yarn.lock` → `yarn`, else `npm run`) — never `bun test` in place
+  of a `test` script that is `vitest run`, `jest` or `go test ./...`. Substituting the runner is
+  worse than not running one: against a repo bun's glob matches but cannot drive, bun prints
+  `0 pass · 0 fail` and exits 0, which parses as a clean zero-count suite, so the member would
+  report done citing counts no suite of that repo ever produced. It FAILS CLOSED in three places a plausible
   implementation would have passed: a runner nobody here can parse ("counts unavailable"), a repo
   with no test command at all, and a non-zero `errors` beside zero `fail`. A failure attaches the
   last 100 lines as the defect and feeds the implementer's fix loop exactly as a reviewer's defects
@@ -231,8 +262,10 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
 
 ## A dispatch becomes a team
 
-One claim → one member per item, fanned out up to `maxConcurrent` (a worker pool, so the third of
-three starts the moment either of the first two finishes). Each member gets its own worktree cut
+One claim → one member per item, fanned out up to the slots FREE at launch (a worker pool, so the
+third of three starts the moment either of the first two finishes). The machine-wide limit itself is
+enforced one layer down, in `RunStore.start()` (RF-005), which is the only thing two overlapping
+dispatches both go through. Each member gets its own worktree cut
 from `origin/<defaultBranch>` in the configured checkout — `run/<dispatchId>` for a single item,
 `run/<dispatchId>-<n>` for a team — with `bun install` and the base checkout's `.env*` copied.
 `KAIROKU_PAT` = that item's `runToken`, else `KAIROKU_AGENT_TOKEN` (RF-008). A role's prompt goes in

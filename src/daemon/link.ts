@@ -37,7 +37,7 @@ import {
   sweepRestarts,
   writeRunState,
 } from "./dispatch";
-import { providerRegistry, type Provider, type ProviderName } from "./providers";
+import { productionProviders, type Provider, type ProviderName } from "./providers";
 import type { RunStore } from "./runs";
 import { originFullName } from "./worktree";
 
@@ -105,7 +105,7 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
    * claimed dispatch is actually run through must be the same objects, or the
    * composer offers a model this machine will not drive.
    */
-  const registry = options.providers ?? providerRegistry();
+  const registry = options.providers ?? productionProviders(config);
   const models = Object.fromEntries(
     Object.entries(registry).map(([name, provider]) => [name, () => provider.models()]),
   );

@@ -97,6 +97,10 @@ describe("runs — lifecycle (RF-010)", () => {
         return { ok: true, summary: "" };
       }),
     );
+    // DURING setup, not before it: a cancel that lands while the member is still
+    // queued is answered earlier (no worktree is ever cut), which is the case
+    // the capacity gate's own tests cover.
+    await Bun.sleep(20);
     expect(store.cancel("r-race")).toBe(true);
     expect(await running).toMatchObject({ status: "error", exitSummary: "cancelled by the app" });
     expect(ran).toBe(false);
@@ -277,6 +281,47 @@ describe("runs — lifecycle (RF-010)", () => {
     await store.shutdown();
     await Promise.all([a, b]);
     expect(store.free()).toBe(2);
+  });
+
+  test("capacity is a GATE, not a hint: a third member waits for a slot", async () => {
+    // Two dispatches can overlap — the claim loop refuses only when nothing is
+    // free — so the fan-out's own bound cannot be the enforcement. This is the
+    // one place that counts.
+    const h = (active = harness());
+    const store = new RunStore(h.config);
+    let live = 0;
+    let peak = 0;
+    const body = async () => {
+      live++;
+      peak = Math.max(peak, live);
+      await Bun.sleep(30);
+      live--;
+      return { ok: true, summary: "done" };
+    };
+
+    const all = ["r-1", "r-2", "r-3"].map((id) => store.start(spec(id, body)));
+    // The queued member is not "running": the beat and the claim loop both read
+    // this number, and a queued member counted as running would refuse work the
+    // machine can take.
+    expect(store.capacity()).toEqual({ running: 2, max: 2 });
+
+    const results = await Promise.all(all);
+    expect(results.map((r) => r.status)).toEqual(["idle", "idle", "idle"]);
+    expect(peak).toBe(2);
+    expect(h.worktrees.created).toHaveLength(3);
+    expect(store.free()).toBe(2);
+  });
+
+  test("shutdown does not deadlock on a member still waiting for a slot", async () => {
+    const h = (active = harness());
+    const store = new RunStore(h.config);
+    const all = ["s-1", "s-2", "s-3"].map((id) => store.start(spec(id, shell(h, id, "sleep 30"))));
+    await waitFor(() => h.worktrees.created.length === 2, "the two that fit");
+    await store.shutdown();
+    const results = await Promise.all(all);
+    expect(results.every((r) => r.status === "error")).toBe(true);
+    // The queued one never got a worktree, so there was never one to tear down.
+    expect(h.worktrees.created).toHaveLength(2);
   });
 
   test("a member's worktree name is what names its branch, not its run id", async () => {

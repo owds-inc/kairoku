@@ -106,6 +106,8 @@ export class EventBuffer {
   readonly #pending: CuratedEvent[] = [];
   #seq = 0;
   #dropped = 0;
+  /** The seq of the FIRST line dropped since the last drain — the notice takes it. */
+  #dropSeq = 0;
 
   constructor(options: EventBufferOptions) {
     // The run dir may not exist yet: a provider can emit before the worktree
@@ -125,7 +127,11 @@ export class EventBuffer {
     writeLine(this.#path, event);
     // The DISK keeps everything; only the wire buffer is bounded.
     if (this.#pending.length >= this.#max) {
-      this.#pending.shift();
+      const gone = this.#pending.shift()!;
+      // The notice inherits the seq of the first line it stands in for, taken
+      // HERE rather than at drain: a seq minted at drain time is higher than
+      // every line the notice precedes, and the app orders a batch by seq.
+      if (this.#dropped === 0) this.#dropSeq = gone.seq;
       this.#dropped++;
     }
     this.#pending.push(event);
@@ -143,13 +149,20 @@ export class EventBuffer {
    * batch still never exceeds the cap the app enforces. The line the notice
    * displaces is not lost — it is the oldest still pending, and it leads the
    * next beat, which is what `seq` ordering is for.
+   *
+   * And the notice carries the seq of the first line it replaces, so EVERY
+   * delivered batch is monotonic by seq — including the one after a drop. That
+   * seq was never delivered (the line it belonged to was dropped), so nothing
+   * collides.
    */
   drain(max: number = this.#max): CuratedEvent[] {
     if (this.#dropped === 0) return this.#pending.splice(0, max);
-    const notice = this.#event(
-      "error",
-      `${this.#dropped} earlier event lines were dropped to keep the buffer at ${this.#max}`,
-    );
+    const notice: CuratedEvent = {
+      seq: this.#dropSeq,
+      ts: new Date().toISOString(),
+      kind: "error",
+      text: `${this.#dropped} earlier event lines were dropped to keep the buffer at ${this.#max}`,
+    };
     this.#dropped = 0;
     return [notice, ...this.#pending.splice(0, Math.max(0, max - 1))];
   }

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { rolePrompt } from "../roles";
 import { codexArgv, codexEvent, codexModels, codexProvider } from "./codex";
 import type { RoleRun } from "./types";
 
@@ -204,8 +205,9 @@ describe("codex — the role prompt the daemon writes", () => {
     for await (const _ of launched.events) void _;
     await launched.exit;
     expect(stdin).toContain("REVIEW THIS ITEM");
-    expect(stdin.toLowerCase()).toContain("reviewer");
-    // The role contract comes FIRST — a prompt cannot talk the role out of it.
+    // The role contract comes FIRST — a prompt cannot talk the role out of it —
+    // and it is the SAME `withRoleContract` claude.ts uses, verbatim.
+    expect(stdin.startsWith(rolePrompt("reviewer"))).toBe(true);
     expect(stdin.indexOf("REVIEW THIS ITEM")).toBeGreaterThan(0);
   });
 });

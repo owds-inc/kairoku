@@ -89,6 +89,8 @@ interface RunRecord {
   worktree?: Worktree;
   handle?: { interrupt(): void };
   stopping?: "cancelled" | "timeout" | "shutdown";
+  /** Registered, but waiting for a slot. Not running, and not counted as such. */
+  queued?: boolean;
 }
 
 export class RunStore {
@@ -97,6 +99,8 @@ export class RunStore {
   readonly #runs = new Map<string, RunRecord>();
   /** In-flight supervision promises, awaited by `shutdown`. */
   readonly #inflight = new Set<Promise<void>>();
+  /** Members waiting for a slot, oldest first. One release wakes exactly one. */
+  readonly #waiting: Array<() => void> = [];
   #shuttingDown = false;
 
   constructor(config: Config) {
@@ -106,7 +110,7 @@ export class RunStore {
 
   runningCount(): number {
     let n = 0;
-    for (const run of this.#runs.values()) if (run.status === "running") n++;
+    for (const run of this.#runs.values()) if (run.status === "running" && !run.queued) n++;
     return n;
   }
 
@@ -124,7 +128,7 @@ export class RunStore {
   list(): RunListing[] {
     const out: RunListing[] = [];
     for (const run of this.#runs.values()) {
-      if (run.status !== "running") continue;
+      if (run.status !== "running" || run.queued) continue;
       out.push({
         dispatchId: run.dispatchId,
         runId: run.runId,
@@ -149,6 +153,13 @@ export class RunStore {
    * The record is registered SYNCHRONOUSLY, before the first await, so the very
    * next `capacity()` already counts it — the claim loop gates on that number
    * and a slot that appears free for one tick is a double claim.
+   *
+   * CAPACITY IS ENFORCED HERE AND NOWHERE ELSE. A caller cannot be trusted to
+   * bound itself: two dispatches overlap by design (the claim loop refuses only
+   * when NOTHING is free), so a fan-out that bounded itself by `maxConcurrent`
+   * would put a whole machine's worth of members on top of the ones already
+   * running. A member past the limit WAITS rather than being refused — it was
+   * claimed, it is owed a run.
    */
   async start(spec: StartSpec): Promise<RunResult> {
     const runsDir = this.#config.runsDir;
@@ -166,6 +177,7 @@ export class RunStore {
       }),
       status: "running",
       state: "starting",
+      queued: true,
       ...(spec.role === undefined ? {} : { role: spec.role }),
       branch: `run/${spec.name}`,
     };
@@ -206,6 +218,8 @@ export class RunStore {
     const run = this.#runs.get(runId);
     if (!run || run.status !== "running") return false;
     run.stopping ??= reason;
+    // A queued member has nothing to interrupt yet; it honours the flag the
+    // moment a slot frees, which shutdown's `await` on #inflight waits for.
     // A stop may land before the worktree is ready and anything exists to
     // interrupt; #supervise re-checks the flag at every point it could be set.
     run.handle?.interrupt();
@@ -220,8 +234,38 @@ export class RunStore {
     await Promise.allSettled([...this.#inflight]);
   }
 
+  /** Wait for a slot. Every `#acquire` is paired with exactly one `#release`. */
+  async #acquire(record: RunRecord): Promise<void> {
+    if (this.runningCount() >= this.#config.maxConcurrent) {
+      await new Promise<void>((go) => this.#waiting.push(go));
+    }
+    record.queued = false;
+  }
+
+  #release(): void {
+    this.#waiting.shift()?.();
+  }
+
   async #supervise(record: RunRecord, spec: StartSpec): Promise<RunResult> {
+    await this.#acquire(record);
+    try {
+      return await this.#run(record, spec);
+    } finally {
+      // The slot is already free here: #finish has taken the record out of
+      // `running`, so whoever we wake counts itself correctly.
+      this.#release();
+    }
+  }
+
+  async #run(record: RunRecord, spec: StartSpec): Promise<RunResult> {
     const runsDir = this.#config.runsDir;
+
+    // A cancel or a shutdown can land while a member is queued. Honour it
+    // before cutting a worktree there is no longer any reason to cut.
+    if (record.stopping || this.#shuttingDown) {
+      const [status, summary] = classify(record, { ok: false, summary: "never started" });
+      return this.#finish(record, status, summary);
+    }
 
     let worktree: Worktree;
     try {

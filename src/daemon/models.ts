@@ -18,7 +18,7 @@ import { hostname } from "node:os";
 import { version } from "../../package.json";
 import { PROTOCOL_VERSION, type DaemonMeta } from "./app";
 import type { Config } from "./config";
-import { providerRegistry } from "./providers";
+import { productionProviders } from "./providers";
 import { recipeNames } from "./recipes";
 import { originFullName } from "./worktree";
 
@@ -54,7 +54,7 @@ async function discover(
   config: Config,
   deps: MetaDeps,
 ): Promise<{ repos: string[]; providers: Record<string, string[]> }> {
-  const registry = providerRegistry();
+  const registry = productionProviders(config);
   const askers: Record<string, () => Promise<string[]>> = {
     claude: () => registry.claude.models(),
     codex: () => registry.codex.models(),

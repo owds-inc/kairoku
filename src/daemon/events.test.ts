@@ -134,6 +134,27 @@ describe("events — curation, masking and the bounded buffer", () => {
     for (const event of events) expect(Date.parse(event.ts)).not.toBeNaN();
   });
 
+  test("EVERY delivered batch is seq-ordered, the one that follows a drop included", () => {
+    // The notice is minted at DROP time, so it carries the seq of the line it
+    // stands in for and leads the survivors. A notice numbered at drain time
+    // would sort AFTER every line it precedes, and the app renders by seq.
+    const runs = tmp();
+    const buffer = new EventBuffer({ runsDir: runs, dispatchId: "d4b", runId: "r4b" });
+    for (let i = 0; i < 60; i++) buffer.push("text", `line ${i}`);
+
+    const first = buffer.drain();
+    expect(first[0]!.kind).toBe("error");
+    expect(first.map((e) => e.seq)).toEqual([...first.map((e) => e.seq)].sort((a, b) => a - b));
+    // Strictly increasing, and the notice stands where the first dropped line did.
+    expect(first[0]!.seq).toBe(0);
+    expect(first[0]!.seq).toBeLessThan(first[1]!.seq);
+
+    buffer.push("text", "after");
+    const second = buffer.drain();
+    expect(second.map((e) => e.seq)).toEqual([...second.map((e) => e.seq)].sort((a, b) => a - b));
+    expect(second[0]!.seq).toBeGreaterThan(first.at(-1)!.seq);
+  });
+
   test("drain empties the pending buffer without touching the file", () => {
     const runs = tmp();
     const buffer = new EventBuffer({ runsDir: runs, dispatchId: "d5", runId: "r5" });

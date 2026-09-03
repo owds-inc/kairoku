@@ -22,7 +22,7 @@ import type { ClaimItem, ClaimedDispatch, RunReport, RunState, SuiteCounts } fro
 import type { Config } from "./config";
 import { ensureRunDir, runDir, stdoutPath } from "./events";
 import type { RoleName } from "./policy";
-import { providerRegistry, resolvePluginPath, type Provider, type ProviderName } from "./providers";
+import { productionProviders, type Provider, type ProviderName } from "./providers";
 import { qaPlan, runQa } from "./qa";
 import { leadRole, recipeFor, schemaFor, type MemberContext, type MemberOutcome } from "./recipes";
 import { childEnv, RunStore } from "./runs";
@@ -55,7 +55,6 @@ export interface DispatchDeps {
   /** One report about one run, delivered or queued by the caller. */
   readonly report?: (report: RunReport) => void;
   readonly providers?: Record<ProviderName, Provider>;
-  readonly pluginPath?: string;
   readonly findPrUrl?: (repoPath: string, branch: string) => Promise<string | undefined>;
 }
 
@@ -326,14 +325,17 @@ export function startDispatch(
   if (!recipe) return refuseAll(`this daemon has no team called "${name}" — upgrade it or pick another`);
   if (items.length === 0) return refuseAll("the claim carried no items, so there is nothing to run");
 
-  const registry = deps.providers ?? providerRegistry();
-  const pluginPath = deps.pluginPath ?? resolvePluginPath();
+  const registry = deps.providers ?? productionProviders(config);
   const findPr = deps.findPrUrl ?? ((repoPath, branch) => findPrUrl(repoPath, branch));
   const base = `origin/${dispatch.repo?.defaultBranch ?? config.defaultBranch}`;
   const timeoutSec = dispatch.limits?.runSeconds ?? config.defaultTimeoutSec;
   const lead = leadRole(name);
 
-  const finished = fanOut(items, config.maxConcurrent, (item, index) =>
+  // The slots actually FREE, never the machine-wide max: a second dispatch that
+  // bounded itself by `maxConcurrent` would launch a full machine's worth on top
+  // of the first one's members. `RunStore.start()` is the real gate; this only
+  // keeps the queue there short.
+  const finished = fanOut(items, store.free(), (item, index) =>
     runMember({
       store,
       config,
@@ -345,7 +347,6 @@ export function startDispatch(
       base,
       timeoutSec,
       registry,
-      ...(pluginPath === undefined ? {} : { pluginPath }),
       findPr,
       report,
       ...(deps.agentToken === undefined ? {} : { agentToken: deps.agentToken }),
@@ -384,7 +385,6 @@ interface MemberArgs {
   base: string;
   timeoutSec: number;
   registry: Record<ProviderName, Provider>;
-  pluginPath?: string;
   findPr: (repoPath: string, branch: string) => Promise<string | undefined>;
   report: (report: RunReport) => void;
   agentToken?: string;

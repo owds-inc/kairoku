@@ -4,14 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseSummary, qaPlan, runQa, tail } from "./qa";
 
-let dir: string | undefined;
+const dirs: string[] = [];
 afterEach(() => {
-  if (dir) rmSync(dir, { recursive: true, force: true });
-  dir = undefined;
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 function worktree(files: Record<string, string>): string {
-  dir = mkdtempSync(join(tmpdir(), "kairoku-qa-"));
+  const dir = mkdtempSync(join(tmpdir(), "kairoku-qa-"));
+  dirs.push(dir);
   for (const [name, body] of Object.entries(files)) writeFileSync(join(dir, name), body);
   return dir;
 }
@@ -73,16 +73,46 @@ describe("qa — what gets run", () => {
     });
   });
 
-  test("package.json's lint and build become the checks, test the test", () => {
+  test("package.json's lint, build and its OWN test script are what get run", () => {
+    // `test` is the package's script, run through the package manager — never
+    // `bun test` in its place. Against a repo whose `test` is `vitest run`,
+    // bun's runner walks the same files and usually prints "0 pass · 0 fail",
+    // which `parseSummary` reads as a clean zero-count suite; the member would
+    // then report done citing counts no suite of this repo ever produced.
     const wt = worktree({
-      "package.json": JSON.stringify({ scripts: { lint: "eslint .", build: "bun run b", test: "bun test", start: "x" } }),
+      "package.json": JSON.stringify({ scripts: { lint: "eslint .", build: "bun run b", test: "vitest run", start: "x" } }),
+      "bun.lock": "{}",
     });
     expect(qaPlan(wt)).toEqual({
       check: ["bun run lint", "bun run build"],
-      test: "bun test",
+      test: "bun run test",
       concurrency: 1,
       source: "package.json",
     });
+  });
+
+  test("the lockfile names the package manager the scripts are run through", () => {
+    const scripts = { scripts: { build: "tsc", test: "jest" } };
+    const pnpm = worktree({ "package.json": JSON.stringify(scripts), "pnpm-lock.yaml": "lockfileVersion: 9" });
+    expect(qaPlan(pnpm)).toMatchObject({ check: ["pnpm run build"], test: "pnpm run test" });
+
+    // yarn has no `run` for a script: `yarn test` is the invocation.
+    const yarn = worktree({ "package.json": JSON.stringify(scripts), "yarn.lock": "" });
+    expect(qaPlan(yarn)).toMatchObject({ check: ["yarn build"], test: "yarn test" });
+
+    // No lockfile this daemon knows: npm, the one every install leaves working.
+    const npm = worktree({ "package.json": JSON.stringify(scripts) });
+    expect(qaPlan(npm)).toMatchObject({ check: ["npm run build"], test: "npm run test" });
+  });
+
+  test("a package.json with no test script cites no suite — counts unavailable is a FAILURE", async () => {
+    const wt = worktree({ "package.json": JSON.stringify({ scripts: { lint: "eslint ." } }) });
+    const plan = qaPlan(wt);
+    expect(plan.test).toBeUndefined();
+    const result = await runQa(wt, { plan, exec: async () => ({ code: 0, stdout: "", stderr: "" }) });
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("no test command");
+    expect(result.counts).toBeUndefined();
   });
 
   test("a repo with neither has nothing to run, and says so", () => {

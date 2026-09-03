@@ -24,7 +24,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { launch as procLaunch } from "../proc";
-import { rolePrompt } from "../roles";
+import { withRoleContract } from "../roles";
 import type { RoleName } from "../policy";
 import { run as execArgv } from "../worktree";
 import type { LaunchedRun, Provider, ProviderEvent, RoleRun } from "./types";
@@ -251,9 +251,7 @@ export function codexProvider(deps: CodexDeps = {}): Provider {
         command: codexArgv(run, paths),
         cwd: run.cwd,
         env: run.env,
-        // The role contract FIRST, then the run's brief: a brief cannot talk
-        // the role out of what it may not do.
-        stdin: `${rolePrompt(run.role)}\n\n---\n\n${run.prompt}\n`,
+        stdin: `${withRoleContract(run.role, run.prompt)}\n`,
         stdoutPath: run.logPath,
         timeoutMs: run.timeoutMs,
         onLine: (line) => emit(codexEvent(line)),

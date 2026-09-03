@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { rolePrompt } from "../roles";
 import { claudeProvider, claudeQueryOptions, preToolUseHook } from "./claude";
 import type { RoleRun } from "./types";
 
@@ -206,9 +207,24 @@ describe("claude — a launched run", () => {
     expect(typeof (prompt as { [Symbol.asyncIterator]?: unknown })[Symbol.asyncIterator]).toBe("function");
     const sent: unknown[] = [];
     for await (const message of prompt) sent.push(message);
-    expect(sent).toEqual([
-      { type: "user", message: { role: "user", content: "build the thing" }, parent_tool_use_id: null, session_id: "" },
-    ]);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ type: "user", parent_tool_use_id: null, session_id: "" });
+    expect((sent[0] as { message: { role: string; content: string } }).message.role).toBe("user");
+    expect((sent[0] as { message: { content: string } }).message.content).toContain("build the thing");
+  });
+
+  test("the role contract leads EVERY prompt, exactly as it does on codex (SPEC.md:175)", async () => {
+    // The stated safety net for a machine with no plugin is that the role
+    // survives anyway. It only exists if it is on BOTH providers: claude is the
+    // default for every role, so a claude-only omission is the whole net gone.
+    const { query, calls } = fakeQuery([result()]);
+    const launched = claudeProvider({ query }).launch(run({ role: "reviewer", prompt: "REVIEW THIS ITEM" }));
+    for await (const _ of launched.events) void _;
+    await launched.exit;
+    const sent: Array<{ message: { content: string } }> = [];
+    for await (const message of calls[0]!.prompt as AsyncIterable<{ message: { content: string } }>) sent.push(message);
+    expect(sent[0]!.message.content.startsWith(rolePrompt("reviewer"))).toBe(true);
+    expect(sent[0]!.message.content.indexOf("REVIEW THIS ITEM")).toBeGreaterThan(0);
   });
 });
 

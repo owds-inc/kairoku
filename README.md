@@ -99,9 +99,22 @@ All keys optional:
   "runsDir": "/home/neil/.kairoku/runs",
   "keepWorktreeOnFailure": false,
   "defaultTimeoutSec": 3600,
-  "killGraceMs": 5000
+  "killGraceMs": 5000,
+  "pluginPath": "/opt/kairoku/plugin"
 }
 ```
+
+`maxConcurrent` is a hard gate, not a hint: a member claimed past the limit
+waits for a slot rather than being refused, and two overlapping dispatches can
+never put more members on the machine than it has slots.
+
+`pluginPath` is only needed when the Kairoku plugin is somewhere the daemon
+would not look (a checkout beside the binary, or `~/.claude/plugins/…`). **A
+Claude run with no plugin fails closed**, naming what is missing, and the
+machine advertises no Claude models: the role agents and the `mcp__kairoku__*`
+tools are the plugin, so a "run" without it would be a model with the role's
+prose and none of its reach. Codex roles are unaffected — their contracts ship
+inside the binary.
 
 No credential is in that file. `KAIROKU_DAEMON_TOKEN` (the app credential) and
 `KAIROKU_AGENT_TOKEN` (the interim `KAIROKU_PAT` for a run whose claim carried
@@ -174,13 +187,13 @@ and the formula in `owds-inc/homebrew-tap` all read from it (copy the released
 | `src/daemon/link.ts` | the loop: the two timers, backoff, the 401 stop, the reports |
 | `src/daemon/dispatch.ts` | a claim becomes a TEAM: one member per item, the run files, the PR url, the restart rule |
 | `src/daemon/recipes.ts` | the six teams as state machines over run records — the fix loops live here |
-| `src/daemon/qa.ts` | the deterministic QA step: the repo's own commands, one summary parser per runner |
+| `src/daemon/qa.ts` | the deterministic QA step: the repo's own commands — its own package scripts, through the package manager its lockfile names — and one summary parser per runner |
 | `src/daemon/policy.ts` | the per-role tool policy as data, and the one function both providers apply |
 | `src/daemon/models.ts` | what this machine advertises: repos, providers → models, recipes |
-| `src/daemon/providers/` | `claude.ts` (the ONLY module importing the Agent SDK) and `codex.ts` |
-| `src/daemon/roles/` | the four role contracts as markdown, embedded in the binary for Codex |
+| `src/daemon/providers/` | `claude.ts` (the ONLY module importing the Agent SDK), `codex.ts`, and `index.ts`'s `productionProviders()` — the one constructor every production call site builds through |
+| `src/daemon/roles/` | the four role contracts as markdown, embedded in the binary; `withRoleContract()` prepends one to every prompt on BOTH providers |
 | `src/daemon/server.ts` | the loopback listener, the bind, SIGTERM wiring |
-| `src/daemon/runs.ts` | the live-run registry: capacity, worktrees, teardown, cancel |
+| `src/daemon/runs.ts` | the live-run registry: capacity (the one gate), worktrees, teardown, cancel |
 | `src/daemon/proc.ts` | process-group spawn, timeout, group kill, escalation, line streaming |
 | `src/daemon/worktree.ts` | `git worktree` create/teardown, `.env*` seeding, enumeration |
 | `src/daemon/events.ts` | the full per-run JSONL, and the bounded curated buffer the beat drains |
