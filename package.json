@@ -4,7 +4,9 @@
   "private": true,
   "license": "MIT",
   "type": "module",
-  "bin": { "kairoku": "./src/cli/main.ts" },
+  "bin": {
+    "kairoku": "./src/cli/main.ts"
+  },
   "scripts": {
     "start": "bun run src/daemon/server.ts",
     "test": "bun test",
@@ -15,5 +17,8 @@
   "devDependencies": {
     "@types/bun": "latest",
     "typescript": "^5"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.259"
   }
 }
