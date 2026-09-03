@@ -172,6 +172,8 @@ describe("kairoku doctor", () => {
     expect(byName(list, "app link")?.detail).toContain("https://app.test");
     // The protocol version is echoed when the app sends one.
     expect(byName(list, "app link")?.detail).toContain("protocol 1");
+    // §23.2 — the curated-events cadence, off the heartbeat entirely.
+    expect(byName(list, "app link")?.detail).toContain("events flush: 2 s while active");
     expect(byName(list, "runs in flight")?.detail).toBe("1");
     expect(await run([], io)).toBe(0);
     expect(io.lines.some((l) => /^\s*PASS\s+daemon service/.test(l))).toBe(true);
