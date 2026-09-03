@@ -16,6 +16,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { SuiteCounts } from "./app";
+import type { Manifest } from "./manifest";
 import { run as execArgv } from "./worktree";
 
 // ------------------------------------------------------------------- parsers
@@ -82,26 +83,36 @@ export interface QaPlan {
   readonly test?: string;
   /** How many suites this repo tolerates at once on one machine. */
   readonly concurrency: number;
+  /** What the concurrency gate queues on: the repo, never the number itself. */
+  readonly key: string;
   readonly source: "kairoku.json" | "package.json" | "none";
+}
+
+export interface QaPlanOptions {
+  /**
+   * The manifest as the BASE BRANCH has it (O-4). It is passed in rather than
+   * read from the worktree: the worktree is where the implementer is editing,
+   * and a gate whose commands the agent under review can rewrite is not a gate.
+   */
+  readonly manifest?: Manifest;
+  /** `owner/name`, when the daemon knows it. Falls back to the worktree path. */
+  readonly key?: string;
+  readonly read?: (path: string) => string;
 }
 
 /**
  * The manifest first, package.json second, nothing third.
- *
- * O-4 owns `kairoku.json` properly (environments, compose, ports). Reading the
- * three fields QA needs here costs four lines and means a repo that already has
- * a manifest is not run with the wrong commands for one lane.
  */
-export function qaPlan(worktree: string, read: (path: string) => string = (p) => readFileSync(p, "utf8")): QaPlan {
-  const manifest = json(read, join(worktree, "kairoku.json"));
-  if (manifest) {
-    const check = Array.isArray(manifest.check) ? manifest.check.filter((c): c is string => typeof c === "string") : [];
-    const test = typeof manifest.test === "string" ? manifest.test : undefined;
-    const concurrency = (manifest.concurrency as { test?: unknown } | undefined)?.test;
+export function qaPlan(worktree: string, options: QaPlanOptions = {}): QaPlan {
+  const read = options.read ?? ((p: string) => readFileSync(p, "utf8"));
+  const key = options.key ?? worktree;
+  const manifest = options.manifest;
+  if (manifest && (manifest.check.length > 0 || manifest.test !== undefined)) {
     return {
-      check,
-      ...(test === undefined ? {} : { test }),
-      concurrency: typeof concurrency === "number" && concurrency > 0 ? concurrency : 1,
+      check: manifest.check,
+      ...(manifest.test === undefined ? {} : { test: manifest.test }),
+      concurrency: manifest.concurrency.test,
+      key,
       source: "kairoku.json",
     };
   }
@@ -119,12 +130,13 @@ export function qaPlan(worktree: string, read: (path: string) => string = (p) =>
       // report done citing counts no suite of this repo ever produced.
       test: `${run} test`,
       concurrency: 1,
+      key,
       source: "package.json",
     };
   }
   // No test script is not "run something else": it is counts unavailable, which
   // `runQa` fails closed on (invariant 7).
-  return { check: [], concurrency: 1, source: "none" };
+  return { check: [], concurrency: 1, key, source: "none" };
 }
 
 /** The lockfile names the installer, and the installer is what can run a script. */
@@ -161,17 +173,22 @@ function json(read: (path: string) => string, path: string): Record<string, unkn
 // -------------------------------------------------------------------- the gate
 //
 // §20.11's "the suite lock becomes a per-repo concurrency setting". One
-// semaphore per limit, held for the duration of the suite.
+// semaphore PER REPO, held for the duration of the suite.
+//
+// Keyed by the repo rather than by the limit: two repos that both said `2` are
+// two queues. Keyed by the number, a daemon holding two checkouts would
+// serialise them against each other and give each repo half of what it asked
+// for, for no reason either repo could see.
 //
 // ponytail: in-process, so it bounds THIS daemon's suites. Two daemons sharing
 // a machine would each get the limit; make it a lock directory under
 // ~/.kairoku if that ever happens.
 
-const gates = new Map<number, { active: number; waiting: Array<() => void> }>();
+const gates = new Map<string, { active: number; waiting: Array<() => void> }>();
 
-async function withGate<T>(limit: number, work: () => Promise<T>): Promise<T> {
-  const gate = gates.get(limit) ?? { active: 0, waiting: [] };
-  gates.set(limit, gate);
+async function withGate<T>(key: string, limit: number, work: () => Promise<T>): Promise<T> {
+  const gate = gates.get(key) ?? { active: 0, waiting: [] };
+  gates.set(key, gate);
   if (gate.active >= limit) await new Promise<void>((release) => gate.waiting.push(release));
   gate.active++;
   try {
@@ -194,7 +211,18 @@ export interface QaResult {
 
 export interface QaDeps {
   readonly plan: QaPlan;
-  readonly exec?: (command: string, cwd: string) => Promise<{ code: number; stdout: string; stderr: string }>;
+  /**
+   * The run's merged environment (§20.11). Absent means the daemon's own, which
+   * is only ever right for a repo with no profile — a suite that inherited the
+   * machine's `DATABASE_URL` would run green against the developer's own
+   * database while the run's compose project sat there untouched.
+   */
+  readonly env?: Record<string, string>;
+  readonly exec?: (
+    command: string,
+    cwd: string,
+    env?: Record<string, string>,
+  ) => Promise<{ code: number; stdout: string; stderr: string }>;
 }
 
 /** The last `lines` lines — what a failing run attaches as its defect. */
@@ -202,14 +230,15 @@ export function tail(text: string, lines = 100): string {
   return text.split("\n").slice(-lines).join("\n");
 }
 
-const shell = (command: string, cwd: string) => execArgv(["sh", "-c", command], cwd);
+const shell = (command: string, cwd: string, env?: Record<string, string>) =>
+  execArgv(["sh", "-c", command], cwd, env);
 
 export async function runQa(worktree: string, deps: QaDeps): Promise<QaResult> {
-  const { plan } = deps;
+  const { plan, env } = deps;
   const exec = deps.exec ?? shell;
 
   for (const command of plan.check) {
-    const result = await exec(command, worktree);
+    const result = await exec(command, worktree, env);
     if (result.code !== 0) {
       return {
         ok: false,
@@ -227,7 +256,7 @@ export async function runQa(worktree: string, deps: QaDeps): Promise<QaResult> {
     };
   }
 
-  const result = await withGate(plan.concurrency, () => exec(plan.test!, worktree));
+  const result = await withGate(plan.key, plan.concurrency, () => exec(plan.test!, worktree, env));
   const output = `${result.stdout}${result.stderr}`;
   const counts = parseSummary(output);
 

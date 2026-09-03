@@ -26,6 +26,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { WorktreeOps } from "./worktree";
+import { DEFAULT_PORT_RANGE, parsePortRange } from "./compose";
 import { DEFAULT_KILL_GRACE_MS } from "./proc";
 
 export interface Listen {
@@ -56,6 +57,12 @@ export interface Config {
   readonly agentToken?: string;
   /** The branch runs are cut from: `origin/<defaultBranch>`. */
   readonly defaultBranch: string;
+  /**
+   * O-4 (§20.11) — the range per-run service ports are allocated from, as
+   * `"20000-29999"`. Every allocated port binds 127.0.0.1; which interface is
+   * the repo's compose file's business, never this daemon's.
+   */
+  readonly ports: string;
   /**
    * O-3 — where the Kairoku plugin lives, when it is not where the daemon
    * would look. Absent is the ordinary case: `resolvePluginPath` finds the
@@ -172,6 +179,19 @@ export function migrateHome(home = homedir()): "migrated" | "already" | "none" {
   return "migrated";
 }
 
+/**
+ * A range nobody can parse falls back to the default with one warning, rather
+ * than refusing to start: it matters only to repos with a compose profile, and
+ * taking a whole machine offline over a typo in a field most repos never use is
+ * the wrong trade. A run that then cannot get a port fails with its own reason.
+ */
+function readPortRange(value: unknown, warn: Warn): string {
+  if (typeof value !== "string" || value.trim() === "") return DEFAULT_PORT_RANGE;
+  if (parsePortRange(value)) return value;
+  warn(`config.json: "ports": ${JSON.stringify(value)} is not a range like "${DEFAULT_PORT_RANGE}" — using the default`);
+  return DEFAULT_PORT_RANGE;
+}
+
 export function loadConfig(
   path = defaultConfigPath(),
   env: Record<string, string | undefined> = process.env,
@@ -205,6 +225,7 @@ export function loadConfig(
     defaultTimeoutSec: (file.defaultTimeoutSec as number) ?? DEFAULT_TIMEOUT_SEC,
     killGraceMs: (file.killGraceMs as number) ?? DEFAULT_KILL_GRACE_MS,
     defaultBranch: (file.defaultBranch as string) ?? "main",
+    ports: readPortRange(file.ports, warn),
     ...(typeof file.pluginPath === "string" && file.pluginPath ? { pluginPath: file.pluginPath } : {}),
     ...(appUrl === undefined ? {} : { appUrl }),
     ...(token === undefined ? {} : { token }),

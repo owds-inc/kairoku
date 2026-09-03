@@ -87,6 +87,9 @@ export function harness(overrides: Partial<Config> = {}): Harness {
     defaultTimeoutSec: 30,
     killGraceMs: 150,
     defaultBranch: "main",
+    // A narrow range of its own, so a suite probing for free ports never wanders
+    // into the range a daemon on the same machine is allocating from.
+    ports: "23000-23999",
     token: TEST_TOKEN,
     // The interim fallback PAT (§20.7). A real daemon has one until every claim
     // carries a token per run, so a harness without one would not be a daemon.
@@ -245,6 +248,8 @@ export interface FakeDispatch {
   readonly team?: { recipe?: string; roles?: Record<string, { provider?: string; model?: string }> };
   readonly items: ClaimItem[];
   readonly limits?: { runSeconds?: number | null };
+  /** §20.11 — the profile and the values the app holds for it. Always present. */
+  readonly env?: { profile: string; secrets?: Record<string, string | { ref: string }> };
 }
 
 export interface FakeRunRow {
@@ -368,7 +373,9 @@ export function fakeApp(options: { token?: string; heartbeatIntervalMs?: number;
               repo: next.repo ?? null,
               team: next.team ?? null,
               items: next.items,
-              env: { profile: "test" },
+              // Always present, `{}` when nothing is set — a key that is
+              // sometimes absent is a key every daemon has to guard.
+              env: { profile: next.env?.profile ?? "test", secrets: next.env?.secrets ?? {} },
               limits: next.limits ?? { runSeconds: null },
             },
           });

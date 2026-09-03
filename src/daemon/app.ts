@@ -150,7 +150,12 @@ export interface ClaimedDispatch {
   } | null;
   readonly team?: ClaimTeam | null;
   readonly items?: ClaimItem[];
-  readonly env?: { profile?: string };
+  /**
+   * The environment the run builds in: the profile's name and the values the
+   * app holds for it (§20.11). A REFERENCE ARRIVES AS `{ ref }`, unresolved —
+   * the app holds no vault credential, so the machine dials its own.
+   */
+  readonly env?: { profile?: string; secrets?: Record<string, string | { ref: string }> };
   readonly limits?: { runSeconds?: number | null };
 }
 

@@ -100,6 +100,23 @@ describe("config", () => {
     expect(config.keepWorktreeOnFailure).toBe(false);
     expect(config.defaultTimeoutSec).toBe(DEFAULT_TIMEOUT_SEC);
     expect(config.runsDir).toMatch(/\.kairoku\/runs$/);
+    // O-4 — the range per-run service ports are allocated from.
+    expect(config.ports).toBe("20000-29999");
+  });
+
+  test("O-4: a `ports` range in the file wins, and one that cannot be read falls back", () => {
+    const dir = tmp();
+    const path = join(dir, "config.json");
+    writeFileSync(path, JSON.stringify({ ports: "31000-31999" }));
+    expect(loadConfig(path, {}).ports).toBe("31000-31999");
+
+    // A range nobody can parse is the default, loudly: refusing to start would
+    // take a machine offline over a field that only matters to repos with a
+    // compose profile.
+    const warnings: string[] = [];
+    writeFileSync(path, JSON.stringify({ ports: "twenty thousand" }));
+    expect(loadConfig(path, {}, (line) => warnings.push(line)).ports).toBe("20000-29999");
+    expect(warnings.join()).toContain("twenty thousand");
   });
 
   test("file values win over defaults, and a bad bind in the file is caught", () => {

@@ -2,7 +2,14 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseManifest, type Manifest } from "./manifest";
 import { parseSummary, qaPlan, runQa, tail } from "./qa";
+
+function manifestOf(source: unknown): Manifest {
+  const parsed = parseManifest(JSON.stringify(source));
+  if (!parsed.ok) throw new Error(parsed.error);
+  return parsed.manifest;
+}
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -61,16 +68,26 @@ describe("qa — the summary parsers (one per known runner)", () => {
 
 describe("qa — what gets run", () => {
   test("the manifest's check[] then test, when there is a manifest", () => {
-    const wt = worktree({
-      "kairoku.json": JSON.stringify({ check: ["make lint", "make types"], test: "make test", concurrency: { test: 3 } }),
-      "package.json": JSON.stringify({ scripts: { lint: "eslint .", test: "bun test" } }),
-    });
-    expect(qaPlan(wt)).toEqual({
+    const wt = worktree({ "package.json": JSON.stringify({ scripts: { lint: "eslint .", test: "bun test" } }) });
+    const manifest = manifestOf({ check: ["make lint", "make types"], test: "make test", concurrency: { test: 3 } });
+    expect(qaPlan(wt, { manifest, key: "owds-inc/kairoku" })).toEqual({
       check: ["make lint", "make types"],
       test: "make test",
       concurrency: 3,
+      key: "owds-inc/kairoku",
       source: "kairoku.json",
     });
+  });
+
+  test("a kairoku.json sitting in the WORKTREE is ignored — the manifest comes from the base branch", () => {
+    // The worktree is where the implementer is editing. A run whose check and
+    // test commands could be rewritten by the agent under review is not a gate.
+    const wt = worktree({
+      "kairoku.json": JSON.stringify({ check: [], test: "echo ' 1 pass'" }),
+      "package.json": JSON.stringify({ scripts: { test: "vitest run" } }),
+      "bun.lock": "{}",
+    });
+    expect(qaPlan(wt)).toMatchObject({ test: "bun run test", source: "package.json" });
   });
 
   test("package.json's lint, build and its OWN test script are what get run", () => {
@@ -83,10 +100,11 @@ describe("qa — what gets run", () => {
       "package.json": JSON.stringify({ scripts: { lint: "eslint .", build: "bun run b", test: "vitest run", start: "x" } }),
       "bun.lock": "{}",
     });
-    expect(qaPlan(wt)).toEqual({
+    expect(qaPlan(wt, { key: "owds-inc/other" })).toEqual({
       check: ["bun run lint", "bun run build"],
       test: "bun run test",
       concurrency: 1,
+      key: "owds-inc/other",
       source: "package.json",
     });
   });
@@ -116,12 +134,13 @@ describe("qa — what gets run", () => {
   });
 
   test("a repo with neither has nothing to run, and says so", () => {
-    expect(qaPlan(worktree({}))).toEqual({ check: [], concurrency: 1, source: "none" });
+    const wt = worktree({});
+    expect(qaPlan(wt)).toEqual({ check: [], concurrency: 1, key: wt, source: "none" });
   });
 });
 
 describe("qa — the step (§20 item 4, no model)", () => {
-  const plan = { check: ["true"], test: "bun test", concurrency: 1, source: "package.json" as const };
+  const plan = { check: ["true"], test: "bun test", concurrency: 1, key: "r", source: "package.json" as const };
 
   test("checks then test, four counts, clean", async () => {
     const ran: string[] = [];
@@ -184,11 +203,28 @@ describe("qa — the step (§20 item 4, no model)", () => {
 
   test("a repo with no test command cannot cite a suite, so the step fails closed", async () => {
     const result = await runQa("/wt", {
-      plan: { check: [], concurrency: 1, source: "none" },
+      plan: { check: [], concurrency: 1, key: "r", source: "none" },
       exec: async () => ({ code: 0, stdout: "", stderr: "" }),
     });
     expect(result.ok).toBe(false);
     expect(result.summary).toContain("no test command");
+  });
+
+  test("the check commands and the suite both run with the RUN'S environment", async () => {
+    // Not the daemon's. A suite that inherited the machine's DATABASE_URL would
+    // run green against the developer's own database while the run's compose
+    // project sat there untouched.
+    const seen: Array<Record<string, string> | undefined> = [];
+    await runQa("/wt", {
+      plan,
+      env: { DATABASE_URL: "postgres://127.0.0.1:20001/main" },
+      exec: async (_command, _cwd, env) => {
+        seen.push(env);
+        return { code: 0, stdout: " 1 pass\n 0 fail\n", stderr: "" };
+      },
+    });
+    expect(seen).toHaveLength(2);
+    for (const env of seen) expect(env?.DATABASE_URL).toBe("postgres://127.0.0.1:20001/main");
   });
 
   test("concurrency.test bounds how many suites run at once", async () => {
@@ -200,8 +236,27 @@ describe("qa — the step (§20 item 4, no model)", () => {
       inFlight--;
       return { code: 0, stdout: " 1 pass\n 0 fail\n", stderr: "" };
     };
-    const two = { check: [], test: "bun test", concurrency: 2, source: "kairoku.json" as const };
+    const two = { check: [], test: "bun test", concurrency: 2, key: "one/repo", source: "kairoku.json" as const };
     await Promise.all([1, 2, 3, 4].map(() => runQa("/wt", { plan: two, exec: slow })));
+    expect(peak).toBe(2);
+  });
+
+  test("the semaphore is PER REPO — two repos that both said 2 are two queues, not one", async () => {
+    // Keyed by the limit alone, a daemon holding two repos would serialise them
+    // against each other and halve the throughput each repo asked for.
+    let inFlight = 0;
+    let peak = 0;
+    const slow = async () => {
+      peak = Math.max(peak, ++inFlight);
+      await Bun.sleep(20);
+      inFlight--;
+      return { code: 0, stdout: " 1 pass\n 0 fail\n", stderr: "" };
+    };
+    const one = { check: [], test: "bun test", concurrency: 1, source: "kairoku.json" as const };
+    await Promise.all([
+      runQa("/a", { plan: { ...one, key: "owner/a" }, exec: slow }),
+      runQa("/b", { plan: { ...one, key: "owner/b" }, exec: slow }),
+    ]);
     expect(peak).toBe(2);
   });
 });

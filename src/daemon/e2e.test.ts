@@ -12,6 +12,10 @@
  *
  * A run against the real app needs a browser-minted daemon token, so that is a
  * human gate rather than a test — it is listed in the PR body.
+ *
+ * O-4 moved `kairoku.json` to the COMMITTED base branch, so the fixture repo
+ * here is a real git repository with a real commit on `origin/main`, and the
+ * worktrees carry only the runner the manifest points at.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
@@ -60,11 +64,18 @@ function fakeGhOnPath(): void {
   process.env.PATH = `${binDir}:${process.env.PATH ?? ""}`;
 }
 
+/** The manifest the fixture repo commits to its base branch. */
+const FIXTURE_MANIFEST = JSON.stringify({
+  check: ["true"],
+  test: "sh ./run-tests.sh",
+  concurrency: { test: 4 },
+});
+
 /**
- * Worktrees that carry a real repo manifest and a real test runner, so the QA
- * step runs a real command and parses a real summary. The runner fails its
- * first invocation per worktree and passes afterwards, which is what a fix loop
- * looks like from the outside.
+ * Worktrees that carry a real test runner, so the QA step runs a real command
+ * and parses a real summary. The runner fails its first invocation per worktree
+ * and passes afterwards, which is what a fix loop looks like from the outside.
+ * The MANIFEST is not written here — it lives on the base branch (O-4).
  */
 function seedingWorktrees(root: string, failFirstFor: (name: string) => boolean) {
   const base = fakeWorktrees(root);
@@ -72,10 +83,6 @@ function seedingWorktrees(root: string, failFirstFor: (name: string) => boolean)
     ...base,
     async create(name: string, from?: string) {
       const worktree = await base.create(name, from);
-      writeFileSync(
-        join(worktree.path, "kairoku.json"),
-        JSON.stringify({ check: ["true"], test: "sh ./run-tests.sh", concurrency: { test: 4 } }),
-      );
       writeFileSync(
         join(worktree.path, "run-tests.sh"),
         failFirstFor(name)
@@ -157,12 +164,23 @@ function scriptedTeam(): Provider & { launched: RoleRun[]; holdItem3: boolean; p
   return provider;
 }
 
-async function machine(overrides: Record<string, unknown> = {}) {
+/**
+ * A real checkout with a real commit on `origin/main`: the daemon reads the
+ * manifest from the branch, so a fixture without one would exercise nothing.
+ */
+async function machine(overrides: Record<string, unknown> = {}, manifest = FIXTURE_MANIFEST) {
   app = fakeApp();
   const h = (active = harness({ ...overrides, appUrl: app.url, token: app.token }));
   mkdirSync(h.config.repoPath, { recursive: true });
-  await git(["git", "init", "-q"], h.config.repoPath);
-  await git(["git", "remote", "add", "origin", "https://github.com/owds-inc/kairoku.git"], h.config.repoPath);
+  const repo = h.config.repoPath;
+  await git(["git", "init", "-q", "-b", "main"], repo);
+  await git(["git", "config", "user.email", "daemon@example.com"], repo);
+  await git(["git", "config", "user.name", "daemon"], repo);
+  await git(["git", "remote", "add", "origin", "https://github.com/owds-inc/kairoku.git"], repo);
+  writeFileSync(join(repo, "kairoku.json"), manifest);
+  await git(["git", "add", "-A"], repo);
+  await git(["git", "commit", "-qm", "the environment contract"], repo);
+  await git(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], repo);
   return { h, app: app! };
 }
 
