@@ -9,6 +9,7 @@
 import { join } from "node:path";
 import { appClient, PROTOCOL_VERSION } from "../daemon/app";
 import { DEFAULT_PORT_RANGE, parsePortRange, type PortDeps } from "../daemon/compose";
+import { CODEGRAPH } from "../daemon/codegraph";
 import { normaliseAppUrl, parseTokenEnv } from "../daemon/config";
 import { availableResolvers } from "../daemon/env";
 import { ACTIVE_FLUSH_MS } from "../daemon/link";
@@ -228,6 +229,17 @@ export async function environment(io: Io, config: DoctorConfig, probe?: PortDeps
     lsp !== null
       ? pass("typescript-language-server", lsp)
       : warn("typescript-language-server", "absent — symbols are grepped, not resolved (`kairoku setup --daemon` installs it)"),
+  );
+
+  // §21 item 3 — WARN, never FAIL, and that is the difference between the two
+  // halves of this ruling: rules are a GATE (a repo that declares them on a
+  // machine without ast-grep fails every run closed), CodeGraph is a PROBATION
+  // (a repo that opted in on a machine without it runs, slower, and says so).
+  const codegraph = await binVersion(io, CODEGRAPH);
+  out.push(
+    codegraph !== null
+      ? pass(CODEGRAPH, codegraph)
+      : warn(CODEGRAPH, `absent — a repo whose ${MANIFEST_FILE} lists it under \`intelligence\` runs without the index`),
   );
 
   const resolvers = availableResolvers((bin) => io.which(bin));
