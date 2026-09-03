@@ -7,6 +7,12 @@ Build lanes: `planned/kairoku-cli-phase5-daemon-client.md` (the link) and
 `docs/plans/2026-09-02-kairoku-cli-phase6-teams.md`. This file is the build contract; changes
 to it are explicit amendments, never silent divergence. No dates, no estimates.*
 
+**Amended again for the Floor's live cadence (DECISIONS.md §23.2), same v1.** The wire did not
+change a fourth time — `update`'s body already accepted `events` for a progress report. What
+changed is WHEN they travel: curated events now flush every 2 s while a run is active, on `update`
+directly, off the 10 s/30 s heartbeat entirely. The amendment is marked inline: RF-012 points at
+it, and RF-020 is new.
+
 **Amended again for environments (§20.11, O-4), same v1.** The wire did not change a third time.
 What changed is what a member is GIVEN: its own `kairoku.json` profile, its own merged environment,
 its own ports and its own compose project, torn down on every exit path. The amendments are marked
@@ -104,7 +110,9 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   than sent as an empty list: "no codex here" and "codex with no models" are different facts.
 
   **AMENDED — one report per RUN.** A beat carries one entry per live run (`{dispatchId, runId,
-  role, state, events}`) plus any terminal report `update` could not deliver.
+  role, state, events}`) plus any terminal report `update` could not deliver. **A live entry's
+  `events` is no longer the only way one travels — see RF-020**: the beat may still carry whatever
+  is pending at its own moment, but the fast path is the flush.
 
   **A 200 on the beat is not consent for what the beat carried.** Each entry of the response's
   `runs[]` is paired with the report it answers **by `runId` when the app sends one**, falling back
@@ -116,6 +124,17 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   stopped working on it (a `failed` report needs no counts, so it cannot be refused for the reason
   the first one was). A refused follow-up is only logged. `doctor` reads the last error and it
   names the run it came from.
+
+- **RF-020 — the active flush (§23.2, new).** A third timer, `ACTIVE_FLUSH_MS` (2 s): while any run
+  is active, each one's curated events are drained (`store.drainEvents`, still bounded by
+  `EVENTS_PER_REPORT_MAX`) and sent on `client.update(...)` directly — the same body shape v1
+  already accepts for a progress report, `{ dispatchId, runId, status: "running", events }` — rather
+  than waiting for the next heartbeat. It ticks constantly, like the claim timer, and is simply a
+  no-op while nothing is running: no second start/stop lifecycle to keep in sync with the beat and
+  the claim. A send that fails is never lost — the drained batch is held (daemon-local, keyed by
+  run id, not written back into the event buffer) and leads the next tick's events for that run — so
+  a `server`/`network` hiccup costs a delay, never a line. `unauthorized` halts this timer exactly as
+  it halts the other two. `doctor`'s app-link check names the cadence.
 
 - **RF-013 — the restart rule. AMENDED (§20 item 9).** Each run keeps
   `~/.kairoku/runs/<dispatchId>/<runId>.json`
