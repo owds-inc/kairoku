@@ -83,6 +83,7 @@ export function harness(overrides: Partial<Config> = {}): Harness {
     repoPath: join(dir, "repo"),
     worktreesDir,
     runsDir,
+    envDir: join(dir, "env"),
     keepWorktreeOnFailure: false,
     defaultTimeoutSec: 30,
     killGraceMs: 150,

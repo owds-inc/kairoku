@@ -17,7 +17,6 @@
  * per-run values every run has always had.
  */
 
-import { homedir } from "node:os";
 import {
   allocatePorts,
   composeDown,
@@ -47,7 +46,8 @@ export interface EnvironmentSpec {
   /** The run's own values — its credential and its ids. */
   readonly perRun: Record<string, string>;
   readonly portRange: PortRange;
-  readonly home?: string;
+  /** Where the daemon's env store lives — `~/.kairoku/env` on a real daemon. */
+  readonly envDir?: string;
 }
 
 export interface EnvironmentDeps {
@@ -74,7 +74,6 @@ export async function prepareEnvironment(
   deps: EnvironmentDeps = {},
 ): Promise<PreparedEnvironment> {
   const exec = deps.exec ?? execArgv;
-  const home = spec.home ?? homedir();
   const profile = spec.manifest ? profileOf(spec.manifest, spec.profileName) : undefined;
 
   // A manifest that declares profiles but not THIS one is a mismatch between
@@ -103,7 +102,10 @@ export async function prepareEnvironment(
 
   const values = mergeEnv({
     checkout: readCheckoutEnv(spec.worktree, profile?.files ?? []),
-    store: spec.repoFullName ? readEnvStore(envStorePath(home, spec.repoFullName, spec.profileName)) : {},
+    store:
+      spec.repoFullName && spec.envDir
+        ? readEnvStore(envStorePath(spec.envDir, spec.repoFullName, spec.profileName))
+        : {},
     secrets: spec.secrets,
     // The ports come first so `inject` can be read against them, and the run's
     // own ids and credential come LAST: a manifest that named `KAIROKU_PAT` in

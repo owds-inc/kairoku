@@ -41,6 +41,8 @@ export interface Config {
   readonly repoPath: string;
   readonly worktreesDir: string;
   readonly runsDir: string;
+  /** O-4 — the daemon's env store: `<KEY>=<value>` per repo and profile, 0600. */
+  readonly envDir: string;
   readonly keepWorktreeOnFailure: boolean;
   readonly defaultTimeoutSec: number;
   /** Grace between SIGTERM and SIGKILL when killing an agent's process group. */
@@ -221,6 +223,7 @@ export function loadConfig(
     repoPath: (file.repoPath as string) ?? join(homedir(), "work", "kairoku"),
     worktreesDir: (file.worktreesDir as string) ?? join(home, "worktrees"),
     runsDir: (file.runsDir as string) ?? join(home, "runs"),
+    envDir: (file.envDir as string) ?? join(home, "env"),
     keepWorktreeOnFailure: (file.keepWorktreeOnFailure as boolean) ?? false,
     defaultTimeoutSec: (file.defaultTimeoutSec as number) ?? DEFAULT_TIMEOUT_SEC,
     killGraceMs: (file.killGraceMs as number) ?? DEFAULT_KILL_GRACE_MS,

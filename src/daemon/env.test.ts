@@ -48,15 +48,15 @@ describe("mergeEnv — low to high (§20.11)", () => {
 });
 
 describe("the daemon's env store", () => {
-  test("one file per repo and profile, under ~/.kairoku/env", () => {
-    expect(envStorePath("/home/x", "owds-inc/kairoku", "test")).toBe(
+  test("one file per repo and profile, under the daemon's env dir", () => {
+    expect(envStorePath("/home/x/.kairoku/env", "owds-inc/kairoku", "test")).toBe(
       "/home/x/.kairoku/env/owds-inc/kairoku/test.env",
     );
   });
 
   test("a repo or profile name that tries to climb out is refused", () => {
-    expect(() => envStorePath("/home/x", "../../etc", "test")).toThrow(/must not contain/);
-    expect(() => envStorePath("/home/x", "owds-inc/kairoku", "../shadow")).toThrow(/must not contain/);
+    expect(() => envStorePath("/e", "../../etc", "test")).toThrow(/must not contain/);
+    expect(() => envStorePath("/e", "owds-inc/kairoku", "../shadow")).toThrow(/must not contain/);
   });
 
   test("written 0600 and read back", () => {

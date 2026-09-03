@@ -25,7 +25,7 @@
 
 import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { kairokuHome, parseEnvFile } from "./config";
+import { parseEnvFile } from "./config";
 import { run as execArgv, type CommandResult } from "./worktree";
 
 // -------------------------------------------------------------- substitution
@@ -87,19 +87,20 @@ function segment(value: string, what: string): string {
 }
 
 /**
- * `~/.kairoku/env/<owner>/<repo>/<profile>.env`.
+ * `<envDir>/<owner>/<repo>/<profile>.env`, where `envDir` is `~/.kairoku/env`
+ * on a real daemon and `config.envDir` everywhere else.
  *
  * The repo's own `owner/name` is the key, so one daemon holding two checkouts
  * cannot serve the second one's values to the first. Every segment is checked:
  * a repo name is a string that arrived over the wire.
  */
-export function envStorePath(home: string, repoFullName: string, profile: string): string {
+export function envStorePath(envDir: string, repoFullName: string, profile: string): string {
   const parts = repoFullName.split("/").filter((p) => p !== "");
   if (parts.length < 2) throw new Error(`"${repoFullName}" must not contain fewer than two path segments`);
   for (const part of parts) segment(part, "a repo name");
   segment(profile, "a profile name");
   if (profile.includes("/")) throw new Error("a profile name must not contain a path separator");
-  return join(kairokuHome(home), "env", ...parts, `${profile}.env`);
+  return join(envDir, ...parts, `${profile}.env`);
 }
 
 export function readEnvStore(path: string): Record<string, string> {

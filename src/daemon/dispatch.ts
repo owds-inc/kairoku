@@ -503,6 +503,7 @@ async function runMember(args: MemberArgs): Promise<void> {
           secrets,
           perRun: { KAIROKU_PAT: pat },
           portRange,
+          ...(args.config.envDir === undefined ? {} : { envDir: args.config.envDir }),
           ...(args.repoFullName === undefined ? {} : { repoFullName: args.repoFullName }),
           ...(manifest?.ok ? { manifest: manifest.manifest } : {}),
         },

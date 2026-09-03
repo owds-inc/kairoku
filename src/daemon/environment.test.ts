@@ -70,7 +70,7 @@ function spec(over: Record<string, unknown> = {}) {
     secrets: {},
     perRun: { KAIROKU_PAT: "kai_run_1" },
     portRange: RANGE,
-    home: "/nowhere",
+    envDir: "/nowhere",
     ...over,
   } as Parameters<typeof prepareEnvironment>[0];
 }
@@ -137,10 +137,10 @@ describe("prepareEnvironment — the whole profile, for one run", () => {
     const worktree = mkdtempSync(join(tmpdir(), "kairoku-wt-"));
     try {
       writeFileSync(join(worktree, ".env.local"), "A=checkout\nB=checkout\nC=checkout\n");
-      writeEnvStore(envStorePath(home, "owds-inc/kairoku", "test"), { B: "store", C: "store" });
+      writeEnvStore(envStorePath(join(home, "env"), "owds-inc/kairoku", "test"), { B: "store", C: "store" });
       const { deps: d } = deps();
       const env = await prepareEnvironment(
-        spec({ home, worktree, secrets: { C: "secret" }, manifest: FULL }),
+        spec({ envDir: join(home, "env"), worktree, secrets: { C: "secret" }, manifest: FULL }),
         d,
       );
       expect(env.values.A).toBe("checkout");
