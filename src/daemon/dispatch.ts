@@ -19,6 +19,7 @@
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ClaimItem, ClaimedDispatch, RunReport, RunState, SuiteCounts } from "./app";
+import { indexWorktree, type IndexedWorktree } from "./codegraph";
 import type { Config } from "./config";
 import { parsePortRange, DEFAULT_PORT_RANGE } from "./compose";
 import { resolveSecrets, type DeliveredSecret, type ResolverDeps } from "./env";
@@ -48,8 +49,22 @@ export interface RunStateFile {
   readonly sessionId?: string;
   /** O-4 — the service ports this run was allocated, for the post-mortem. */
   readonly ports?: Record<string, number>;
+  /** §21 Q19 — the two numbers the CodeGraph measurement compares. */
+  readonly measure?: RunMeasure;
   /** A terminal report the app has not accepted yet. Retried until it does. */
   readonly report?: RunReport;
+}
+
+/**
+ * §21 Q19 — the yardstick, per member: "fewer tool calls or less wall clock per
+ * item at equal-or-better QA counts". The counts are already in the terminal
+ * report; these are the other two, recorded whether or not this run had an
+ * index, because a measurement needs both arms.
+ */
+export interface RunMeasure {
+  readonly toolCalls: number;
+  /** Launch to the end of the team's work — teardown is daemon time, not agent time. */
+  readonly wallClockMs: number;
 }
 
 export interface DispatchDeps {
@@ -67,6 +82,8 @@ export interface DispatchDeps {
   readonly manifest?: () => Promise<ManifestResult | undefined>;
   /** Test seam: the base branch's `.kairoku/rules`, instead of asking git. */
   readonly rules?: () => Promise<RulesResult>;
+  /** Test seam: §21's index step, instead of shelling out to real CodeGraph. */
+  readonly codegraph?: (worktree: string) => Promise<IndexedWorktree>;
   /** Test seam: docker and the init step. */
   readonly environment?: EnvironmentDeps;
   /** Test seam: the vault CLIs a `{ref}` is resolved through. */
@@ -375,6 +392,7 @@ export function startDispatch(
       report,
       manifest,
       rules,
+      index: deps.codegraph ?? ((worktree) => indexWorktree(worktree)),
       ...(deps.agentToken === undefined ? {} : { agentToken: deps.agentToken }),
       ...(deps.agentEnv === undefined ? {} : { agentEnv: deps.agentEnv }),
       ...(deps.repoFullName === undefined ? {} : { repoFullName: deps.repoFullName }),
@@ -418,6 +436,7 @@ interface MemberArgs {
   report: (report: RunReport) => void;
   manifest: Promise<ManifestResult | undefined>;
   rules: Promise<RulesResult>;
+  index: (worktree: string) => Promise<IndexedWorktree>;
   agentToken?: string;
   agentEnv?: Record<string, string>;
   repoFullName?: string;
@@ -471,7 +490,9 @@ async function runMember(args: MemberArgs): Promise<void> {
 
   const profileName = dispatch.env?.profile ?? "test";
   const portRange = parsePortRange(args.config.ports ?? DEFAULT_PORT_RANGE) ?? parsePortRange(DEFAULT_PORT_RANGE)!;
+  const launchedAt = Date.parse(startedAt);
   let ports: Record<string, number> = {};
+  let measure: RunMeasure | undefined;
   let sessionId: string | undefined;
   let outcome: MemberOutcome = { ok: false, summary: "the member produced no outcome" };
 
@@ -485,6 +506,7 @@ async function runMember(args: MemberArgs): Promise<void> {
       branch,
       ...(sessionId === undefined ? {} : { sessionId }),
       ...(Object.keys(ports).length === 0 ? {} : { ports }),
+      ...(measure === undefined ? {} : { measure }),
       ...extra,
     });
 
@@ -539,6 +561,14 @@ async function runMember(args: MemberArgs): Promise<void> {
       // committed manifest that could set KAIROKU_URL would send the agent —
       // carrying KAIROKU_PAT, this run's credential — to an origin the repo
       // chose. The daemon's own facts about the app are not the repo's to set.
+      // §21 item 2 — the index, AFTER the worktree exists and BEFORE the first
+      // role launches, and only when the base branch's manifest opted in.
+      // One index per worktree: CodeGraph will not share one across worktrees,
+      // so this is paid per member, which is exactly what Q4 is measuring.
+      const indexed =
+        manifest?.ok && manifest.manifest.intelligence.includes("codegraph") ? await args.index(cwd) : {};
+      if (indexed.event) ctx.events.push("ok", indexed.event);
+
       const env = childEnv({ ...environment.values, ...(args.agentEnv ?? {}) });
       const plan = qaPlan(cwd, {
         ...(manifest?.ok ? { manifest: manifest.manifest } : {}),
@@ -571,6 +601,7 @@ async function runMember(args: MemberArgs): Promise<void> {
             timeoutMs: args.timeoutSec * 1000,
             logPath: stdoutPath(runsDir, dispatchId, runId),
             ...(rules.rules === undefined ? {} : { rules: rules.rules }),
+            ...(indexed.codegraph === undefined ? {} : { codegraph: indexed.codegraph }),
             ...(choice.model === undefined ? {} : { model: choice.model }),
             ...(choice.effort === undefined ? {} : { effort: choice.effort }),
             ...(schemaFor(role) === undefined ? {} : { schema: schemaFor(role)! }),
@@ -591,6 +622,11 @@ async function runMember(args: MemberArgs): Promise<void> {
         },
       };
       outcome = await args.recipe(memberCtx);
+      // §21 Q19, pushed HERE rather than beside the terminal report: the link
+      // drains `store.list()`, which holds only RUNNING runs, so a line pushed
+      // after this body returns would reach the local log and never the app.
+      measure = { toolCalls: ctx.events.tools(), wallClockMs: Date.now() - launchedAt };
+      ctx.events.push("ok", `run: ${measure.toolCalls} tool calls in ${(measure.wallClockMs / 1000).toFixed(1)}s`);
       return { ok: outcome.ok, summary: outcome.summary };
     },
   });

@@ -27,6 +27,7 @@ import {
 } from "./dispatch";
 import { reserved } from "./compose";
 import { parseManifest } from "./manifest";
+import type { CodeGraph, IndexedWorktree } from "./codegraph";
 import { PATTERNS_PATH, type Rules } from "./rules";
 import { RunStore } from "./runs";
 import { rolePrompt, rolesWithPrompts } from "./roles";
@@ -732,6 +733,102 @@ describe("dispatch — §21 the repo's own rules", () => {
     expect(reads).toBe(1);
   });
 
+});
+
+// ------------------------------------------------- §21 Q15/Q19 CodeGraph on probation
+
+const CODEGRAPH: CodeGraph = { bin: "/opt/homebrew/bin/codegraph", worktree: "/tmp/wt" };
+
+const withIntelligence = (names: string[]) => {
+  const parsed = parseManifest(JSON.stringify({ intelligence: names, test: "echo ' 1 pass'" }));
+  if (!parsed.ok) throw new Error(parsed.error);
+  return async () => parsed;
+};
+
+/** Records the worktrees asked for an index, instead of building one. */
+function fakeIndex(answer: IndexedWorktree = { codegraph: CODEGRAPH, event: "codegraph: 573 files in 4.1s" }) {
+  const asked: string[] = [];
+  return {
+    asked,
+    index: async (worktree: string): Promise<IndexedWorktree> => {
+      asked.push(worktree);
+      return answer;
+    },
+  };
+}
+
+describe("dispatch — §21 CodeGraph, opt-in per repo", () => {
+  test("the flag ON indexes the worktree BEFORE the first role turn, and every turn gets the index", async () => {
+    const r = rig();
+    const { asked, index } = fakeIndex();
+    await r.run(claim(), { manifest: withIntelligence(["codegraph"]), codegraph: index });
+
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toBe(r.h.worktrees.created[0]!.path);
+    expect(r.provider.launched.length).toBeGreaterThan(0);
+    for (const launched of r.provider.launched) expect(launched.codegraph).toEqual(CODEGRAPH);
+  });
+
+  test("the index step is recorded as ONE event line carrying the file count and the wall clock", async () => {
+    const r = rig();
+    await r.run(claim(), { manifest: withIntelligence(["codegraph"]), codegraph: fakeIndex().index });
+    const log = readFileSync(join(r.h.config.runsDir, "d1", "run-1.jsonl"), "utf8");
+    expect(log).toContain("codegraph: 573 files in 4.1s");
+  });
+
+  test("the flag OFF changes NOTHING: no index is attempted and no turn carries one", async () => {
+    const r = rig();
+    const { asked, index } = fakeIndex();
+    await r.run(claim(), { manifest: withIntelligence([]), codegraph: index });
+    expect(asked).toEqual([]);
+    for (const launched of r.provider.launched) expect(launched.codegraph).toBeUndefined();
+  });
+
+  test("no manifest at all is the same as off", async () => {
+    const r = rig();
+    const { asked, index } = fakeIndex();
+    await r.run(claim(), { manifest: async () => undefined, codegraph: index });
+    expect(asked).toEqual([]);
+  });
+
+  test("a machine without CodeGraph DEGRADES SILENTLY — the run lands, with no index and no failure", async () => {
+    const r = rig();
+    await r.run(claim(), { manifest: withIntelligence(["codegraph"]), codegraph: fakeIndex({}).index });
+    expect(r.reports.at(-1)!.status).toBe("done");
+    for (const launched of r.provider.launched) expect(launched.codegraph).toBeUndefined();
+  });
+});
+
+describe("dispatch — §21 Q19, the two numbers the measurement compares", () => {
+  // A clean QA (the manifest's own `test` command passes) so the recipe runs
+  // ONE implementer turn: a fix loop would make the tool count a property of
+  // the fake's script rather than of the measurement.
+  const CLEAN_QA = withIntelligence([]);
+
+  test("the end-of-run event carries the tool calls and the wall clock", async () => {
+    const r = rig();
+    r.provider.script("implementer", [
+      { events: [{ kind: "tool", text: "Read a.ts" }, { kind: "text", text: "thinking" }, { kind: "tool", text: "Edit a.ts" }] },
+    ]);
+    await r.run(claim(), { manifest: CLEAN_QA });
+    const log = readFileSync(join(r.h.config.runsDir, "d1", "run-1.jsonl"), "utf8");
+    const texts = log
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => (JSON.parse(l) as { text?: string }).text ?? "");
+    expect(texts.filter((t) => t.startsWith("run: "))).toEqual([expect.stringMatching(/^run: 2 tool calls in \d+\.\ds$/)]);
+  });
+
+  test("the same two numbers are on the run's own record, for a post-mortem with no app", async () => {
+    const r = rig();
+    r.provider.script("implementer", [{ events: [{ kind: "tool", text: "Read a.ts" }] }]);
+    await r.run(claim(), { manifest: CLEAN_QA });
+    const state = JSON.parse(readFileSync(runStatePath(r.h.config.runsDir, "d1", "run-1"), "utf8")) as {
+      measure?: { toolCalls: number; wallClockMs: number };
+    };
+    expect(state.measure?.toolCalls).toBe(1);
+    expect(state.measure?.wallClockMs).toBeGreaterThanOrEqual(0);
+  });
 });
 
 describe("§21 Q6/Q7 — the patterns.md convention reaches every role, on both hosts", () => {
