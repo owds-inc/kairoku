@@ -1,21 +1,32 @@
 /**
  * RF-012 — the loop that links this daemon to the app.
  *
- * Two timers and one rule each:
+ * Three timers and one rule each:
  *
  *   HEARTBEAT, every 10 s WHILE ANY RUN IS ACTIVE and at the app's own cadence
- *   otherwise (grill Q6). It carries `meta`, one report per live run with that
- *   run's curated events, and any terminal report `update` could not deliver.
+ *   otherwise (grill Q6). It carries `meta` and any terminal report `update`
+ *   could not deliver; it may still carry whatever events are pending at its
+ *   own moment (draining is the single source, so nothing doubles up), but it
+ *   no longer needs to be an event's only way up.
  *   CLAIM, every 5 s, but only while there is a free slot AND the last
  *   heartbeat succeeded — claiming into a link that is not working takes a
  *   dispatch off the queue that nothing will report on.
+ *   FLUSH (RF-020, §23.2) — every 2 s, draining each ACTIVE run's curated
+ *   events onto `client.update(...)` directly, off the heartbeat entirely.
+ *   It ticks constantly, like claim, and is simply a no-op while nothing is
+ *   running — the same idiom `poll()` already uses for "only while eligible",
+ *   with no second start/stop lifecycle to keep in sync with the other two.
+ *   A failed flush's batch is held (link-local, keyed by runId) and leads the
+ *   next tick's events for that run, so a send failure never loses a line.
  *
- * `unauthorized` stops both, once, loudly. The listener stays up on purpose:
- * `kairoku doctor` has to be able to walk up to a daemon whose token the app
- * refused and be told exactly that, which it cannot do if the process exits.
+ * `unauthorized` stops all three, once, loudly. The listener stays up on
+ * purpose: `kairoku doctor` has to be able to walk up to a daemon whose token
+ * the app refused and be told exactly that, which it cannot do if the process
+ * exits.
  *
- * `beat()` and `poll()` are one turn each and return what the scheduler needs,
- * so the policy is testable without waiting out a real cadence.
+ * `beat()`, `poll()` and `flush()` are one turn each and return what the
+ * scheduler needs, so the policy is testable without waiting out a real
+ * cadence.
  */
 
 import {
@@ -24,6 +35,7 @@ import {
   type AppResult,
   type CancelInstruction,
   type ClaimedDispatch,
+  type RunEvent,
   type RunOutcome,
   type RunReport,
 } from "./app";
@@ -47,6 +59,8 @@ export const BACKOFF_MAX_MS = 300_000;
 export const DEFAULT_HEARTBEAT_MS = 30_000;
 /** Grill Q6 — the fast cadence while anything is running. */
 export const ACTIVE_HEARTBEAT_MS = 10_000;
+/** §23.2 — curated events flush independently of the heartbeat while active. */
+export const ACTIVE_FLUSH_MS = 2_000;
 /** The app caps a beat's `runs` at 50. */
 const MAX_RUNS_PER_BEAT = EVENTS_PER_REPORT_MAX;
 
@@ -71,6 +85,8 @@ export interface Link {
   beat(): Promise<number>;
   /** One claim, if the link and the capacity allow. True when work was taken. */
   poll(): Promise<boolean>;
+  /** One flush: drain and send curated events for every active run. A no-op while nothing is running. */
+  flush(): Promise<void>;
   stop(): void;
 }
 
@@ -99,6 +115,12 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
   const refusedOnce = new Set<string>();
   /** Dispatch ids this daemon is already running — the lease can re-issue one. */
   const active = new Set<string>();
+  /**
+   * §23.2 — a run's events after a flush that failed to deliver them. They
+   * lead the NEXT tick's batch for that run, so a send failure never loses a
+   * line; the event buffer itself is untouched (it already drained them).
+   */
+  const pendingFlushes = new Map<string, RunEvent[]>();
 
   /**
    * ONE registry, used for both halves. What the beat advertises and what a
@@ -120,6 +142,7 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
   let backoffMs = 0;
   let beatTimer: ReturnType<typeof setTimeout> | undefined;
   let claimTimer: ReturnType<typeof setTimeout> | undefined;
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
   let booted = false;
 
   /**
@@ -158,7 +181,8 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     lastError = error;
     clearTimeout(beatTimer);
     clearTimeout(claimTimer);
-    beatTimer = claimTimer = undefined;
+    clearTimeout(flushTimer);
+    beatTimer = claimTimer = flushTimer = undefined;
     log(`app link: ${error} — the loop is stopped; fix the token and restart (kairoku setup --daemon)`);
   }
 
@@ -406,6 +430,38 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     });
   }
 
+  /**
+   * §23.2 (DECISIONS.md — the Floor is live) — one flush: every ACTIVE run's
+   * curated events, drained and sent on `client.update(...)` directly, the
+   * same body shape protocol v1 already accepts for a progress report with
+   * `events`. Independent of the heartbeat entirely; `EVENTS_PER_REPORT_MAX`
+   * still bounds one run's batch.
+   *
+   * A run whose send fails keeps its drained batch in `pendingFlushes` — it
+   * leads the next tick's events for that run — so nothing is lost to a
+   * `server`/`network` hiccup. `401` halts every timer via `halted()`,
+   * exactly as it does for the beat and the claim.
+   */
+  async function flush(): Promise<void> {
+    if (stopped || !client) return;
+    if (store.capacity().running === 0) return;
+    for (const run of store.list()) {
+      const drained = store.drainEvents(run.runId, EVENTS_PER_REPORT_MAX);
+      const carried = pendingFlushes.get(run.runId) ?? [];
+      const events = [...carried, ...drained].slice(0, EVENTS_PER_REPORT_MAX);
+      if (events.length === 0) continue;
+
+      const result = await client.update({ dispatchId: run.dispatchId, runId: run.runId, status: "running", events });
+      if (halted(result)) return;
+      if (result.ok) {
+        pendingFlushes.delete(run.runId);
+      } else {
+        pendingFlushes.set(run.runId, events);
+        lastError = result.error;
+      }
+    }
+  }
+
   // ------------------------------------------------------------- the timers
 
   function scheduleBeat(delay: number): void {
@@ -420,14 +476,23 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     claimTimer.unref?.();
   }
 
+  /** §23.2 — ticks constantly, like claim; `flush()` itself no-ops while idle. */
+  function scheduleFlush(): void {
+    if (stopped) return;
+    flushTimer = setTimeout(() => void flush().finally(scheduleFlush), ACTIVE_FLUSH_MS);
+    flushTimer.unref?.();
+  }
+
   const link: Link = {
     status,
     beat,
     poll,
+    flush,
     stop() {
       clearTimeout(beatTimer);
       clearTimeout(claimTimer);
-      beatTimer = claimTimer = undefined;
+      clearTimeout(flushTimer);
+      beatTimer = claimTimer = flushTimer = undefined;
     },
   };
 
@@ -442,6 +507,7 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
       log(`app link: ${client.appUrl}`);
       void beat().then(scheduleBeat);
       scheduleClaim();
+      scheduleFlush();
     }
   }
   return link;
