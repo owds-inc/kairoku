@@ -400,4 +400,48 @@ describe("the done-condition, against the fake app", () => {
     },
     60_000,
   );
+
+  test(
+    "§23.2 — a run's curated events reach the app over update, off the heartbeat entirely",
+    async () => {
+      const { h, app: fake } = await machine({ maxConcurrent: 1 });
+      const provider = scriptedTeam();
+      provider.paused = true; // held mid-turn, so its events are sitting there to flush
+      const config = { ...h.config, worktreeOps: seedingWorktrees(h.config.worktreesDir, () => false) };
+      const store = new RunStore(config);
+
+      const l = (link = startLink(store, config, {
+        client: appClient({ appUrl: fake.url, token: fake.token }),
+        autostart: false,
+        log: () => {},
+        providers: { claude: provider, codex: provider },
+      }));
+      await l.beat();
+
+      fake.queue({
+        id: "d-flush",
+        taskType: "implement",
+        target: { kind: "phase", id: "ph1", title: "Phase one" },
+        repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
+        team: { recipe: "solo" },
+        items: [fakeItem(1)],
+      });
+      expect(await l.poll()).toBe(true);
+      await waitFor(() => store.list().length === 1, "the run to start");
+      await Bun.sleep(30);
+
+      // No heartbeat since the setup beat — flush is the only thing that ran.
+      const beatsBefore = fake.calls.filter((c) => c.route === "heartbeat").length;
+      await l.flush();
+      expect(fake.calls.filter((c) => c.route === "heartbeat").length).toBe(beatsBefore);
+
+      const update = fake.calls.filter((c) => c.route === "update").at(-1)!.body as RunReport;
+      expect(update).toMatchObject({ dispatchId: "d-flush", runId: "run-1", status: "running" });
+      expect(update.events!.some((e) => e.kind === "text")).toBe(true);
+
+      provider.resume();
+      await waitFor(() => fake.runs.get("run-1")?.status !== undefined, "the run to settle", 30_000);
+    },
+    30_000,
+  );
 });

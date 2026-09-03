@@ -11,6 +11,7 @@ import { appClient, PROTOCOL_VERSION } from "../daemon/app";
 import { DEFAULT_PORT_RANGE, parsePortRange, type PortDeps } from "../daemon/compose";
 import { normaliseAppUrl, parseTokenEnv } from "../daemon/config";
 import { availableResolvers } from "../daemon/env";
+import { ACTIVE_FLUSH_MS } from "../daemon/link";
 import { parseManifest, MANIFEST_FILE } from "../daemon/manifest";
 import { version as binVersion, type Io } from "./io";
 import { resolvePluginPath } from "../daemon/providers";
@@ -110,7 +111,8 @@ export async function appLink(
 
   if (!result.ok) return [fail("app link", result.error), inFlight];
   const protocol = result.body.protocol ? `, protocol ${result.body.protocol}` : "";
-  return [pass("app link", `${normaliseAppUrl(appUrl)} — ${result.body.liveness}${protocol}`), inFlight];
+  const cadence = `events flush: ${ACTIVE_FLUSH_MS / 1000} s while active`;
+  return [pass("app link", `${normaliseAppUrl(appUrl)} — ${result.body.liveness}${protocol}, ${cadence}`), inFlight];
 }
 
 const NO_PLUGIN_PATH =
