@@ -76,6 +76,12 @@ describe("claude — the options the SDK is handed (§20 item 1)", () => {
     expect(claudeQueryOptions(run(), {})).not.toHaveProperty("outputFormat");
   });
 
+  test("allowedTools for a reviewer run with a schema contains StructuredOutput", () => {
+    const schema = { type: "object", properties: { verdict: { type: "string" } } };
+    const options = claudeQueryOptions(run({ role: "reviewer", schema }), {});
+    expect(options.allowedTools).toContain("StructuredOutput");
+  });
+
   test("model and effort are passed only when the composer chose them", () => {
     const chosen = claudeQueryOptions(run({ model: "claude-opus-5", effort: "high" }), {});
     expect(chosen.model).toBe("claude-opus-5");
@@ -112,6 +118,20 @@ describe("claude — the hook enforces the policy unconditionally", () => {
       hookSpecificOutput: { permissionDecision: string };
     };
     expect(answer.hookSpecificOutput.permissionDecision).toBe("deny");
+  });
+
+  test("a reviewer with a schema is allowed to call StructuredOutput", async () => {
+    // Production, 2026-09-03: this call was denied ("the reviewer may not use
+    // StructuredOutput"), so the reviewer's verdict never reached the daemon.
+    const denials: string[] = [];
+    const schema = { type: "object", properties: { verdict: { type: "string" } } };
+    const hook = preToolUseHook(run({ role: "reviewer", schema }), (reason) => denials.push(reason));
+    const answer = await hook({
+      tool_name: "StructuredOutput",
+      tool_input: { verdict: "NOT_CLEAN", defects: [] },
+    });
+    expect(answer).toEqual({});
+    expect(denials).toEqual([]);
   });
 });
 
