@@ -24,6 +24,8 @@ describe("kairoku cli", () => {
       expect(await main(args, io)).toBe(0);
       expect(io.lines.join("\n")).toContain("kairoku setup");
       expect(io.lines.join("\n")).toContain("kairoku doctor");
+      // O-4 — the daemon's own value store is a command, not a file to edit.
+      expect(io.lines.join("\n")).toContain("kairoku env");
     }
   });
 
@@ -42,6 +44,7 @@ describe("kairoku cli", () => {
       ["plugin", "kairoku plugin install|update|status"],
       ["daemon", "kairoku daemon [install|start|stop|status|prune]"],
       ["setup", "kairoku setup [--plugin]"],
+      ["env", "kairoku env <set|import|list|rm>"],
     ] as const;
     for (const [command, marker] of cases) {
       for (const flag of ["--help", "-h"]) {

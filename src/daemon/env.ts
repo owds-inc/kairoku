@@ -111,14 +111,19 @@ export function readEnvStore(path: string): Record<string, string> {
   }
 }
 
-/** Replaces the file wholesale, mode 0600. The directory is created 0700. */
-export function writeEnvStore(path: string, values: Record<string, string>): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+/** The file's whole text: `KEY=value` per line, sorted, one trailing newline. */
+export function formatEnvStore(values: Record<string, string>): string {
   const body = Object.entries(values)
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([key, value]) => `${key}=${value}`)
     .join("\n");
-  writeFileSync(path, body ? `${body}\n` : "", { mode: 0o600 });
+  return body ? `${body}\n` : "";
+}
+
+/** Replaces the file wholesale, mode 0600. The directory is created 0700. */
+export function writeEnvStore(path: string, values: Record<string, string>): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  writeFileSync(path, formatEnvStore(values), { mode: 0o600 });
   // `mode` on writeFileSync is ignored for a file that already exists.
   try {
     if ((statSync(path).mode & 0o777) !== 0o600) chmodSync(path, 0o600);

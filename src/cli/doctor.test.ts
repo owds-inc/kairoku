@@ -22,7 +22,7 @@ function laptop(): FakeIo {
 function linuxDaemon(): FakeIo {
   const home = "/home/tester";
   const io = fakeIo({ platform: "linux", home, uid: 1000 });
-  for (const b of ["node", "bun", "claude", "codex", "paseo", "git", "systemctl"]) io.bins.add(b);
+  for (const b of ["node", "bun", "claude", "codex", "paseo", "git", "systemctl", "docker", "op"]) io.bins.add(b);
   Object.assign(io.files, {
     [`${home}/.bashrc`]: `export PATH="${home}/.bun/bin:${home}/.nvm/versions/node/v24.1.0/bin:$PATH"\n# interactive guard below\n`,
     [`${home}/.bun/bin`]: "",
@@ -53,6 +53,10 @@ function linuxDaemon(): FakeIo {
     "systemctl is-active paseo": { stdout: "active\n" },
     [`git -C ${home}/work/kairoku rev-parse --short HEAD`]: { stdout: "abc1234\n" },
     [`git -C ${home}/work/kairoku status --porcelain`]: { stdout: "" },
+    "docker compose version": { stdout: "Docker Compose version v5.4.0\n" },
+    [`git -C ${home}/work/kairoku show origin/main:kairoku.json`]: {
+      stdout: JSON.stringify({ env: { test: { compose: "compose.test.yml" } }, test: "bun test" }),
+    },
   });
   io.fetch = async (url, init) => {
     // The loopback listener: no bearer, and `/status` is what doctor reads.
@@ -138,7 +142,7 @@ describe("kairoku doctor", () => {
 
   test("a provisioned linux VM passes every check", async () => {
     const io = linuxDaemon();
-    const list = await checks(io);
+    const list = await checks(io, { probe: () => true });
     expect(statuses(list)).toEqual({
       "claude installed": "PASS",
       "kairoku plugin installed": "PASS",
@@ -159,6 +163,10 @@ describe("kairoku doctor", () => {
       "runs in flight": "PASS",
       "paseo.service": "PASS",
       "repo present": "PASS",
+      "docker compose": "PASS",
+      "run port range": "PASS",
+      "kairoku.json": "PASS",
+      "secret resolvers": "PASS",
       "repo clean": "PASS",
     });
     expect(byName(list, "app link")?.detail).toContain("https://app.test");
@@ -252,5 +260,77 @@ describe("kairoku doctor", () => {
     const list = await checks(io);
     expect(byName(list, "config.json")).toMatchObject({ status: "PASS", detail: expect.stringContaining(".hikyaku") });
     expect(byName(list, "app link")?.status).toBe("PASS");
+  });
+
+  // ------------------------------------------------------------ O-4: environments
+
+  /** Never bind a real port from a unit test. */
+  const freeProbe = { probe: () => true };
+
+  test("O-4: docker, the port range, the repo's manifest and the resolvers are all reported", async () => {
+    const io = linuxDaemon();
+    const list = await checks(io, freeProbe);
+    expect(byName(list, "docker compose")?.status).toBe("PASS");
+    expect(byName(list, "docker compose")?.detail).toContain("v5.4.0");
+    expect(byName(list, "run port range")?.status).toBe("PASS");
+    expect(byName(list, "run port range")?.detail).toContain("20000-29999");
+    expect(byName(list, "kairoku.json")?.status).toBe("PASS");
+    expect(byName(list, "kairoku.json")?.detail).toContain("test");
+    expect(byName(list, "secret resolvers")?.status).toBe("PASS");
+    expect(byName(list, "secret resolvers")?.detail).toContain("op");
+  });
+
+  test("O-4: no docker is a WARN, not a FAIL — a repo with no compose profile still runs here", async () => {
+    const io = linuxDaemon();
+    io.bins.delete("docker");
+    const check = byName(await checks(io, freeProbe), "docker compose");
+    expect(check?.status).toBe("WARN");
+    expect(check?.detail).toContain("compose");
+    expect(await run([], io)).toBe(0);
+  });
+
+  test("O-4: docker installed but not RUNNING is a FAIL — that is a machine that will fail every run", async () => {
+    const io = linuxDaemon();
+    io.canned["docker compose version"] = { code: 1, stderr: "Cannot connect to the Docker daemon" };
+    expect(byName(await checks(io, freeProbe), "docker compose")?.status).toBe("FAIL");
+  });
+
+  test("O-4: a range with nothing free is a FAIL, and it names the range", async () => {
+    const io = linuxDaemon();
+    io.files["/home/tester/.kairoku/config.json"] = JSON.stringify({
+      listen: { host: "10.0.0.5", port: 7801 },
+      appUrl: "https://app.test",
+      repoPath: "/home/tester/work/kairoku",
+      ports: "31000-31003",
+    });
+    const check = byName(await checks(io, { probe: () => false }), "run port range");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain("31000-31003");
+  });
+
+  test("O-4: a manifest that does not parse FAILs with the path of the error", async () => {
+    const io = linuxDaemon();
+    io.canned["git -C /home/tester/work/kairoku show origin/main:kairoku.json"] = {
+      stdout: JSON.stringify({ env: { test: { ports: [1] } } }),
+    };
+    const check = byName(await checks(io, freeProbe), "kairoku.json");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain("env.test.ports[0] must be a string");
+  });
+
+  test("O-4: no manifest on the base branch is a WARN — today's behaviour, not a fault", async () => {
+    const io = linuxDaemon();
+    io.canned["git -C /home/tester/work/kairoku show origin/main:kairoku.json"] = { code: 128, stdout: "" };
+    const check = byName(await checks(io, freeProbe), "kairoku.json");
+    expect(check?.status).toBe("WARN");
+    expect(await run([], io)).toBe(0);
+  });
+
+  test("O-4: no resolver on this machine is a WARN naming what a run would fail on", async () => {
+    const io = linuxDaemon();
+    io.bins.delete("op");
+    const check = byName(await checks(io, freeProbe), "secret resolvers");
+    expect(check?.status).toBe("WARN");
+    expect(check?.detail).toContain("{ref}");
   });
 });

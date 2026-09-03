@@ -7,6 +7,7 @@
  */
 
 import { dirname, join } from "node:path";
+import { DEFAULT_PORT_RANGE } from "../daemon/compose";
 import { kairokuHome } from "../daemon/config";
 import { version, type Io } from "./io";
 
@@ -85,6 +86,57 @@ export async function runtimes(io: Io): Promise<Step[]> {
     steps.push(install.code === 0 ? done("agent CLIs", `npm install -g ${missing.join(" ")}`) : manual("agent CLIs", `npm install -g ${missing.join(" ")} failed (exit ${install.code})`));
   }
   return steps;
+}
+
+/**
+ * O-4 (§20.11) — Docker Compose is the one service engine, so a machine that
+ * runs repos with an `env.<profile>.compose` needs it.
+ *
+ * Installed is SKIPPED, never upgraded: this is provisioning, not an update
+ * channel, and swapping the container engine under a running agent is how a
+ * whole machine's work is lost at once. Installed but not ANSWERING is a manual
+ * step — `apt-get install` cannot fix a stopped daemon or a socket this user
+ * has no group membership for.
+ *
+ * On mac it names the install rather than pretending: OrbStack and Docker
+ * Desktop are both GUI installs with licence terms, and a setup script that
+ * `brew install --cask`s one of them behind an operator's back is overreach.
+ */
+export async function docker(io: Io): Promise<Step> {
+  const name = "docker (per-run services)";
+  if (io.which("docker")) {
+    const version = await io.shell(["docker", "compose", "version"]);
+    return version.code === 0
+      ? skipped(name, `${version.stdout.trim().split("\n")[0]} already installed`)
+      : manual(
+          name,
+          "docker is installed but not answering — start it, and check this user is in the `docker` group:\n" +
+            "     sudo systemctl enable --now docker && sudo usermod -aG docker $USER   # then log out and back in",
+        );
+  }
+
+  const APT = "sudo apt-get update && sudo apt-get install -y docker.io docker-compose-plugin";
+  if (io.platform !== "linux") {
+    return manual(
+      name,
+      "not installed — install OrbStack (https://orbstack.dev) or Docker Desktop, then rerun `kairoku setup --daemon`",
+    );
+  }
+  if (!(await sudoOk(io))) {
+    return manual(
+      name,
+      "no passwordless sudo — run by hand:\n" +
+        `     ${APT}\n` +
+        "     sudo usermod -aG docker $USER   # then log out and back in",
+    );
+  }
+  const install = await io.shell(["bash", "-c", APT], { live: true });
+  if (install.code !== 0) return manual(name, `${APT} failed (exit ${install.code})`);
+  // Without the group the socket is root-only and every compose call fails with
+  // "permission denied", which reads as a broken daemon rather than a missing
+  // login. It only takes effect on a new session, so the step SAYS so.
+  await io.shell(["bash", "-c", "sudo usermod -aG docker $USER"]);
+  return done(name, "installed from apt and added this user to `docker` — log out and back in for the group to take effect");
 }
 
 /**
@@ -171,6 +223,7 @@ export function configuredRepoUrl(io: Io): string | undefined {
 }
 
 export const LOOPBACK = "127.0.0.1";
+export { DEFAULT_PORT_RANGE };
 
 /**
  * `~/.kairoku/config.json`.
@@ -191,11 +244,30 @@ export const LOOPBACK = "127.0.0.1";
  * be wrong on a machine nobody is watching. Absent when nothing resolved — a
  * guessed path would be worse than the fail-closed message.
  */
-export async function daemonConfig(io: Io, repoPath: string, repoUrl?: string, pluginPath?: string): Promise<Step[]> {
+export interface DaemonConfigOptions {
+  readonly repoUrl?: string;
+  readonly pluginPath?: string;
+  /** O-4 — the range per-run service ports are allocated from. */
+  readonly ports?: string;
+}
+
+export async function daemonConfig(
+  io: Io,
+  repoPath: string,
+  options: DaemonConfigOptions = {},
+): Promise<Step[]> {
+  const { repoUrl, pluginPath, ports } = options;
   const configPath = join(kairokuHome(io.home), "config.json");
   const existing = io.readFile(configPath);
   if (existing === null) {
-    const config = { listen: { host: LOOPBACK, port: 7801 }, maxConcurrent: 2, repoPath, ...(repoUrl ? { repoUrl } : {}), ...(pluginPath ? { pluginPath } : {}) };
+    const config = {
+      listen: { host: LOOPBACK, port: 7801 },
+      maxConcurrent: 2,
+      repoPath,
+      ...(repoUrl ? { repoUrl } : {}),
+      ...(pluginPath ? { pluginPath } : {}),
+      ...(ports ? { ports } : {}),
+    };
     io.writeFile(configPath, JSON.stringify(config, null, 2) + "\n");
     return [done("config.json", `bound to ${LOOPBACK}:7801 (the listener answers doctor only)`)];
   }
@@ -220,6 +292,10 @@ export async function daemonConfig(io: Io, repoPath: string, repoUrl?: string, p
   if (pluginPath && config.pluginPath !== pluginPath) {
     config.pluginPath = pluginPath;
     changes.push(`recorded pluginPath ${pluginPath}`);
+  }
+  if (ports && config.ports !== ports) {
+    config.ports = ports;
+    changes.push(`recorded per-run port range ${ports}`);
   }
   if (changes.length === 0) return [skipped("config.json", "already present")];
   io.writeFile(configPath, JSON.stringify(config, null, 2) + "\n");

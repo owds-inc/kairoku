@@ -26,11 +26,12 @@ function withClaude(io = fakeIo()): FakeIo {
 /** A linux VM with everything already in place: every provisioning step is a skip. */
 function provisionedVm(): FakeIo {
   const io = withClaude(fakeIo({ platform: "linux", home, env: { USER: "neil", PATH: "/usr/bin:/bin" } }));
-  for (const b of ["node", "bun", "codex", "paseo", "git"]) io.bins.add(b);
+  for (const b of ["node", "bun", "codex", "paseo", "git", "docker"]) io.bins.add(b);
   Object.assign(io.canned, {
     "node --version": { stdout: "v24.1.0\n" },
     "bun --version": { stdout: "1.3.14\n" },
     "sudo -n true": { code: 0 },
+    "docker compose version": { stdout: "Docker Compose version v5.4.0\n" },
   });
   Object.assign(io.files, {
     [`${home}/.bashrc`]: `export PATH="${home}/.bun/bin:$PATH"\n`,
@@ -47,6 +48,7 @@ function provisionedVm(): FakeIo {
       maxConcurrent: 2,
       repoPath: `${home}/work/kairoku`,
       repoUrl: "https://example.com/app.git",
+      ports: "20000-29999",
     }),
   });
   io.modes[`${home}/.kairoku/token.env`] = 0o600;
@@ -129,7 +131,7 @@ describe("kairoku setup — daemon", () => {
     expect(await run(["--daemon", "--yes"], io)).toBe(0);
     expect(io.questions).toEqual([]);
     const out = io.lines.join("\n");
-    for (const skipped of ["not upgrading", "already above the interactive guard", `already at ${home}/work/kairoku`, "already 0 and persisted", "already set"]) {
+    for (const skipped of ["not upgrading", "already above the interactive guard", `already at ${home}/work/kairoku`, "already 0 and persisted", "already set", "v5.4.0 already installed"]) {
       expect(out).toContain(skipped);
     }
     expect(out).toContain("unit written to /etc/systemd/system/kairoku-daemon.service");
@@ -237,7 +239,12 @@ describe("kairoku setup — daemon", () => {
   test("the wizard asks for the app URL and the token, offering the default origin", async () => {
     const io = provisionedVm();
     delete io.files[`${home}/.kairoku/token.env`];
-    io.files[`${home}/.kairoku/config.json`] = JSON.stringify({ listen: { host: "127.0.0.1", port: 7801 }, repoUrl: "https://example.com/app.git" });
+    // `ports` is already recorded, so the only questions here are the link's.
+    io.files[`${home}/.kairoku/config.json`] = JSON.stringify({
+      listen: { host: "127.0.0.1", port: 7801 },
+      repoUrl: "https://example.com/app.git",
+      ports: "20000-29999",
+    });
     io.answers = ["https://app.test", "kai_pasted_token"];
 
     expect(await run(["--daemon"], io)).toBe(0);
@@ -297,7 +304,7 @@ describe("kairoku setup — daemon migrates a pre-rename home first", () => {
         mode: realIo.mode,
         writeFile: realIo.writeFile,
       }));
-      for (const b of ["node", "bun", "codex", "paseo", "git"]) io.bins.add(b);
+      for (const b of ["node", "bun", "codex", "paseo", "git", "docker"]) io.bins.add(b);
       Object.assign(io.canned, { "node --version": { stdout: "v24.1.0\n" }, "bun --version": { stdout: "1.3.14\n" }, "sudo -n true": { code: 0 } });
       const seen: string[] = [];
       io.fetch = async (url, init) => {
@@ -333,5 +340,50 @@ describe("kairoku setup — daemon migrates a pre-rename home first", () => {
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
+  });
+
+});
+
+describe("kairoku setup — daemon: environments (O-4)", () => {
+  test("O-4: --yes records the default port range and asks nothing", async () => {
+    const io = provisionedVm();
+    const { ports: _drop, ...rest } = JSON.parse(io.files[`${home}/.kairoku/config.json`]!);
+    io.files[`${home}/.kairoku/config.json`] = JSON.stringify(rest);
+
+    expect(await run(["--daemon", "--yes"], io)).toBe(0);
+    expect(io.questions).toEqual([]);
+    expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).ports).toBe("20000-29999");
+  });
+
+  test("O-4: the wizard asks for the range, offering the default, and records the answer", async () => {
+    const io = provisionedVm();
+    const { ports: _drop, ...rest } = JSON.parse(io.files[`${home}/.kairoku/config.json`]!);
+    io.files[`${home}/.kairoku/config.json`] = JSON.stringify(rest);
+    io.answers = ["31000-31999"];
+
+    expect(await run(["--daemon"], io)).toBe(0);
+    expect(io.questions.join("\n")).toContain("20000-29999");
+    expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).ports).toBe("31000-31999");
+  });
+
+  test("O-4: a range the operator typed wrong is refused rather than written", async () => {
+    // Written, it would sit in config.json doing nothing visible until the
+    // first run with a compose profile failed to get a port.
+    const io = provisionedVm();
+    const { ports: _drop, ...rest } = JSON.parse(io.files[`${home}/.kairoku/config.json`]!);
+    io.files[`${home}/.kairoku/config.json`] = JSON.stringify(rest);
+    io.answers = ["twenty thousand", "31000-31999"];
+
+    expect(await run(["--daemon"], io)).toBe(0);
+    expect(io.questions).toHaveLength(2);
+    expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).ports).toBe("31000-31999");
+  });
+
+  test("O-4: a VM with no docker gets it installed as part of --daemon", async () => {
+    const io = provisionedVm();
+    io.bins.delete("docker");
+    expect(await run(["--daemon", "--yes"], io)).toBe(0);
+    expect(calls(io).some((c) => c.includes("docker.io docker-compose-plugin"))).toBe(true);
+    expect(io.lines.join("\n")).toContain("log out and back in");
   });
 });

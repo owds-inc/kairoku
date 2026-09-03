@@ -8,7 +8,10 @@
 
 import { join } from "node:path";
 import { appClient, PROTOCOL_VERSION } from "../daemon/app";
+import { DEFAULT_PORT_RANGE, parsePortRange, type PortDeps } from "../daemon/compose";
 import { normaliseAppUrl, parseTokenEnv } from "../daemon/config";
+import { availableResolvers } from "../daemon/env";
+import { parseManifest, MANIFEST_FILE } from "../daemon/manifest";
 import { version as binVersion, type Io } from "./io";
 import { resolvePluginPath } from "../daemon/providers";
 import { installedPlugin } from "./plugin";
@@ -135,7 +138,101 @@ export function configuredPluginPath(io: Io): string | undefined {
   }
 }
 
-export async function checks(io: Io): Promise<Check[]> {
+/**
+ * O-4 (§20.11) — can this machine give a run its own environment?
+ *
+ * Four facts, and each is one a machine can be wrong about silently: docker
+ * present but not RUNNING, a port range with nothing free in it, a manifest on
+ * the base branch that does not parse, and a `{ref}` nobody here can resolve.
+ * Every one of them turns into a failed run on a machine nobody is watching.
+ */
+export async function environment(io: Io, config: DoctorConfig, probe?: PortDeps): Promise<Check[]> {
+  const out: Check[] = [];
+
+  // Docker ABSENT is a WARN: `no manifest → today's behaviour` is still
+  // supported, so a machine without it runs repos that declare no services.
+  // Docker PRESENT but not answering is a FAIL: that machine will accept work
+  // for a repo with a compose profile and fail every one of those runs.
+  if (!io.which("docker")) {
+    out.push(warn("docker compose", "not installed — a repo with a compose profile cannot run on this machine"));
+  } else {
+    const version = await io.shell(["docker", "compose", "version"]);
+    out.push(
+      version.code === 0
+        ? pass("docker compose", version.stdout.trim().split("\n")[0])
+        : fail("docker compose", (version.stderr || version.stdout).trim().split("\n")[0] || "docker is not answering"),
+    );
+  }
+
+  const text = typeof config.ports === "string" && config.ports ? config.ports : DEFAULT_PORT_RANGE;
+  const range = parsePortRange(text);
+  if (!range) {
+    out.push(fail("run port range", `"${text}" in config.json is not a range like "${DEFAULT_PORT_RANGE}"`));
+  } else {
+    const test = probe ?? bindProbeFor(io);
+    // A handful, not the whole range: the question is "is this range usable",
+    // and probing ten thousand ports to answer it is its own kind of wrong.
+    let free = 0;
+    for (let i = 0; i < 4 && range.from + i <= range.to; i++) if (test.probe(range.from + i)) free++;
+    out.push(
+      free > 0
+        ? pass("run port range", `${text} — ${free} of the first 4 free`)
+        : fail("run port range", `${text} — nothing free at the bottom of the range; widen or move it`),
+    );
+  }
+
+  const repo = config.repoPath ?? join(io.home, "work", "kairoku");
+  const branch = config.defaultBranch ?? "main";
+  const shown = await io.shell(["git", "-C", repo, "show", `origin/${branch}:${MANIFEST_FILE}`]);
+  if (shown.code !== 0) {
+    out.push(warn(MANIFEST_FILE, `none on origin/${branch} — runs get today's behaviour (no services, no profile)`));
+  } else {
+    const parsed = parseManifest(shown.stdout);
+    out.push(
+      parsed.ok
+        ? pass(
+            MANIFEST_FILE,
+            `origin/${branch} — profiles: ${Object.keys(parsed.manifest.env).join(", ") || "none"}`,
+          )
+        : fail(MANIFEST_FILE, parsed.error),
+    );
+  }
+
+  const resolvers = availableResolvers((bin) => io.which(bin));
+  out.push(
+    resolvers.length
+      ? pass("secret resolvers", resolvers.join(", "))
+      : warn("secret resolvers", "none installed — a run whose secrets arrive as a {ref} will fail (op, aws)"),
+  );
+
+  return out;
+}
+
+/** The real probe, kept out of `environment` so a test never binds a port. */
+function bindProbeFor(_io: Io): PortDeps {
+  return {
+    probe(port) {
+      try {
+        const socket = Bun.listen({ hostname: "127.0.0.1", port, socket: { data() {} } });
+        socket.stop(true);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
+
+/** Only the fields the checks read. */
+interface DoctorConfig {
+  listen?: { host?: string; port?: number };
+  appUrl?: string;
+  repoPath?: string;
+  defaultBranch?: string;
+  ports?: string;
+}
+
+export async function checks(io: Io, probe?: PortDeps): Promise<Check[]> {
   const out: Check[] = [];
 
   // -- the plugin, everywhere
@@ -232,7 +329,7 @@ export async function checks(io: Io): Promise<Check[]> {
     out.push(r.code === 0 ? pass("daemon service", `${LAUNCHD_LABEL} loaded`) : fail("daemon service", `${LAUNCHD_LABEL} not loaded`));
   }
 
-  let config: { listen?: { host?: string; port?: number }; appUrl?: string; repoPath?: string } = {};
+  let config: DoctorConfig = {};
   try {
     config = JSON.parse(configText ?? "{}");
   } catch {
@@ -249,6 +346,7 @@ export async function checks(io: Io): Promise<Check[]> {
       : fail("daemon reachable", "cannot test — listen host/port is missing from config.json"),
   );
   out.push(...(await appLink(io, config.appUrl, token, status)));
+  out.push(...(await environment(io, config, probe)));
 
   if (io.platform === "linux") {
     if (io.exists("/etc/systemd/system/paseo.service")) {
