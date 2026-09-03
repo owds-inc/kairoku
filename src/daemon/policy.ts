@@ -42,7 +42,13 @@ export interface RolePolicy {
   readonly allowedTools: readonly string[];
 }
 
-const READ_ONLY = ["Read", "Glob", "Grep", "TodoWrite", "Skill", MCP_PREFIX] as const;
+// "StructuredOutput" is the SDK's own tool for delivering an `outputFormat`
+// answer (§20.8, RF-017 amendment) — denying it fails every schema-bearing
+// turn closed (production, 2026-09-03: a reviewer's verdict never reached the
+// daemon). The implementer runs with no schema, so the SDK never offers it
+// the tool; listing it for all four roles here is simpler than a per-schema
+// branch and keeps the hook and the SDK's option list agreeing.
+const READ_ONLY = ["Read", "Glob", "Grep", "TodoWrite", "Skill", MCP_PREFIX, "StructuredOutput"] as const;
 
 export const POLICY: Record<RoleName, RolePolicy> = {
   implementer: {

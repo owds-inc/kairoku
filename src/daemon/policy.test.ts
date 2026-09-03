@@ -78,6 +78,15 @@ describe("policy — the matrix (§20.8, fail closed)", () => {
     expect(ask("researcher", "mcp__evil__exfiltrate", {}).allow).toBe(false);
     expect(ask("implementer", "mcp__kairoku__update_item_status", {}).allow).toBe(true);
   });
+
+  test("every role may answer with StructuredOutput", () => {
+    // Production, 2026-09-03: the SDK's own tool for `outputFormat` was on no
+    // role's list, so a reviewer/planner/researcher run with a schema was
+    // denied its only way to answer and failed closed (§20.4).
+    for (const role of ROLE_NAMES) {
+      expect(ask(role, "StructuredOutput", { verdict: "CLEAN", defects: [] }).allow).toBe(true);
+    }
+  });
 });
 
 describe("policy — the tool summary that reaches an event", () => {

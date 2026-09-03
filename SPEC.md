@@ -7,6 +7,11 @@ Build lanes: `planned/kairoku-cli-phase5-daemon-client.md` (the link) and
 `docs/plans/2026-09-02-kairoku-cli-phase6-teams.md`. This file is the build contract; changes
 to it are explicit amendments, never silent divergence. No dates, no estimates.*
 
+**Amended again for `StructuredOutput` (§20.4, §20.8), same v1.** The wire did not change. What
+changed is RF-017: every role's tool list now names the Agent SDK's own `StructuredOutput` tool
+(`daemon/structured-output`) — production found every schema-bearing reviewer, planner and
+researcher turn denied that tool and failing closed, because it was on no role's list.
+
 **Amended again for the Floor's live cadence (DECISIONS.md §23.2), same v1.** The wire did not
 change a fourth time — `update`'s body already accepted `events` for a progress report. What
 changed is WHEN they travel: curated events now flush every 2 s while a run is active, on `update`
@@ -330,7 +335,11 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   read + run, no write tool at all; planner and researcher: MCP + read-only, no shell. It fails
   closed at every branch — an unknown role, an unlisted tool, a write whose path cannot be read.
   Both providers read the same table, so they cannot drift into different ideas of what a reviewer
-  may do. **Every denial is a `deny` event** and carries its reason to the model.
+  may do. **Every denial is a `deny` event** and carries its reason to the model. Every role's list
+  also carries `StructuredOutput` — the Agent SDK's own tool for delivering an `outputFormat`
+  answer — because a schema-bearing turn (reviewer, planner, researcher) has no other way to
+  report: denying it fails the turn closed even though the model did everything asked of it
+  (production, 2026-09-03; amended by `daemon/structured-output`).
 
 - **RF-019 — a run gets its own ENVIRONMENT (§20.11, O-4).** Four things, in this order.
 
