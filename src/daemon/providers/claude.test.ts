@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { CODEGRAPH_NOTE, type CodeGraph } from "../codegraph";
 import { rolePrompt } from "../roles";
 import type { Rules } from "../rules";
 import { claudeProvider, claudeQueryOptions, postToolUseHook, preToolUseHook } from "./claude";
@@ -42,6 +43,40 @@ const result = (over: Record<string, unknown> = {}) => ({
   result: "all done",
   session_id: "sess-1",
   ...over,
+});
+
+const CODEGRAPH: CodeGraph = { bin: "/opt/homebrew/bin/codegraph", worktree: "/tmp/wt/r1" };
+
+describe("claude — §21 CodeGraph as an MCP server for the run", () => {
+  test("an indexed run gets the server, pinned to its own worktree", () => {
+    const options = claudeQueryOptions(run({ codegraph: CODEGRAPH }), {});
+    expect(options.mcpServers).toEqual({
+      codegraph: {
+        type: "stdio",
+        command: "/opt/homebrew/bin/codegraph",
+        args: ["serve", "--mcp", "-p", "/tmp/wt/r1"],
+      },
+    });
+  });
+
+  test("a run without the index gets NO mcpServers option at all", () => {
+    expect(claudeQueryOptions(run(), {})).not.toHaveProperty("mcpServers");
+  });
+
+  test("the tool is named in the prompt only when it is actually there", async () => {
+    const { query, calls } = fakeQuery([result()]);
+    const read = async (index: number): Promise<string> => {
+      const sent: Array<{ message: { content: string } }> = [];
+      for await (const m of calls[index]!.prompt as AsyncIterable<{ message: { content: string } }>) sent.push(m);
+      return sent[0]!.message.content;
+    };
+
+    await claudeProvider({ query }).launch(run({ codegraph: CODEGRAPH })).exit;
+    expect(await read(0)).toContain(CODEGRAPH_NOTE);
+
+    await claudeProvider({ query }).launch(run()).exit;
+    expect(await read(1)).not.toContain(CODEGRAPH_NOTE);
+  });
 });
 
 describe("claude — the options the SDK is handed (§20 item 1)", () => {

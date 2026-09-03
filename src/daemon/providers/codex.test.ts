@@ -263,6 +263,21 @@ afterEach(() => {
   for (const d of extra.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
+describe("codex — §21 CodeGraph as an MCP server for the run", () => {
+  test("an indexed run gets the codegraph table, pinned to its own worktree", () => {
+    const toml = codexConfigToml(
+      run({ cwd: "/tmp/wt/r1", codegraph: { bin: "/opt/homebrew/bin/codegraph", worktree: "/tmp/wt/r1" } }),
+    );
+    expect(toml).toContain("[mcp_servers.codegraph]");
+    expect(toml).toContain('command = "/opt/homebrew/bin/codegraph"');
+    expect(toml).toContain('args = ["serve", "--mcp", "-p", "/tmp/wt/r1"]');
+  });
+
+  test("a run without the index gets no codegraph table", () => {
+    expect(codexConfigToml(run())).not.toContain("mcp_servers.codegraph");
+  });
+});
+
 describe("codex — §21 the per-run project config", () => {
   test("the MCP entry names the ENV VAR and never a token, and points at the run's own app", () => {
     const toml = codexConfigToml(run({ env: { KAIROKU_PAT: "kai_secret_value", KAIROKU_URL: "https://kairoku.io" } }));
