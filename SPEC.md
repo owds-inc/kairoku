@@ -226,17 +226,25 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   that `claude plugin list --json` reports for `kairoku@kairoku-marketplace`, read through the ONE
   parser `doctor` uses (`cli/plugin.ts`'s `pickPlugin`); `~/.claude/plugins/cache/<marketplace>/
   kairoku/<version>`, which is where Claude Code actually unpacks a plugin, highest version by
-  semver; and only then a checkout beside the source. **`config.pluginPath` is a candidate, not an
-  answer** — it is validated like every other one, so a path recorded before a plugin update does
-  not outlive the version directory it names. **The checkout candidate is offered only when the
-  process is not a compiled binary**: `bun build --compile` gives `import.meta.dir` the value
-  `/$bunfs/root`, so a path derived from it can only ever resolve in development — offering it in a
-  shipped binary is how "the plugin is never handed to the SDK in production" hid behind a passing
-  suite. `kairoku setup --daemon` resolves the same way and RECORDS the result as `pluginPath`, so a
-  released daemon starting cold on a provisioned machine does not have to resolve anything; `kairoku
-  doctor` prints the directory a launched run will be given (`kairoku plugin path`) as a check
-  separate from `kairoku plugin installed`, because those two facts came apart in exactly the way
-  that made every Claude run on a "PASS" machine refuse.
+  semver; and only then a checkout beside the source. **A cache entry that is not a semver version
+  is SKIPPED, never a throw** — `Bun.semver.order` raises `Invalid SemVer` rather than ordering one,
+  and both triggers are ordinary (Finder writes `.DS_Store` into any directory a person opens, and
+  Claude Code names the version directory with a commit hash when a marketplace entry carries no
+  version), so the entries are filtered to valid semver BEFORE they are sorted and a stray one is
+  ignored exactly like a directory with no manifest. **The candidates are evaluated LAZILY, in
+  order** — each is produced only when the one before it failed to validate, so a `config.pluginPath`
+  that still exists costs no `claude plugin list --json`, a synchronous ~210 ms spawn
+  `productionProviders()` would otherwise pay once per dispatch. **`config.pluginPath` is a
+  candidate, not an answer** — it is validated like every other one, so a path recorded before a
+  plugin update does not outlive the version directory it names. **The checkout candidate is
+  offered only when the process is not a compiled binary**: `bun build --compile` gives
+  `import.meta.dir` the value `/$bunfs/root`, so a path derived from it can only ever resolve in
+  development — offering it in a shipped binary is how "the plugin is never handed to the SDK in
+  production" hid behind a passing suite. `kairoku setup --daemon` resolves the same way and
+  RECORDS the result as `pluginPath`, so a released daemon starting cold on a provisioned machine
+  does not have to resolve anything; `kairoku doctor` prints the directory a launched run will be
+  given (`kairoku plugin path`) as a check separate from `kairoku plugin installed`, because those
+  two facts came apart in exactly the way that made every Claude run on a "PASS" machine refuse.
 
 - **RF-015 — recipes.** A team is deterministic code over run records, testable against a fake
   provider, never an agent deciding whom to spawn. `solo` (implementer → QA); `build-verify`

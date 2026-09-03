@@ -135,14 +135,19 @@ export function resolvePluginPath({
   installed = installedPluginPath,
   exists = existsSync,
 }: PluginLookup = {}): string | undefined {
-  const candidates = [
-    configured,
-    installed(),
-    ...cachedPlugins(home),
+  // LAZY, in order: `??` produces each candidate only when the one before it
+  // did not validate, so a configured path that still exists costs no `claude
+  // plugin list --json` — a ~210 ms synchronous spawn that `productionProviders`
+  // would otherwise pay on every dispatch.
+  const ok = (path: string | undefined) =>
+    path !== undefined && exists(join(path, ".claude-plugin", "plugin.json")) ? path : undefined;
+  return (
+    ok(configured) ??
+    ok(installed()) ??
+    cachedPlugins(home).find(ok) ??
     // A compiled binary has no checkout beside it, and `/$bunfs` is the marker.
-    moduleDir.includes("$bunfs") ? undefined : join(dirname(dirname(moduleDir)), "..", "plugin"),
-  ];
-  return candidates.find((path) => path !== undefined && exists(join(path, ".claude-plugin", "plugin.json")));
+    (moduleDir.includes("$bunfs") ? undefined : ok(join(dirname(dirname(moduleDir)), "..", "plugin")))
+  );
 }
 
 /** `claude plugin list --json`, through the shared parser. Absent claude = no answer. */
@@ -163,6 +168,13 @@ function cachedPlugins(home: string): string[] {
   return ls(cache).flatMap((marketplace) => {
     const dir = join(cache, marketplace, PLUGIN_NAME);
     return ls(dir)
+      // `Bun.semver.order` RAISES on a non-semver string rather than ordering
+      // it, and a throw inside `sort` escapes the resolver entirely. Finder
+      // writes `.DS_Store` into any directory a person opens, and Claude Code
+      // names the version directory with a commit hash when a marketplace entry
+      // carries no version — so filter to a total comparator's domain first,
+      // and skip a stray entry the way a directory with no manifest is skipped.
+      .filter((version) => Bun.semver.satisfies(version, "*"))
       .sort((a, b) => Bun.semver.order(b, a))
       .map((version) => join(dir, version));
   });

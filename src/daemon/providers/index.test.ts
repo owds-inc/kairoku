@@ -14,10 +14,12 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pluginPathFor } from "../../cli/doctor";
 import { pickPlugin } from "../../cli/plugin";
+import { fakeIo } from "../../cli/testkit";
 import { productionProviders, resolvePluginPath } from "./index";
 import type { RoleRun } from "./types";
 
@@ -168,5 +170,62 @@ describe("resolvePluginPath — where a RELEASED binary finds the plugin", () =>
     expect(resolvePluginPath({ configured, home, moduleDir: bunfs, installed: none })).toBe(configured);
     rmSync(configured, { recursive: true, force: true });
     expect(resolvePluginPath({ configured, home, moduleDir: bunfs, installed: none })).toBe(join(cacheDir(home), "2.3.0"));
+  });
+
+  /**
+   * THE COMPARATOR MUST BE TOTAL. `Bun.semver.order` does not return a number
+   * for a non-semver string — it raises `Invalid SemVer`, and a throw inside
+   * `Array.prototype.sort` propagates straight out of `resolvePluginPath`, past
+   * `productionProviders`, into `doctor`, `setup --daemon` and the daemon's own
+   * link start. Both triggers are ordinary: macOS Finder writes `.DS_Store`
+   * into any directory a person opens, and Claude Code names the version
+   * directory with a commit hash whenever a marketplace entry carries no
+   * version (five such installPaths on one developer box). A stray entry is
+   * skipped exactly like a directory with no `.claude-plugin/plugin.json`.
+   */
+  test("a stray non-semver entry beside the versions is SKIPPED, never a throw", () => {
+    plant(join(cacheDir(home), "2.2.0"));
+    plant(join(cacheDir(home), "2.10.0"));
+    writeFileSync(join(cacheDir(home), ".DS_Store"), "");
+    plant(join(cacheDir(home), "06403d54c6c0"));
+    expect(resolvePluginPath({ home, moduleDir: bunfs, installed: none })).toBe(join(cacheDir(home), "2.10.0"));
+  });
+
+  test("a cache of NOTHING BUT non-semver entries resolves undefined, and still does not throw", () => {
+    mkdirSync(cacheDir(home), { recursive: true });
+    writeFileSync(join(cacheDir(home), ".DS_Store"), "");
+    plant(join(cacheDir(home), "06403d54c6c0"));
+    expect(resolvePluginPath({ home, moduleDir: bunfs, installed: none })).toBeUndefined();
+  });
+
+  /**
+   * LAZY, IN ORDER. `claude plugin list --json` is a ~210 ms synchronous spawn,
+   * and `productionProviders()` runs once per dispatch — so it must not happen
+   * at all when the configured path still validates.
+   */
+  test("a configured path that validates spawns no `claude plugin list`", () => {
+    const configured = plant(join(home, "opt", "plugin"));
+    let listed = 0;
+    const path = resolvePluginPath({
+      configured,
+      home,
+      moduleDir: bunfs,
+      installed: () => {
+        listed++;
+        return undefined;
+      },
+    });
+    expect(path).toBe(configured);
+    expect(listed).toBe(0);
+  });
+
+  /** The two commands that crashed on a Finder-visited cache, through the resolver they share. */
+  test("doctor and setup survive a .DS_Store in the cache", async () => {
+    plant(join(cacheDir(home), "2.2.0"));
+    writeFileSync(join(cacheDir(home), ".DS_Store"), "");
+    const io = fakeIo({ home, exists: existsSync });
+    io.bins.add("claude");
+    io.canned["claude plugin list --json"] = { stdout: "[]" };
+    expect(await pluginPathFor(io, undefined)).toBe(join(cacheDir(home), "2.2.0"));
   });
 });
