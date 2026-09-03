@@ -78,7 +78,8 @@ its content changes. It ends with what only a human can do (`claude` login,
 kairoku setup --daemon --app-url https://kairoku.io --app-token kai_…
 kairoku daemon                          # foreground, until SIGTERM
 kairoku daemon install|start|stop|status   # systemd unit kairoku-daemon (linux) / launchd agent io.kairoku.daemon (mac)
-kairoku daemon prune                    # remove stale run worktrees — asks first, never deletes a branch
+kairoku daemon prune                    # remove stale run worktrees and orphaned compose projects — asks first, never deletes a branch
+kairoku env set|import|list|rm          # the values this machine holds for a repo's runs
 kairoku doctor                          # PASS/WARN/FAIL per check; nonzero on FAIL
 ```
 
@@ -97,6 +98,8 @@ All keys optional:
   "repoUrl": "https://github.com/bikerwhocodes/kairoku.git",
   "worktreesDir": "/home/neil/.kairoku/worktrees",
   "runsDir": "/home/neil/.kairoku/runs",
+  "envDir": "/home/neil/.kairoku/env",
+  "ports": "20000-29999",
   "keepWorktreeOnFailure": false,
   "defaultTimeoutSec": 3600,
   "killGraceMs": 5000,
@@ -107,6 +110,77 @@ All keys optional:
 `maxConcurrent` is a hard gate, not a hint: a member claimed past the limit
 waits for a slot rather than being refused, and two overlapping dispatches can
 never put more members on the machine than it has slots.
+
+`ports` is the range per-run service ports are allocated from. A value that does
+not parse falls back to `20000-29999` with one warning rather than refusing to
+start: it matters only to repos that declare a compose profile.
+
+## A run's environment
+
+A repo describes what its runs need in a **`kairoku.json`** at its root, and the
+daemon reads it from the **committed base branch** — `git show
+origin/<defaultBranch>:kairoku.json` — never from the worktree the implementer
+is editing in. No `kairoku.json` means the previous behaviour, unchanged.
+
+```json
+{
+  "setup": ["bun install"],
+  "env": {
+    "test": {
+      "files": [".env.local"],
+      "compose": "compose.test.yml",
+      "ports": ["PG_PORT", "PROXY_PORT"],
+      "inject": {
+        "DATABASE_URL": "postgres://postgres:postgres@127.0.0.1:${PG_PORT}/main"
+      },
+      "init": ["bun run db:migrate"]
+    }
+  },
+  "check": ["bunx tsc --noEmit", "bun run lint"],
+  "test": "bun test",
+  "concurrency": { "test": 2 }
+}
+```
+
+Unknown keys are ignored, so a `"$comment"` costs nothing. Anything the daemon
+does read is type-checked, and an error names the path: `kairoku.json:
+env.test.ports[1] must be a string`. An invalid manifest fails the run before a
+worktree is cut.
+
+Values merge **low to high**:
+
+| | Layer | Where it comes from |
+|---|---|---|
+| 1 | the checkout's dotenv | the profile's `files[]`, copied into the worktree with the rest of `.env*` |
+| 2 | this machine's store | `~/.kairoku/env/<owner>/<repo>/<profile>.env`, mode 0600 — `kairoku env` |
+| 3 | the project's secrets | delivered in the claim; a `{ ref }` is resolved **here** |
+| 4 | the run's own | the allocated ports, `inject` with `${PORT}` substituted, then `KAIROKU_RUN_ID`, `KAIROKU_DISPATCH_ID` and `KAIROKU_PAT` |
+
+Layer 3 never touches a disk: it lives in this process and in the environment of
+the processes it launches. A reference is `op://…` through the 1Password CLI or
+an AWS Secrets Manager ARN through the `aws` CLI. When one cannot be resolved the run fails
+**naming the key** — never the value, and never the locator, because a vault
+path names the vault, the item and the field, and failure text ends up in the
+app's run log. Every delivered value is masked out of the events and the local
+log before the first line is written.
+
+Each run then gets its own ports (a bind probe inside `ports`, reserved so two
+members cannot pick the same number), its own compose project
+(`docker compose -p kairoku-<runId> -f <compose> up --wait`), its own `init[]`,
+and a `down -v` on **every** exit path — done, failed, cancelled, timed out, or
+the daemon shutting down. Everything binds `127.0.0.1`; the daemon passes port
+numbers and the repo's compose file decides the interface.
+
+```sh
+kairoku env set STRIPE_KEY=sk_live_…        # this repo, profile `test`
+kairoku env import ./prod.env --profile staging
+kairoku env list                            # the NAMES held here, never the values
+kairoku env rm STRIPE_KEY
+```
+
+`--repo <owner/name>` and `--profile <name>` pick another store; the default
+repo is the origin of the checkout in `config.json`, and a checkout whose origin
+cannot be read is refused rather than guessed at.
 
 `pluginPath` is written for you by `kairoku setup --daemon` and is only worth
 setting by hand when the plugin lives somewhere unusual. Left out, the daemon
@@ -195,11 +269,16 @@ and the formula in `owds-inc/homebrew-tap` all read from it (copy the released
 | `src/cli/main.ts` | the CLI entry: one command per first argument |
 | `src/cli/setup.ts`, `provision.ts` | the wizard and the machine steps |
 | `src/cli/daemon.ts`, `service.ts` | `kairoku daemon` and the systemd / launchd service files |
+| `src/cli/env.ts` | `kairoku env` — the value store; `list` prints names, never values |
 | `src/cli/doctor.ts`, `plugin.ts`, `update.ts` | the other commands; `io.ts` is the seam every command is tested through |
 | `src/daemon/app.ts` | the app client — the ONLY outbound module; three routes, four result tags |
 | `src/daemon/link.ts` | the loop: the two timers, backoff, the 401 stop, the reports |
 | `src/daemon/dispatch.ts` | a claim becomes a TEAM: one member per item, the run files, the PR url, the restart rule |
 | `src/daemon/recipes.ts` | the six teams as state machines over run records — the fix loops live here |
+| `src/daemon/manifest.ts` | `kairoku.json` from the base branch: a non-strict parser whose errors carry the JSON path |
+| `src/daemon/env.ts` | the four value layers, the 0600 store, and `{ ref }` resolution that fails by name |
+| `src/daemon/compose.ts` | port allocation (bind probe + reservation) and the per-run compose project |
+| `src/daemon/environment.ts` | one run's environment, prepared and torn down — the wiring of the three above |
 | `src/daemon/qa.ts` | the deterministic QA step: the repo's own commands — its own package scripts, through the package manager its lockfile names — and one summary parser per runner |
 | `src/daemon/policy.ts` | the per-role tool policy as data, and the one function both providers apply |
 | `src/daemon/models.ts` | what this machine advertises: repos, providers → models, recipes |
@@ -211,7 +290,7 @@ and the formula in `owds-inc/homebrew-tap` all read from it (copy the released
 | `src/daemon/worktree.ts` | `git worktree` create/teardown, `.env*` seeding, enumeration |
 | `src/daemon/events.ts` | the full per-run JSONL, and the bounded curated buffer the beat drains |
 | `src/daemon/config.ts` | config file, env token, bind validation |
-| `src/daemon/prune.ts` | the human-run cleanup CLI |
+| `src/daemon/prune.ts` | the human-run cleanup CLI: stale worktrees and orphaned `kairoku-…` compose projects |
 | `plugin/`, `.claude-plugin/` | the Claude Code plugin and its marketplace manifest |
 
 **One runtime dependency**, `@anthropic-ai/claude-agent-sdk`, pinned and

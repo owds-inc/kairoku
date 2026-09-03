@@ -7,6 +7,13 @@ Build lanes: `planned/kairoku-cli-phase5-daemon-client.md` (the link) and
 `docs/plans/2026-09-02-kairoku-cli-phase6-teams.md`. This file is the build contract; changes
 to it are explicit amendments, never silent divergence. No dates, no estimates.*
 
+**Amended again for environments (§20.11, O-4), same v1.** The wire did not change a third time.
+What changed is what a member is GIVEN: its own `kairoku.json` profile, its own merged environment,
+its own ports and its own compose project, torn down on every exit path. The amendments are marked
+inline: RF-010 and RF-016, plus RF-019 which is new. Nothing was added to the daemon's dependency
+list — the manifest validator is hand-written, because §20.2 names exactly one runtime dependency
+and `constraints.test.ts` enforces the count.
+
 **Amended for teams (§20.2, §20.4–8 and the grill), same v1.** The wire did not change; what runs
 behind it did. A dispatch is a TEAM now — one member per item, each in its own worktree, driven by
 a recipe through one of two providers, gated by a reviewer's structured verdict and a deterministic
@@ -192,6 +199,14 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   cancel, and daemon shutdown (SIGTERM kills children, marks running runs, writes final events).
   Agent processes spawn in their own process group; kill is group-wide (no orphans). Worktree
   teardown runs unless the run failed and `keepWorktreeOnFailure` is set.
+  **AMENDED (O-4): the RUN ENVIRONMENT comes down first, and unconditionally.** `ExecContext`
+  carries an `onTeardown(fn)` the member's body registers BEFORE it knows whether its environment
+  even came up, and `RunStore` runs it ahead of the worktree step on every path above — because
+  `docker compose down` needs the compose file that lives in the worktree, and because a project
+  that came up before the init step failed must not outlive the run. It runs even under
+  `keepWorktreeOnFailure`: a kept worktree is for reading a failure, and containers left running
+  are not evidence, they are a machine that slowly fills up. It cannot throw into the run's exit
+  path — a teardown that throws is a run that never reports.
 
 ## The team requirements (new in the teams amendment)
 
@@ -267,7 +282,8 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
 
 - **RF-016 — the QA step is deterministic and has no model** (grill Q2). It runs the repo's
   `kairoku.json` `check[]` then `test`, or package.json's `lint`/`build`/`test` when there is no
-  manifest, in the member's worktree, and parses the runner's own summary — one parser per known
+  manifest, in the member's worktree **with the run's own merged environment (O-4)**, and parses
+  the runner's own summary — one parser per known
   runner (bun, vitest, jest, `go test -v`). **The package.json fallback runs the package's OWN
   scripts, through the package manager its lockfile names** (`bun.lock`/`bun.lockb` → `bun run`,
   `pnpm-lock.yaml` → `pnpm run`, `yarn.lock` → `yarn`, else `npm run`) — never `bun test` in place
@@ -280,12 +296,64 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   last 100 lines as the defect and feeds the implementer's fix loop exactly as a reviewer's defects
   do. `concurrency.test` bounds how many suites run at once, else one at a time.
 
+  **AMENDED (O-4), two ways.** The manifest is the one read from the BASE BRANCH (RF-019), handed
+  in rather than read out of the worktree a second time: the worktree is where the implementer is
+  editing, and a gate whose `check` and `test` commands the agent under review can rewrite is not a
+  gate. And the `concurrency.test` semaphore is keyed **per repo**, not per limit — two repos that
+  both said `2` are two queues, and keying by the number made a daemon holding two checkouts
+  serialise them against each other for no reason either repo could see. The suite also inherits
+  the run's merged environment rather than the daemon's: a suite given the machine's own
+  `DATABASE_URL` runs green against the developer's database while the run's own compose project
+  sits there untouched.
+
 - **RF-017 — the tool policy is data, and one function applies it** (§20.8). implementer:
   read/edit/write/run, and every write path must resolve INSIDE that member's worktree; reviewer:
   read + run, no write tool at all; planner and researcher: MCP + read-only, no shell. It fails
   closed at every branch — an unknown role, an unlisted tool, a write whose path cannot be read.
   Both providers read the same table, so they cannot drift into different ideas of what a reviewer
   may do. **Every denial is a `deny` event** and carries its reason to the model.
+
+- **RF-019 — a run gets its own ENVIRONMENT (§20.11, O-4).** Four things, in this order.
+
+  **The manifest.** `kairoku.json` at the repo root, read with
+  `git show origin/<defaultBranch>:kairoku.json` against the configured checkout — **never the
+  worktree**, for the RF-016 reason above, and read ONCE per dispatch so that every member of a
+  team runs the same contract even if someone pushes to the base branch mid-fan-out. It is
+  NON-STRICT about keys it does not know (the app repo's own manifest carries a `"$comment"`
+  pointing at the ruling, and a schema that refused it would make documenting the file a build
+  failure) and strict about the type of every key it reads, with the JSON **path** in the error —
+  `env.test.ports[1] must be a string`, never "invalid manifest". A `compose` that is absolute or
+  contains `..` is refused: it is a file this daemon runs with the run's own secrets exported into
+  it. An invalid manifest fails the run before a worktree is cut. **No manifest → today's
+  behaviour**, exactly.
+
+  **The values, merged low → high.** (1) the profile's `files[]`, read from the worktree where the
+  base checkout's `.env*` were already copied; (2) `~/.kairoku/env/<owner>/<repo>/<profile>.env`,
+  mode 0600, written by `kairoku env set|import|list|rm` — `list` prints names and never values;
+  (3) the claim's `env.secrets`, a value or a `{ref}` resolved HERE (`op read` for `op://`,
+  `aws secretsmanager get-secret-value` for an ARN) and held in memory only, never written under
+  `~/.kairoku` and never into the worktree; (4) per-run — the allocated ports, the profile's
+  `inject{}` with `${PORT}` substituted, then `KAIROKU_RUN_ID` and `KAIROKU_DISPATCH_ID`, then
+  `KAIROKU_PAT` last, so that a manifest naming `KAIROKU_PAT` in its `inject` cannot hand the agent
+  a credential of the repo's choosing. **A failure names the KEY and nothing else** — not the
+  value, not the `op://…` that names the vault, the item and the field, and not the resolver's
+  stderr (vault CLIs routinely echo the locator they failed on). Failure text reaches the app's run
+  log, which is read by everyone who can see the project. Every delivered value joins the run's
+  masking set BEFORE the first event can be written.
+
+  **Ports and services.** `ports: "20000-29999"` in config.json. Allocation is a bind probe from a
+  random offset with a **process-wide reservation**, because the probe must close the socket before
+  compose can open it and the next member of the same daemon would otherwise probe the same free
+  number a millisecond later; the reservation is released at teardown. Then
+  `docker compose -p kairoku-<runId> -f <compose> up --wait` with the ports exported, the profile's
+  `init[]` in the worktree with the merged environment, and the role launch. The bind ADDRESS is
+  the repo's compose file's business, never this daemon's — it passes numbers. The allocated ports
+  are recorded in the run's json.
+
+  **Teardown** is RF-010's, amended above. `kairoku daemon prune` also offers orphaned
+  `kairoku-<something>` projects and takes them down with `-v`; the bare `kairoku` project is never
+  offered, because that is what `docker compose up` in the app checkout creates and pruning it
+  would stop the machine owner's own database.
 
 - **RF-018 — the per-run wall clock.** `limits.runSeconds` from the claim, default 3600. A member
   that passes it is interrupted, torn down and reported `failed` / "time limit". A run that will
@@ -346,8 +414,12 @@ confirm, remove) — never an automatic sweep.
 ## Config
 
 `~/.kairoku/config.json` (`KAIROKU_DAEMON_CONFIG` overrides the path): `{ listen, appUrl,
-defaultBranch, maxConcurrent, repoPath, repoUrl?, worktreesDir?, runsDir?, keepWorktreeOnFailure?,
-defaultTimeoutSec?, killGraceMs? }`. Credentials via `KAIROKU_DAEMON_TOKEN` /
+defaultBranch, maxConcurrent, repoPath, repoUrl?, worktreesDir?, runsDir?, envDir?, ports?,
+keepWorktreeOnFailure?, defaultTimeoutSec?, killGraceMs? }`. `ports` is the O-4 range (default
+`"20000-29999"`); a value that does not parse falls back to the default with one warning rather
+than refusing to start, because it matters only to repos with a compose profile and taking a whole
+machine offline over a typo in a field most repos never use is the wrong trade. `envDir` (default
+`~/.kairoku/env`) is the value store `kairoku env` writes. Credentials via `KAIROKU_DAEMON_TOKEN` /
 `KAIROKU_AGENT_TOKEN` in the environment or `~/.kairoku/token.env` (mode 600), never config.json.
 `~/.hikyaku/`, `HIKYAKU_TOKEN` and `HIKYAKU_CONFIG` are honoured for one version with a deprecation
 line and a one-time copy of the directory.
@@ -365,6 +437,13 @@ all three end with PR urls and four counts in the app, the run detail shows the 
 cancelling one run interrupts only that member within one beat, and the beat advertises the repos,
 models and recipes the composer greys its dropdowns against.
 
+**With environments (amended, O-4):** two `build-verify` members on one machine at the same time
+each get their own compose project and their own allocated port, the init step reaches a service on
+the port it was told it had, both QA steps report four counts, the app's delivered secret appears in
+neither log, and no `kairoku-<runId>` project is left standing. Against the app repo that is
+postgres and the proxy per run; in this repo's own suite it is one redis, and the case SKIPS with a
+printed reason where Docker is not usable — no test pulls an image.
+
 Plus: the full `bun test` suite green **with counts reported**, `tsc --noEmit` clean,
 `claude plugin validate plugin/` passing, and tests covering the beat cadence, the capacity gate,
 the double-claim guard, the 401 stop, the backoff, the report contents, the restart rule, the
@@ -374,15 +453,18 @@ truncation/masking/overflow, and cancel.
 
 ## Deliberately out of v1 (each is a named lane)
 
-`kairoku.json` environments, compose per run, per-run ports, secrets client-side (**O-4** — the QA
-step reads the manifest's `check`/`test`/`concurrency.test` and nothing else) · live terminal
-attach/steering · scheduling · providers beyond two · custom recipes and an agent-led lead role ·
+live terminal attach/steering · scheduling · providers beyond two · custom recipes and an agent-led lead role ·
 per-item claims across daemons · a repo map with auto-clone · any auto-approval of agent permission
 requests (no trigger — this is a gate, not a backlog item).
 
 Delivered since v1 was ratified, and no longer out: recipes beyond `solo`, the Agent SDK provider,
 the four role agents, the per-role tool policy, curated events over the beat, cancel from the app
-(**O-3**) · per-run MCP tokens and the runs/events tables (**O-2**).
+(**O-3**) · per-run MCP tokens and the runs/events tables (**O-2**) · `kairoku.json` environments,
+compose per run, per-run ports and secrets client-side (**O-4**, RF-019).
+
+Still out, and named: a second service engine besides compose · vault resolvers beyond 1Password
+and AWS Secrets Manager · end-to-end secret encryption (the app server can decrypt — recorded
+honestly in §20.11) · a lock that bounds suites across two daemons sharing one machine.
 
 ---
 
