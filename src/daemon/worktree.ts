@@ -36,13 +36,21 @@ export function branchFor(runId: string): string {
   return `${RUN_BRANCH_PREFIX}${runId}`;
 }
 
+/**
+ * `env` REPLACES the daemon's own environment when it is given, rather than
+ * being layered on top of it (O-4). A run's environment is the merge §20.11
+ * defines and nothing else: inheriting `process.env` here would put the
+ * daemon's own `DATABASE_URL` under a profile that did not name one, which is
+ * the machine's database and not the run's.
+ */
 export async function run(
   command: string[],
   cwd: string,
+  env?: Record<string, string>,
 ): Promise<CommandResult> {
   let proc;
   try {
-    proc = Bun.spawn(command, { cwd, stdout: "pipe", stderr: "pipe" });
+    proc = Bun.spawn(command, { cwd, stdout: "pipe", stderr: "pipe", ...(env === undefined ? {} : { env }) });
   } catch (err) {
     // A missing cwd surfaces from Bun as ENOENT against the *binary*, which
     // reads as "git is not installed". Name the directory instead.
