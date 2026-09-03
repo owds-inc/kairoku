@@ -27,7 +27,7 @@ import {
 } from "./dispatch";
 import { reserved } from "./compose";
 import { parseManifest } from "./manifest";
-import type { Rules } from "./rules";
+import { PATTERNS_PATH, type Rules } from "./rules";
 import { RunStore } from "./runs";
 import { rolePrompt, rolesWithPrompts } from "./roles";
 import { ROLE_NAMES } from "./policy";
@@ -732,4 +732,33 @@ describe("dispatch — §21 the repo's own rules", () => {
     expect(reads).toBe(1);
   });
 
+});
+
+describe("§21 Q6/Q7 — the patterns.md convention reaches every role, on both hosts", () => {
+  const repoDir = join(import.meta.dir, "..", "..");
+
+  test("every daemon role prompt names the memory files it must read first", () => {
+    for (const role of ROLE_NAMES) {
+      const prompt = rolePrompt(role);
+      expect({ [role]: prompt.includes(PATTERNS_PATH) }).toEqual({ [role]: true });
+      expect({ [role]: /AGENTS\.md|CLAUDE\.md/.test(prompt) }).toEqual({ [role]: true });
+    }
+  });
+
+  test("the plugin's implementer and reviewer say the same thing — one convention, two hosts", () => {
+    for (const agent of ["implementer", "reviewer"]) {
+      const text = readFileSync(join(repoDir, "plugin", "agents", `${agent}.md`), "utf8");
+      expect({ [agent]: text.includes(PATTERNS_PATH) }).toEqual({ [agent]: true });
+    }
+  });
+
+  test("ONE WRITER (§21 Q7): the reviewer treats a change outside the item's scope as a defect", () => {
+    for (const text of [
+      rolePrompt("reviewer"),
+      readFileSync(join(repoDir, "plugin", "agents", "reviewer.md"), "utf8"),
+    ]) {
+      expect(text).toContain(PATTERNS_PATH);
+      expect(text.toLowerCase()).toContain("defect");
+    }
+  });
 });

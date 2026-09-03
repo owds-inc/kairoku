@@ -1,0 +1,18 @@
+id: bun-spawn-resolved-path
+valid:
+  # The resolved value is what runs.
+  - |
+    const gh = Bun.which("gh");
+    export const p = Bun.spawn([gh, "pr", "view"], { cwd: repo });
+  # No `which` for this command at all: a different question, not this rule's.
+  - |
+    export const p = Bun.spawn(["bun", "test"], { cwd: repo });
+  # A resolved binary beside an unrelated bare one is still not this defect.
+  - |
+    const gh = Bun.which("gh");
+    export const p = Bun.spawn(["glab", "mr", "view"], { cwd: repo });
+invalid:
+  # PR #7 defect 5, exactly.
+  - |
+    const gh = Bun.which("gh");
+    export const p = Bun.spawn(["gh", "pr", "view"], { cwd: repo });

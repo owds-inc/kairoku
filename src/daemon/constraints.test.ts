@@ -24,6 +24,8 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { DAEMON_ROUTES } from "./app";
+import { MANIFEST_FILE, parseManifest, type Manifest } from "./manifest";
+import { RULES_PATH } from "./rules";
 
 const srcDir = import.meta.dir;
 const repoDir = join(srcDir, "..", "..");
@@ -162,5 +164,55 @@ describe("SPEC constraints", () => {
     for (const provider of [SDK_MODULE, join("providers", "codex.ts")]) {
       expect({ [provider]: /from "\.\.\/policy"/.test(sources.get(provider) ?? "") }).toEqual({ [provider]: true });
     }
+  });
+});
+
+/**
+ * §21 Q23 — THIS REPO DOGFOODS ITS OWN MANIFEST. The rules a daemon would read
+ * from `origin/main` and the commands it would run are checked here rather than
+ * only in a fixture, because a rule set nobody runs is a rule set that rots.
+ */
+describe("§21 — the CLI repo's own .kairoku", () => {
+  const read = (rel: string) => readFileSync(join(repoDir, rel), "utf8");
+
+  test("kairoku.json parses, and its commands are this repo's own scripts", () => {
+    const parsed = parseManifest(read(MANIFEST_FILE));
+    expect(parsed.ok).toBe(true);
+    const manifest = (parsed as { manifest: Manifest }).manifest;
+    expect(manifest.test).toBe("bun test");
+    expect(manifest.check).toContain("bunx tsc --noEmit");
+    // The rule fixture is part of the gate: a rule whose own test broke is a
+    // rule that has stopped meaning what it says.
+    expect(manifest.check).toContain("ast-grep test");
+    const scripts = (JSON.parse(readFileSync(join(repoDir, "package.json"), "utf8")) as {
+      scripts: Record<string, string>;
+    }).scripts;
+    expect(scripts.test).toBe("bun test");
+  });
+
+  test("the manifest asks for NO ast-grep entry — the gate is automatic, not opt-in", () => {
+    expect(read(MANIFEST_FILE)).not.toContain("ast-grep scan");
+  });
+
+  test("rule 3 is present, is valid YAML for ast-grep, and cites the defect it exists for", () => {
+    const rule = read(join(RULES_PATH, "bun-spawn-resolved-path.yml"));
+    expect(rule).toContain("id: bun-spawn-resolved-path");
+    expect(rule).toContain("language: TypeScript");
+    expect(rule).toContain("severity: error");
+    // §21 Q10: a rule ships only if it would have caught a real defect, and cites it.
+    expect(rule).toContain("PR #7 defect 5");
+    expect(rule).toContain("Bun.which($CMD)");
+  });
+
+  test("the plugin ships NO rules of its own (§21 Q10)", () => {
+    const inPlugin = readdirSync(join(repoDir, "plugin"), { withFileTypes: true }).map((e) => e.name);
+    expect(inPlugin).not.toContain(".kairoku");
+    expect(inPlugin).not.toContain("rules");
+  });
+
+  test("sgconfig.yml points at the same rules the daemon would materialise", () => {
+    const config = read("sgconfig.yml");
+    expect(config).toContain(RULES_PATH);
+    expect(config).toContain(".kairoku/rule-tests");
   });
 });

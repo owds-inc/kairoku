@@ -388,6 +388,58 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   not stop is a slot that never comes back, which is worse for the next dispatch than this one
   failing.
 
+- **RF-020 — a run is held to the REPO'S OWN RULES, in two layers (§21).** `.kairoku/rules/*.yml`
+  in the target repo, in ast-grep's own rule format, read with `git ls-tree` + `git show` against
+  `origin/<defaultBranch>` — **never the worktree**, for RF-019's reason and one more: a rule an
+  agent can delete inside its own PR is not a rule, so a rule change takes effect after the merge
+  and not before it. Materialised once per dispatch into the run's scratch dir, with a generated
+  `sgconfig.yml` beside them, because `ast-grep scan -r` takes one file and a directory needs a
+  config. **No `.kairoku/rules` on the base branch → nothing runs**, and one line says so.
+
+  **Layer one, the hook at the write.** A `PostToolUse` hook on `Write|Edit` (Claude) beside the
+  unconditional `PreToolUse` policy hook of RF-017. ast-grep runs on the real file after the write —
+  no temp-file reconstruction — and a match returns the SDK's blocking result carrying the rule's
+  `message` and its `note`, which is the DEFECT the rule exists for. "Block" stops the AGENT, not
+  the disk. Three things pass silently here: a file outside the worktree, a file no rule's language
+  parses, and a scan this daemon cannot read — each is caught one layer down.
+
+  **Layer two, QA, the gate of record.** Whenever rules were materialised, `qa.ts` scans the whole
+  worktree BEFORE the manifest's `check` commands, and any match fails QA with the rule ids and
+  `file:line` in the defect text the fix loop is handed. **No manifest entry asks for this.** It is
+  automatic on the presence of the directory, so a repo cannot opt its own gate out in the same file
+  the gate reads. A scan that cannot be parsed fails QA too — `[]` from ast-grep is proof the scan
+  ran; empty output from a broken scanner is proof of nothing.
+
+  **Fail closed on a missing ast-grep.** A repo whose base branch declares rules, on a machine with
+  no `ast-grep`, fails the run at environment settlement naming ast-grep — before a worktree is cut,
+  exactly as a `{ref}` nobody here can resolve does. `kairoku setup --daemon` installs it beside the
+  agent CLIs and `kairoku doctor` reports it, together with the rule count on the configured repo's
+  base branch (absent + rules = FAIL, absent + no rules = WARN).
+
+  **Codex parity.** The daemon writes `.codex/config.toml` and `.codex/hooks.json` into the worktree
+  fresh per run and adds them to the checkout's `info/exclude`, so they are never part of the diff:
+  a `PostToolUse` matcher `Write|Edit` running the same materialised scan script (exit 2 with the
+  reason on stderr, Codex's blocking contract for a synchronous hook), and the `[mcp_servers.kairoku]`
+  entry with `bearer_token_env_var = "KAIROKU_PAT"` and `default_tools_approval_mode = "approve"`.
+  That entry is **per run and no longer machine-wide**: `KAIROKU_PAT` is set only inside a run, and
+  Codex prefers the bearer path once the variable is configured, so a global one gave the operator's
+  own interactive Codex `401 No authorization provided` while ignoring its OAuth login. The project
+  is trusted as a SESSION FLAG (`-c projects."<worktree>".trust_level="trusted"`) rather than by a
+  write to `~/.codex/config.toml`, because trust cannot be self-declared from inside a project config
+  and the machine should keep nothing after the run; `--dangerously-bypass-hook-trust` is passed only
+  when this daemon itself wrote a hook to run.
+
+  **Exact resolution.** `setup` installs `typescript-language-server` (with `typescript`) through bun
+  when the configured checkout has a `tsconfig.json`; Claude Code's built-in LSP tool finds it on
+  PATH, so no provider changes. `doctor` reports it as **WARN** when absent, never FAIL: a machine
+  without it still runs every role, the implementer just greps for a symbol instead of resolving it.
+
+  **Memory is versioned files (§21 Q6/Q7).** Every role prompt — the plugin's agents and the
+  daemon's own — says to read `AGENTS.md` (or `CLAUDE.md`) and `.kairoku/patterns.md` before the
+  first write. One writer per resource: an agent may change `patterns.md` only inside its own item's
+  scope, and the reviewer treats any other change to it as a defect, so the human merge stays the
+  gate on what a repo says about itself. No injection machinery.
+
 ## A dispatch becomes a team
 
 One claim → one member per item, fanned out up to the slots FREE at launch (a worker pool, so the

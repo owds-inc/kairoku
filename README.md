@@ -182,6 +182,44 @@ kairoku env rm STRIPE_KEY
 repo is the origin of the checkout in `config.json`, and a checkout whose origin
 cannot be read is refused rather than guessed at.
 
+### The repo's own rules
+
+A repo can also state the code shapes it refuses, in **`.kairoku/rules/*.yml`** — ast-grep's own
+rule format — and the daemon reads those from the **committed base branch** for the same reason it
+reads `kairoku.json` there, plus one more: a rule an agent can delete inside its own pull request is
+not a rule. A rule change takes effect after the merge. No `.kairoku/rules` means nothing runs.
+
+```yaml
+id: bun-spawn-resolved-path
+language: TypeScript
+severity: error
+message: Bun.spawn must run the path Bun.which resolved, not the bare command name.
+note: >-
+  PR #7 defect 5 — a PATH change between the two ran a different binary than the one checked.
+rule:
+  all:
+    - pattern: Bun.spawn([$CMD, $$$ARGS], $$$OPTS)
+    - inside: { stopBy: end, has: { stopBy: end, pattern: Bun.which($CMD) } }
+```
+
+They are checked twice. **At the write**, as a `PostToolUse` hook on `Write|Edit`: the agent is
+stopped and handed the rule's message and the `note` — the defect the rule exists for — while the
+fix is still one edit away. **In QA**, over the whole worktree, before the manifest's `check`
+commands: any match fails the step with the rule ids and `file:line`, and the fix loop gets that
+text verbatim. Nothing in `kairoku.json` asks for either; the presence of the directory is what
+turns them on, so a repo cannot opt its own gate out in the same file the gate reads.
+
+`ast-grep` is one binary. `kairoku setup --daemon` installs it and `kairoku doctor` reports it
+beside the rule count for your base branch. A repo that declares rules on a machine that has no
+ast-grep **fails the run closed**, naming it, before a worktree is cut — the same way a secret
+reference nobody here can resolve does. Codex runs get the same layer through a
+`.codex/hooks.json` the daemon writes per run and excludes from the diff.
+
+A repo may also keep **`.kairoku/patterns.md`** — a short list of exemplar snippets with a one-line
+"why" each. Every role reads it, and its own `AGENTS.md`/`CLAUDE.md`, before the first write. An
+agent may change it only inside the item it was given; the reviewer treats any other change to it
+as a defect, so what a repo says about itself still changes through a human merge.
+
 `pluginPath` is written for you by `kairoku setup --daemon` and is only worth
 setting by hand when the plugin lives somewhere unusual. Left out, the daemon
 takes the first of these that contains `.claude-plugin/plugin.json`: the
@@ -193,8 +231,8 @@ no longer exists — a plugin update moves the version directory — is skipped
 rather than trusted. `kairoku doctor` prints the one it will use:
 
 ```
-PASS  kairoku plugin installed           2.3.0 enabled
-PASS  kairoku plugin path                /Users/you/.claude/plugins/cache/kairoku-marketplace/kairoku/2.3.0
+PASS  kairoku plugin installed           2.4.0 enabled
+PASS  kairoku plugin path                /Users/you/.claude/plugins/cache/kairoku-marketplace/kairoku/2.4.0
 ```
 
 **A Claude run with no plugin fails closed**, naming what is missing, and the

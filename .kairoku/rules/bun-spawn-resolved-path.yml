@@ -1,0 +1,25 @@
+# Rule 3 of exactly three (DECISIONS §21 Q10). A rule ships only if it would
+# have caught a defect a verifier actually found in a merged PR, and it cites it.
+#
+# It is strict by construction: the bare command is flagged ONLY when the same
+# file also resolves that exact command through `Bun.which`. A spawn with no
+# `which` beside it is somebody running a command they never resolved, which is
+# a different question; a spawn of the resolved variable is correct and is not
+# flagged. The daemon reads this file from `origin/main`, never from a worktree.
+id: bun-spawn-resolved-path
+language: TypeScript
+severity: error
+message: Bun.spawn must run the path Bun.which resolved, not the bare command name.
+note: >-
+  owds-inc/kairoku PR #7 defect 5 — `Bun.which(bin)` resolved a path and the later
+  `Bun.spawn(["gh", …])` re-resolved the bare name itself, so a PATH change between
+  the two (a service manager setting the daemon's PATH) ran a different binary than
+  the one that was checked. Pass the resolved value.
+rule:
+  all:
+    - pattern: Bun.spawn([$CMD, $$$ARGS], $$$OPTS)
+    - inside:
+        stopBy: end
+        has:
+          stopBy: end
+          pattern: Bun.which($CMD)

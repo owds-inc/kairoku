@@ -1,0 +1,6 @@
+# This repo dogfoods its own manifest (DECISIONS §21 Q23): the rules a Kairoku
+# daemon reads from `origin/main` are the same ones `ast-grep test` checks here.
+ruleDirs:
+  - .kairoku/rules
+testConfigs:
+  - testDir: .kairoku/rule-tests
