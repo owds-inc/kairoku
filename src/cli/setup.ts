@@ -25,6 +25,7 @@ import {
   DEFAULT_APP_URL,
   DEFAULT_PORT_RANGE,
   docker,
+  languageServer,
   remainder,
   runtimes,
   shellPath,
@@ -184,6 +185,9 @@ export async function daemon(
     repoUrl = opts.yes ? DEFAULT_APP_REPO : (await io.ask(`App repo to clone as the worktree base [${DEFAULT_APP_REPO}]: `)) || DEFAULT_APP_REPO;
   }
   show(await checkout(io, repoUrl));
+  // §21 item 6 — after the checkout exists, because whether this machine needs
+  // a TypeScript server is a fact about the repo it will run.
+  show(await languageServer(io, appCheckoutDir(io)));
   show(await userns(io));
   show(await codexConfig(io));
   show(await docker(io));

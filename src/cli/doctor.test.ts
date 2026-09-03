@@ -22,13 +22,13 @@ function laptop(): FakeIo {
 function linuxDaemon(): FakeIo {
   const home = "/home/tester";
   const io = fakeIo({ platform: "linux", home, uid: 1000 });
-  for (const b of ["node", "bun", "claude", "codex", "paseo", "git", "systemctl", "docker", "op"]) io.bins.add(b);
+  for (const b of ["node", "bun", "claude", "codex", "paseo", "git", "systemctl", "docker", "op", "ast-grep", "typescript-language-server"]) io.bins.add(b);
   Object.assign(io.files, {
     [`${home}/.bashrc`]: `export PATH="${home}/.bun/bin:${home}/.nvm/versions/node/v24.1.0/bin:$PATH"\n# interactive guard below\n`,
     [`${home}/.bun/bin`]: "",
     [`${home}/.nvm/versions/node/v24.1.0/bin`]: "",
     "/proc/sys/kernel/apparmor_restrict_unprivileged_userns": "0\n",
-    [`${home}/.codex/config.toml`]: 'bearer_token_env_var = "KAIROKU_PAT"\ndefault_tools_approval_mode = "approve"\n',
+    [`${home}/.codex/config.toml`]: '[mcp_servers.kairoku]\nurl = "https://kairoku.io/api/mcp"\n',
     [`${home}/.kairoku`]: "",
     [`${home}/.kairoku/config.json`]: JSON.stringify({
       listen: { host: "10.0.0.5", port: 7801 },
@@ -54,6 +54,11 @@ function linuxDaemon(): FakeIo {
     [`git -C ${home}/work/kairoku rev-parse --short HEAD`]: { stdout: "abc1234\n" },
     [`git -C ${home}/work/kairoku status --porcelain`]: { stdout: "" },
     "docker compose version": { stdout: "Docker Compose version v5.4.0\n" },
+    "ast-grep --version": { stdout: "ast-grep 0.45.2\n" },
+    "typescript-language-server --version": { stdout: "5.1.0\n" },
+    [`git -C ${home}/work/kairoku ls-tree -r --name-only origin/main -- .kairoku/rules`]: {
+      stdout: ".kairoku/rules/bun-spawn-resolved-path.yml\n.kairoku/rules/compose-loopback-ports.yml\n",
+    },
     [`git -C ${home}/work/kairoku show origin/main:kairoku.json`]: {
       stdout: JSON.stringify({ env: { test: { compose: "compose.test.yml" } }, test: "bun test" }),
     },
@@ -154,7 +159,7 @@ describe("kairoku doctor", () => {
       "PATH export is ~/.bashrc line 1": "PASS",
       "exported dirs exist": "PASS",
       "userns unrestricted": "PASS",
-      "codex MCP writes pre-approved": "PASS",
+      "codex MCP is a human login": "PASS",
       "config.json": "PASS",
       "token.env": "PASS",
       "daemon service": "PASS",
@@ -166,6 +171,9 @@ describe("kairoku doctor", () => {
       "docker compose": "PASS",
       "run port range": "PASS",
       "kairoku.json": "PASS",
+      "ast-grep": "PASS",
+      "rules on base branch": "PASS",
+      "typescript-language-server": "PASS",
       "secret resolvers": "PASS",
       "repo clean": "PASS",
     });
@@ -334,5 +342,59 @@ describe("kairoku doctor", () => {
     const check = byName(await checks(io, freeProbe), "secret resolvers");
     expect(check?.status).toBe("WARN");
     expect(check?.detail).toContain("{ref}");
+  });
+});
+
+// -------------------------------------------------------------------- §21 CI-1
+
+describe("§21 — doctor's three new lines", () => {
+  test("ast-grep: its version when present, a FAIL when the configured repo declares rules without it", async () => {
+    const io = linuxDaemon();
+    expect(byName(await checks(io, { probe: () => true }), "ast-grep")?.detail).toBe("ast-grep 0.45.2");
+
+    // Absent AND the base branch declares rules: every run of this repo would
+    // fail closed, so the machine is broken for it, not merely degraded.
+    io.bins.delete("ast-grep");
+    const broken = await checks(io, { probe: () => true });
+    expect(byName(broken, "ast-grep")?.status).toBe("FAIL");
+    expect(byName(broken, "ast-grep")?.detail).toContain(".kairoku/rules");
+  });
+
+  test("ast-grep absent on a repo with NO rules is a WARN, not a FAIL", async () => {
+    const io = linuxDaemon();
+    io.bins.delete("ast-grep");
+    io.canned["git -C /home/tester/work/kairoku ls-tree -r --name-only origin/main -- .kairoku/rules"] = { stdout: "" };
+    expect(byName(await checks(io, { probe: () => true }), "ast-grep")?.status).toBe("WARN");
+  });
+
+  test("the rule count for the configured repo's base branch", async () => {
+    const io = linuxDaemon();
+    expect(byName(await checks(io, { probe: () => true }), "rules on base branch")?.detail).toBe("2");
+    io.canned["git -C /home/tester/work/kairoku ls-tree -r --name-only origin/main -- .kairoku/rules"] = { stdout: "" };
+    expect(byName(await checks(io, { probe: () => true }), "rules on base branch")?.detail).toBe("0");
+  });
+
+  test("typescript-language-server is a WARN when absent, never a FAIL (§21 Q14)", async () => {
+    const io = linuxDaemon();
+    expect(byName(await checks(io, { probe: () => true }), "typescript-language-server")?.status).toBe("PASS");
+    io.bins.delete("typescript-language-server");
+    const list = await checks(io, { probe: () => true });
+    expect(byName(list, "typescript-language-server")?.status).toBe("WARN");
+    expect(list.filter((c) => c.status === "FAIL")).toEqual([]);
+  });
+
+  test("§21 item 5b — a global codex entry carrying the bearer env var FAILS, naming the flag", async () => {
+    const io = linuxDaemon();
+    io.files["/home/tester/.codex/config.toml"] =
+      '[mcp_servers.kairoku]\nurl = "https://kairoku.io/api/mcp"\nbearer_token_env_var = "KAIROKU_PAT"\n';
+    const list = await checks(io, { probe: () => true });
+    expect(byName(list, "codex MCP is a human login")?.status).toBe("FAIL");
+    expect(byName(list, "codex MCP is a human login")?.detail).toContain("bearer_token_env_var");
+  });
+
+  test("§21 item 5b — an OAuth-only entry passes", async () => {
+    const io = linuxDaemon();
+    io.files["/home/tester/.codex/config.toml"] = '[mcp_servers.kairoku]\nurl = "https://kairoku.io/api/mcp"\n';
+    expect(byName(await checks(io, { probe: () => true }), "codex MCP is a human login")?.status).toBe("PASS");
   });
 });
