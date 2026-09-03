@@ -1,9 +1,10 @@
 /**
  * RF-012 — the loop, against the fake app.
  *
- * The two timers are split from their policy on purpose: `beat()` and `poll()`
- * are each one turn of the loop and each returns what the scheduler needs, so
- * every rule below is asserted without waiting out a real 30-second cadence.
+ * The three timers are split from their policy on purpose: `beat()`, `poll()`
+ * and `flush()` are each one turn of the loop and each returns what the
+ * scheduler needs, so every rule below is asserted without waiting out a real
+ * 30-second cadence.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
@@ -12,6 +13,7 @@ import { appClient, type RunReport } from "./app";
 import { run as git } from "./worktree";
 import { startLink, ACTIVE_HEARTBEAT_MS, BACKOFF_START_MS, BACKOFF_MAX_MS, type Link } from "./link";
 import { pendingReports, readRunStates, runStatePath, writeRunState } from "./dispatch";
+import { EVENTS_PER_REPORT_MAX } from "./events";
 import { RunStore } from "./runs";
 import {
   fakeApp,
@@ -479,6 +481,145 @@ describe("the curated events ride the beat (§20 item 7)", () => {
     await link.beat();
     const second = app.calls.filter((c) => c.route === "heartbeat").at(-1)!.body as { runs?: RunReport[] };
     expect(second.runs!.find((r) => r.runId === "r-ev")!.events).toBeUndefined();
+    await store.shutdown();
+    await running;
+  });
+});
+
+describe("the flush timer (§23.2, DECISIONS.md — the Floor is live)", () => {
+  test("a live run's events flush over update, off the heartbeat, within one tick", async () => {
+    const { link, store, app } = setup();
+    await link.beat();
+    app.runs.set("r-flush", { dispatchId: "d-flush", taskType: "implement", status: "running", events: [] });
+    const running = store.start({
+      dispatchId: "d-flush",
+      runId: "r-flush",
+      name: "r-flush",
+      role: "implementer",
+      execute: async (ctx) => {
+        ctx.events.push("text", "reading the item");
+        ctx.events.push("tool", 'Bash {"command":"ls"}');
+        await Bun.sleep(400);
+        return { ok: true, summary: "done" };
+      },
+    });
+    await waitFor(() => store.list().length === 1, "the run");
+    await Bun.sleep(20);
+
+    await link.flush();
+
+    const updates = app.calls.filter((c) => c.route === "update");
+    expect(updates).toHaveLength(1);
+    const body = updates[0]!.body as RunReport;
+    expect(body).toMatchObject({ dispatchId: "d-flush", runId: "r-flush", status: "running" });
+    expect(body.events!.map((e) => e.kind)).toEqual(["text", "tool"]);
+    // The flush rode `update`, never the heartbeat: only the setup beat happened.
+    expect(app.calls.filter((c) => c.route === "heartbeat")).toHaveLength(1);
+
+    // Drained: a second flush with nothing new sends nothing.
+    await link.flush();
+    expect(app.calls.filter((c) => c.route === "update")).toHaveLength(1);
+
+    await store.shutdown();
+    await running;
+  });
+
+  test("no active run: the flush is a no-op", async () => {
+    const { link, app } = setup();
+    await link.beat();
+    await link.flush();
+    expect(app.calls.filter((c) => c.route === "update")).toHaveLength(0);
+  });
+
+  test("a failed flush keeps the events for the next tick — nothing is lost", async () => {
+    const { link, store, app } = setup();
+    await link.beat();
+    app.runs.set("r-retry", { dispatchId: "d-retry2", taskType: "implement", status: "running", events: [] });
+    const running = store.start({
+      dispatchId: "d-retry2",
+      runId: "r-retry",
+      name: "r-retry",
+      execute: async (ctx) => {
+        ctx.events.push("text", "line one");
+        await Bun.sleep(300);
+        return { ok: true, summary: "done" };
+      },
+    });
+    await waitFor(() => store.list().length === 1, "the run");
+    await Bun.sleep(20);
+
+    app.failWith = 503;
+    await link.flush();
+    expect(app.calls.filter((c) => c.route === "update")).toHaveLength(1); // attempted, refused
+
+    app.failWith = 0;
+    await link.flush();
+    const delivered = app.calls.filter((c) => c.route === "update");
+    expect(delivered).toHaveLength(2);
+    expect((delivered[1]!.body as RunReport).events!.map((e) => e.text)).toEqual(["line one"]);
+
+    await store.shutdown();
+    await running;
+  });
+
+  test("EVENTS_PER_REPORT_MAX still bounds one flush", async () => {
+    const { link, store, app } = setup();
+    await link.beat();
+    app.runs.set("r-bound", { dispatchId: "d-bound", taskType: "implement", status: "running", events: [] });
+    const running = store.start({
+      dispatchId: "d-bound",
+      runId: "r-bound",
+      name: "r-bound",
+      execute: async (ctx) => {
+        for (let i = 0; i < EVENTS_PER_REPORT_MAX + 5; i++) ctx.events.push("text", `line ${i}`);
+        await Bun.sleep(300);
+        return { ok: true, summary: "done" };
+      },
+    });
+    await waitFor(() => store.list().length === 1, "the run");
+    await Bun.sleep(20);
+
+    await link.flush();
+    const body = app.calls.filter((c) => c.route === "update").at(-1)!.body as RunReport;
+    expect(body.events).toHaveLength(EVENTS_PER_REPORT_MAX);
+    expect(body.events![0]!.kind).toBe("error"); // the overflow notice leads
+
+    await store.shutdown();
+    await running;
+  });
+
+  test("a 401 during a flush halts every timer, not just the beat", async () => {
+    app = fakeApp({ token: "kai_the_right_token" });
+    const h = (active = harness({ appUrl: app.url, token: "kai_the_wrong_token" }));
+    const store = new RunStore(h.config);
+    const logs: string[] = [];
+    const l = (link = startLink(store, h.config, {
+      client: appClient({ appUrl: app.url, token: "kai_the_wrong_token" }),
+      autostart: false,
+      log: (line) => logs.push(line),
+    }));
+
+    const running = store.start({
+      dispatchId: "d-401",
+      runId: "r-401",
+      name: "r-401",
+      execute: async (ctx) => {
+        ctx.events.push("text", "hello");
+        await Bun.sleep(300);
+        return { ok: true, summary: "done" };
+      },
+    });
+    await waitFor(() => store.list().length === 1, "the run");
+    await Bun.sleep(20);
+
+    await l.flush();
+    expect(l.status().stopped).toBe("token-rejected");
+    // The fake app refuses before it even logs the call — same as any 401.
+    expect(app.calls.filter((c) => c.route === "update")).toHaveLength(0);
+
+    await l.flush();
+    expect(app.calls.filter((c) => c.route === "update")).toHaveLength(0); // stopped: no retry
+
     await store.shutdown();
     await running;
   });
