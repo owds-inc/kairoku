@@ -2,12 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { checks, run, type Check } from "./doctor";
 import { fakeIo, type FakeIo } from "./testkit";
 
+const PLUGIN_PATH = "/home/tester/.claude/plugins/cache/kairoku-marketplace/kairoku/2.2.0";
 const pluginInstalled = JSON.stringify([
-  { id: "kairoku@kairoku-marketplace", version: "2.2.0", scope: "user", enabled: true },
+  { id: "kairoku@kairoku-marketplace", version: "2.2.0", scope: "user", enabled: true, installPath: PLUGIN_PATH },
 ]);
+/** What `exists` has to see for a candidate to count as a plugin. */
+const PLUGIN_MANIFEST = `${PLUGIN_PATH}/.claude-plugin/plugin.json`;
 
 function laptop(): FakeIo {
-  const io = fakeIo();
+  const io = fakeIo({ home: "/home/tester" });
+  io.files[PLUGIN_MANIFEST] = '{"name":"kairoku"}';
   io.bins.add("claude");
   io.canned["claude --version"] = { stdout: "2.1.258 (Claude Code)\n" };
   io.canned["claude plugin list --json"] = { stdout: pluginInstalled };
@@ -34,6 +38,7 @@ function linuxDaemon(): FakeIo {
     [`${home}/.kairoku/token.env`]: "KAIROKU_DAEMON_TOKEN=secret\n",
     "/etc/systemd/system/paseo.service": "",
     [`${home}/work/kairoku/.git`]: "",
+    [PLUGIN_MANIFEST]: '{"name":"kairoku"}',
   });
   io.modes[`${home}/.kairoku/token.env`] = 0o600;
   Object.assign(io.canned, {
@@ -87,10 +92,40 @@ describe("kairoku doctor", () => {
     expect(statuses(list)).toEqual({
       "claude installed": "PASS",
       "kairoku plugin installed": "PASS",
+      "kairoku plugin path": "PASS",
       "daemon configured": "WARN",
     });
     expect(byName(list, "daemon configured")?.detail).toContain("kairoku setup --daemon");
     expect(await run([], io)).toBe(0);
+  });
+
+  test("doctor names the plugin directory the daemon will hand the SDK, and FAILs closed without one", async () => {
+    // `PASS kairoku plugin installed` was true on a machine where every Claude
+    // run refused: installed says the marketplace registered it, this says the
+    // daemon can find it. The two came apart, so they are now two lines.
+    const io = laptop();
+    expect(byName(await checks(io), "kairoku plugin path")?.detail).toBe(PLUGIN_PATH);
+
+    const missing = laptop();
+    delete missing.files[PLUGIN_MANIFEST];
+    const check = byName(await checks(missing), "kairoku plugin path");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain("kairoku plugin install");
+  });
+
+  test("a pluginPath in config.json is what doctor reports — and only while it still exists", async () => {
+    const io = linuxDaemon();
+    io.files["/home/tester/.kairoku/config.json"] = JSON.stringify({
+      listen: { host: "10.0.0.5", port: 7801 },
+      appUrl: "https://app.test",
+      repoPath: "/home/tester/work/kairoku",
+      pluginPath: "/opt/kairoku/plugin",
+    });
+    io.files["/opt/kairoku/plugin/.claude-plugin/plugin.json"] = "{}";
+    expect(byName(await checks(io), "kairoku plugin path")?.detail).toBe("/opt/kairoku/plugin");
+
+    delete io.files["/opt/kairoku/plugin/.claude-plugin/plugin.json"];
+    expect(byName(await checks(io), "kairoku plugin path")?.detail).toBe(PLUGIN_PATH);
   });
 
   test("no claude on PATH is a FAIL and the plugin check is skipped", async () => {
@@ -107,6 +142,7 @@ describe("kairoku doctor", () => {
     expect(statuses(list)).toEqual({
       "claude installed": "PASS",
       "kairoku plugin installed": "PASS",
+      "kairoku plugin path": "PASS",
       "node ≥ 24": "PASS",
       "bun installed": "PASS",
       "codex installed": "PASS",

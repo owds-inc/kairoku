@@ -7,9 +7,10 @@
  */
 
 import { join } from "node:path";
-import { appClient } from "../daemon/app";
+import { appClient, PROTOCOL_VERSION } from "../daemon/app";
 import { normaliseAppUrl, parseTokenEnv } from "../daemon/config";
 import { version as binVersion, type Io } from "./io";
+import { resolvePluginPath } from "../daemon/providers";
 import { installedPlugin } from "./plugin";
 import { version as cliVersion } from "../../package.json";
 
@@ -91,6 +92,7 @@ export async function appLink(
 
   const result = await appClient({ appUrl: normaliseAppUrl(appUrl), token, fetch: io.fetch }).heartbeat({
     meta: {
+      protocol: PROTOCOL_VERSION,
       host: io.env.HOSTNAME ?? "this machine",
       version: cliVersion,
       capacity: status?.capacity ?? { running: 0, max: 0 },
@@ -108,6 +110,31 @@ export async function appLink(
   return [pass("app link", `${normaliseAppUrl(appUrl)} — ${result.body.liveness}${protocol}`), inFlight];
 }
 
+const NO_PLUGIN_PATH =
+  "no plugin directory on this machine — Claude runs will fail closed; `kairoku plugin install`, or set pluginPath in config.json";
+
+/**
+ * The daemon's own plugin resolution, run through `io` rather than the process
+ * — so `doctor` reports, and `setup --daemon` records, exactly the directory a
+ * launched run would be given, never a second opinion about it.
+ */
+export async function pluginPathFor(io: Io, configured = configuredPluginPath(io)): Promise<string | undefined> {
+  const have = await installedPlugin(io);
+  return resolvePluginPath({ configured, home: io.home, installed: () => have?.installPath, exists: io.exists });
+}
+
+/** A pluginPath already in config.json, if a daemon is configured here. A candidate: it can go stale. */
+export function configuredPluginPath(io: Io): string | undefined {
+  const home = daemonHome(io);
+  if (home === null) return undefined;
+  try {
+    const file = JSON.parse(io.readFile(join(home, "config.json")) ?? "{}") as { pluginPath?: unknown };
+    return typeof file.pluginPath === "string" ? file.pluginPath : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function checks(io: Io): Promise<Check[]> {
   const out: Check[] = [];
 
@@ -123,6 +150,12 @@ export async function checks(io: Io): Promise<Check[]> {
         ? pass("kairoku plugin installed", `${have.version ?? "?"} ${have.enabled === false ? "disabled" : "enabled"}`)
         : fail("kairoku plugin installed", "run `kairoku plugin install`"),
     );
+    // Installed and FINDABLE are two facts, and they came apart: a machine
+    // reported the plugin installed and enabled while every Claude run on it
+    // refused, because the daemon looked in directories no install ever writes.
+    // This line is the directory a launched run is actually given.
+    const path = await pluginPathFor(io);
+    out.push(path ? pass("kairoku plugin path", path) : fail("kairoku plugin path", NO_PLUGIN_PATH));
   }
 
   // -- the daemon, only where one is configured

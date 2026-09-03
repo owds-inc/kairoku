@@ -1,9 +1,18 @@
 # Kairoku daemon — protocol v1
 
 *Ratified 2026-09-02 from planning `DECISIONS.md` §20 (rulings 1–3, 9) and `planned/orchestration-v1.md`.
-Build lane: `planned/kairoku-cli-phase5-daemon-client.md`; plan of record
-`docs/plans/2026-09-02-kairoku-cli-phase5-daemon-client.md`. This file is the build contract; changes
+Build lanes: `planned/kairoku-cli-phase5-daemon-client.md` (the link) and
+`planned/kairoku-cli-phase6-teams.md` (the team); plans of record
+`docs/plans/2026-09-02-kairoku-cli-phase5-daemon-client.md` and
+`docs/plans/2026-09-02-kairoku-cli-phase6-teams.md`. This file is the build contract; changes
 to it are explicit amendments, never silent divergence. No dates, no estimates.*
+
+**Amended for teams (§20.2, §20.4–8 and the grill), same v1.** The wire did not change; what runs
+behind it did. A dispatch is a TEAM now — one member per item, each in its own worktree, driven by
+a recipe through one of two providers, gated by a reviewer's structured verdict and a deterministic
+QA step, streaming curated events up the beat and obeying the beat's cancel list. The amendments
+are marked inline: the stack's dependency rule (one, named), RF-003, RF-004, RF-008, RF-009, RF-012
+and RF-013, plus RF-014 to RF-018 which are new.
 
 **v1 SUPERSEDES v0, explicitly.** v0 is kept in full as an appendix at the bottom of this file,
 marked superseded, because half a dozen documents cite its RF numbers and a reader who follows one
@@ -41,9 +50,12 @@ docs site said AGPL-3.0. That was wrong and is corrected here — §20.10.)
 
 ## Stack
 
-Bun + TypeScript, `Bun.serve`, **zero runtime dependencies**. In-memory run state (a `Map`) plus one
-`run.json` per run on disk. Per-run JSONL event log + captured stdout (a log, not state).
-`tsc --noEmit` clean and `bun test` green (with counts) are the merge gates.
+Bun + TypeScript, `Bun.serve`, **exactly one runtime dependency: `@anthropic-ai/claude-agent-sdk`,
+pinned, imported by `src/daemon/providers/claude.ts` and nowhere else** (§20.2 amends v1's
+zero-dependency rule to name that one; `constraints.test.ts` enforces the amendment, and its scan
+recurses so a subdirectory is not a place the rules stop applying). In-memory run state (a `Map`)
+plus one `<runId>.json` per run on disk. Per-run JSONL event log + captured stream (a log, not
+state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge gates.
 
 ## Requirements
 
@@ -73,17 +85,44 @@ Bun + TypeScript, `Bun.serve`, **zero runtime dependencies**. In-memory run stat
   able to walk up to a daemon whose token the app refused and be told exactly that, which it cannot
   do if the process exits. A dispatch id the daemon is already running is ignored if the app's
   lease re-issues it.
-  **A 200 on the beat is not consent for what the beat carried.** Each entry of the response's
-  `runs[]` pairs with the report sent in that position, and an `{ ok: false }` entry is answered
-  exactly as a direct `update` refusal is — logged once with the app's reason and issues, and the
-  run marked `failed` in its `run.json`, never retried into the same refusal. Dropping those
-  outcomes leaves a dispatch stuck `running` in the app with no record anywhere of why.
+  **AMENDED — the cadence is adaptive (grill Q6):** every 10 s while any run is active, and at the
+  app's own `heartbeatIntervalMs` (30 s) when nothing is. An app asking for something faster than
+  10 s is obeyed rather than overridden.
 
-- **RF-013 — the restart rule.** Each run keeps `~/.kairoku/runs/<dispatchId>/run.json`
-  `{ dispatchId, state: starting|running|done|failed, pid?, startedAt, branch, worktree? }`. On
-  boot, a run left non-terminal whose pid is dead is marked failed on disk and reported to the app
-  as `failed` / "daemon restarted". **It is never relaunched.** Re-running a prompt whose first
-  attempt may have committed, pushed or opened a PR is worse than any stuck row; the human decides.
+  **AMENDED — `meta` says what this machine can do:** `{ protocol, host, version, capacity, repos,
+  providers, recipes }`. `repos` is `owner/repo` per checkout (the claim query filters on it, grill
+  Q21); `providers` is provider → the models that tool itself reported (`supportedModels()` for
+  Claude, `codex debug models` projected to slugs for Codex), asked ONCE per daemon and cached —
+  a new model is a daemon restart (§20.6). A provider that advertises nothing is left out rather
+  than sent as an empty list: "no codex here" and "codex with no models" are different facts.
+
+  **AMENDED — one report per RUN.** A beat carries one entry per live run (`{dispatchId, runId,
+  role, state, events}`) plus any terminal report `update` could not deliver.
+
+  **A 200 on the beat is not consent for what the beat carried.** Each entry of the response's
+  `runs[]` is paired with the report it answers **by `runId` when the app sends one**, falling back
+  to position only when it does not, and a length mismatch is logged rather than silently mapped.
+  An `{ ok: false }` entry is answered exactly as a direct `update` refusal is — logged once with
+  the app's reason and issues, and the run marked `failed` locally. **The refused report is never
+  retried; ONE follow-up `failed` report carrying the refusal reason is sent instead**, because a
+  refused terminal report otherwise leaves the app row `running` forever while the daemon has
+  stopped working on it (a `failed` report needs no counts, so it cannot be refused for the reason
+  the first one was). A refused follow-up is only logged. `doctor` reads the last error and it
+  names the run it came from.
+
+- **RF-013 — the restart rule. AMENDED (§20 item 9).** Each run keeps
+  `~/.kairoku/runs/<dispatchId>/<runId>.json`
+  `{ dispatchId, runId, state: starting|running|done|failed, pid?, startedAt, branch, worktree?,
+  sessionId?, report? }` — one file per member, all of a dispatch's members in one directory.
+  On boot a run left non-terminal is reaped and reported `failed` / "daemon restarted" **unless a
+  live process with that pid was started at the recorded time**: pid alone is not enough, because
+  a recycled number would make the daemon decline to reap a genuinely stranded run forever, and
+  the daemon's own pid on a run it did not start means exactly that recycling happened.
+  Unreadable — no `ps`, no permission — reaps, because a stranded run reported failed is
+  recoverable and a run left `running` in the app is not. **It is never relaunched.**
+  `report?` is a terminal report the app has not accepted; it is retried on every beat until a 2xx
+  and cleared then, so a daemon killed between finishing a run and reporting it still settles the
+  row on its next boot.
 
 ### Running the work
 
@@ -93,13 +132,32 @@ Bun + TypeScript, `Bun.serve`, **zero runtime dependencies**. In-memory run stat
   *claiming*, not a refusal to a caller.
 - **RF-002 — `GET /runs/{id}`. RETIRED (§20.3).** The app is the ledger; `GET /status` lists what is
   in flight for `doctor`.
-- **RF-003 — events**: per-run JSONL at `~/.kairoku/runs/<dispatchId>/events.jsonl` (created,
-  started, finished, teardown, error) plus `stdout.log`. Its path travels to the app as
-  `artifacts.jsonl`; the file stays the source of truth. Curated events over the heartbeat are O-3.
-- **RF-004 — `POST /runs/{id}/cancel`. RETIRED (§20.3)** as a route. The group-kill and teardown it
-  drove remain and are what daemon shutdown uses; cancellation *from the app* (the heartbeat's
-  `cancel` list) arrives in O-3.
+- **RF-003 — events. AMENDED (§20 item 7).** Two logs, one truth. Everything a provider emits is
+  appended in full to `~/.kairoku/runs/<dispatchId>/<runId>.jsonl`, alongside `<runId>.log` (the
+  raw provider stream) and the structured lifecycle lines (created, started, finished, teardown,
+  error). What travels to the app is a CURATION of it: `{seq, ts, kind, text}` with `kind` one of
+  `text|tool|ok|deny|error`, text ≤ 2 KB, tool calls summarised to a name plus 200 characters,
+  every delivered value masked, at most 50 lines a beat, oldest dropped first with one line saying
+  how many. **Every delivered batch is monotonic by `seq`, the one after a drop included**: the
+  overflow notice is numbered at DROP time, so it carries the seq of the first line it stands in for
+  and leads the survivors. That seq was never delivered — the line it belonged to was the one
+  dropped — so nothing collides. A notice numbered at drain time would sort after every line it
+  precedes, and the app renders a batch by seq. `artifacts.jsonl` is GONE from the wire: §20.12 makes the app the control panel, so
+  there is nothing on the machine left to point at.
+- **RF-004 — `POST /runs/{id}/cancel`. RETIRED (§20.3)** as a route, and **REPLACED (grill Q5)** by
+  the heartbeat response's `cancel[]`. Each entry names a dispatch or one run of it; the daemon
+  interrupts what that member is currently doing (the SDK's own `interrupt`, or SIGTERM → grace →
+  SIGKILL on the process group), tears the worktree down and reports `failed` / "cancelled by the
+  app". Acting on the list is idempotent and a cancel for a run this daemon does not hold is
+  ignored rather than answered.
 - **RF-005 — `GET /capacity`** → `{ running, max }` (max from config). Unauthenticated, loopback.
+  **AMENDED (teams): `maxConcurrent` is a GATE, enforced in one place — `RunStore.start()`.** A
+  member past the limit WAITS for a slot rather than being refused; it was claimed, so it is owed a
+  run. `running` counts members that hold a slot, never one still queued, because the beat and the
+  claim loop both read that number. The fan-out bounds itself by `store.free()` at launch, never by
+  `maxConcurrent`: two dispatches overlap by design (the claim loop refuses only when NOTHING is
+  free), so a fan-out that bounded itself by the machine-wide max would put a whole machine's worth
+  of members on top of the ones already running.
 - **RF-006 — the bind is the boundary.** The listener has **no inbound credential**: with the push
   API retired it answers `doctor` and nothing else, so reachability on the configured address is the
   trust boundary. It therefore binds **127.0.0.1** by default and **refuses `0.0.0.0`, `::` and an
@@ -119,26 +177,140 @@ Bun + TypeScript, `Bun.serve`, **zero runtime dependencies**. In-memory run stat
   known gap**, removed in O-3. A run with neither is reported `failed` rather than launched without
   a credential. Unchanged: a credential value never appears in a log, an event, a run record or an
   error.
-- **RF-009 — roles are a fixed table in the daemon**: `executor` only — provider `codex`, command
-  `codex exec --json`, `approval_policy: "never"`, `sandbox_mode: "workspace-write"`. Command
-  construction lives in one module; tests substitute a stub through test-only config, never a
-  test-mode role. Claude Code arrives in O-3 through the Agent SDK, with §20.8's per-role tool
-  policy; a half-provider added here would be replaced by that.
+- **RF-009 — roles are a fixed table in the daemon. AMENDED (§20.5).** The `executor` role and its
+  module are retired, as this requirement said they would be. There are now **four roles**:
+  `implementer`, `reviewer`, `planner`, `researcher`. **QA is not one of them** (grill Q2) — it is
+  a deterministic daemon step, RF-016. For Claude the roles are the plugin's own agents
+  (`plugin/agents/*.md`, canonical in this repo since §19.4); for Codex the daemon writes the same
+  four contracts as prompts (`src/daemon/roles/*.md`, embedded in the binary as text imports). The
+  role contract is prepended to EVERY prompt on both providers — through ONE helper,
+  `withRoleContract(role, prompt)`, which both `claude.ts` and `codex.ts` call, because a line each
+  provider is trusted to remember is a line one of them forgets. What a run without the plugin
+  loses is the MCP tools and the skills; the role survives. **On the Claude side that run does not
+  happen at all** — see RF-014.
 - **RF-010 — teardown on every exit path**: normal exit, timeout (default 3600 s, per-run override),
   cancel, and daemon shutdown (SIGTERM kills children, marks running runs, writes final events).
   Agent processes spawn in their own process group; kill is group-wide (no orphans). Worktree
   teardown runs unless the run failed and `keepWorktreeOnFailure` is set.
 
-## A dispatch becomes a run
+## The team requirements (new in the teams amendment)
 
-`solo` recipe only (the recipe table is O-3). One claim → one worktree `run/<dispatchId>` cut from
-`origin/<defaultBranch>` in the configured checkout, `bun install`, `.env*` copied from the base
-checkout. `KAIROKU_PAT` = the claim's run token, else `KAIROKU_AGENT_TOKEN` (RF-008). The brief goes
-in on **stdin** — never argv, so it stays out of the process table and a brief beginning with `-` is
-not read as a flag. `update running` at launch; at exit, `update done|failed` with
-`artifacts.branch`, `artifacts.prUrl` (`gh pr view` / `glab mr view` on the branch, asked of the base
-checkout because the worktree is gone by then), `artifacts.jsonl`, and `counts` parsed from the
-agent's final `{"kairoku": {"counts": {…}}}` block when it printed one.
+- **RF-014 — providers.** One interface: `launch(run) → { events, interrupt(), exit }`, and nothing
+  above it knows which tool is driving a role. `providers/claude.ts` is the ONLY module importing
+  the Agent SDK: `cwd` = the worktree; `plugins: [{type:'local', path}]` (NOT `settingSources`);
+  `permissionMode` and `allowedTools` per role AND an unconditional `PreToolUse` hook, because
+  `canUseTool` is last in the permission chain and is shadowed by a bypass or allow rule while a
+  hook deny wins even under `bypassPermissions`; `outputFormat: {type:'json_schema', schema}` read
+  back from `message.structured_output`; `effort` per role; the session id recorded; streaming-input
+  mode, which is what makes `supportedModels()` and `interrupt()` available at all;
+  `pathToClaudeCodeExecutable` = the resolved `claude`. `providers/codex.ts` is
+  `codex exec --json -s <sandbox from the policy> -c approval_policy="never" -C <worktree>
+  [-m <model>] [--output-schema <file> -o <file>]`, prompt on stdin. Three upstream codex bugs are
+  designed around rather than hoped about: the schema is read from the `-o` FILE, never from the
+  event stream (openai/codex#19816), the file is parsed leniently because the schema is ignored
+  while MCP servers are active (#15451), and a missing report fails the run closed (#4181).
+
+  **ONE PRODUCTION CONSTRUCTOR, `productionProviders(config)`.** The plugin path
+  (`resolvePluginPath({configured: config.pluginPath})`) and the resolved `claude` are resolved
+  once, there, and handed into `claudeProvider()`; `link.ts`, `dispatch.ts` and `models.ts` all build
+  their providers through it and nothing in production calls `providerRegistry()` bare. This is a
+  requirement rather than a detail because the wiring it does is invisible in a unit test and fatal
+  without it: a `claudeProvider({})` is a perfectly working provider that happens to start every run
+  with no kairoku MCP server, no protocol skills and no role agents. **A machine with no plugin
+  FAILS THE RUN CLOSED** with a summary naming what is missing, and advertises no Claude models — a
+  role agent is a plugin agent, so without the plugin there are no `mcp__kairoku__*` tools, which
+  are the very tools RF-017 allows and the role contracts instruct the agent to call.
+
+  **WHERE THE PLUGIN IS LOOKED FOR (amended).** `resolvePluginPath()` returns the first candidate
+  that contains `.claude-plugin/plugin.json`, in this order: `config.pluginPath`; the `installPath`
+  that `claude plugin list --json` reports for `kairoku@kairoku-marketplace`, read through the ONE
+  parser `doctor` uses (`cli/plugin.ts`'s `pickPlugin`); `~/.claude/plugins/cache/<marketplace>/
+  kairoku/<version>`, which is where Claude Code actually unpacks a plugin, highest version by
+  semver; and only then a checkout beside the source. **A cache entry the comparator does not accept
+  is SKIPPED, never a throw** — `Bun.semver.order` raises `Invalid SemVer` rather than ordering one,
+  and a throw inside `sort` escapes the resolver into `doctor`, `setup --daemon`, link start and
+  every dispatch. **The domain test IS the comparator, by construction**: an entry is a version
+  candidate only when `Bun.semver.order(entry, entry)` does not throw, so the sort only ever sees
+  values its comparator takes. No stand-in predicate — `Bun.semver.satisfies(v, "*")` is not that
+  domain (true for `2.2.0.bak`, `1.2.3.4` and `2.2.0~`, each of which then raises from `order`;
+  false for `1.0.0-beta`, which `order` accepts). The triggers are all ordinary: `mv 2.2.0 2.2.0.bak`
+  before pinning a version, the `.DS_Store` Finder writes into any directory a person opens, and the
+  commit hash Claude Code names the version directory with when a marketplace entry carries no
+  version. A stray entry is ignored exactly like a directory with no manifest, and the whole cache
+  scan is wrapped so that any throw inside it yields no candidates — `resolvePluginPath()` returns a
+  validated path or `undefined`, never a throw, whatever the filesystem holds. **The candidates are evaluated LAZILY, in
+  order** — each is produced only when the one before it failed to validate, so a `config.pluginPath`
+  that still exists costs no `claude plugin list --json`, a synchronous ~210 ms spawn
+  `productionProviders()` would otherwise pay once per dispatch. **`config.pluginPath` is a
+  candidate, not an answer** — it is validated like every other one, so a path recorded before a
+  plugin update does not outlive the version directory it names. **The checkout candidate is
+  offered only when the process is not a compiled binary**: `bun build --compile` gives
+  `import.meta.dir` the value `/$bunfs/root`, so a path derived from it can only ever resolve in
+  development — offering it in a shipped binary is how "the plugin is never handed to the SDK in
+  production" hid behind a passing suite. `kairoku setup --daemon` resolves the same way and
+  RECORDS the result as `pluginPath`, so a released daemon starting cold on a provisioned machine
+  does not have to resolve anything; `kairoku doctor` prints the directory a launched run will be
+  given (`kairoku plugin path`) as a check separate from `kairoku plugin installed`, because those
+  two facts came apart in exactly the way that made every Claude run on a "PASS" machine refuse.
+
+- **RF-015 — recipes.** A team is deterministic code over run records, testable against a fake
+  provider, never an agent deciding whom to spawn. `solo` (implementer → QA); `build-verify`
+  (implementer → reviewer → on NOT_CLEAN re-run the implementer with the defects VERBATIM, ≤ 2 fix
+  rounds per gate → QA → the same loop on a failing suite); `phase-team` (build-verify per item of
+  the claim, in parallel up to `maxConcurrent`, one worktree and branch `run/<dispatchId>-<n>`
+  each); `plan` (planner → reviewer); `research` (researcher → reviewer); `custom` (the escape
+  hatch, which KEEPS the QA gate because the app refuses an `implement` run reporting done without
+  all four counts). A reviewer's verdict is the structured report
+  `{verdict: CLEAN|NOT_CLEAN, defects: [...]}`; **absence or invalidity fails the run closed**,
+  because a review read out of free prose is exactly the claim invariant 7 exists to refuse. An
+  unknown team name is reported failed with the name it was asked for.
+
+- **RF-016 — the QA step is deterministic and has no model** (grill Q2). It runs the repo's
+  `kairoku.json` `check[]` then `test`, or package.json's `lint`/`build`/`test` when there is no
+  manifest, in the member's worktree, and parses the runner's own summary — one parser per known
+  runner (bun, vitest, jest, `go test -v`). **The package.json fallback runs the package's OWN
+  scripts, through the package manager its lockfile names** (`bun.lock`/`bun.lockb` → `bun run`,
+  `pnpm-lock.yaml` → `pnpm run`, `yarn.lock` → `yarn`, else `npm run`) — never `bun test` in place
+  of a `test` script that is `vitest run`, `jest` or `go test ./...`. Substituting the runner is
+  worse than not running one: against a repo bun's glob matches but cannot drive, bun prints
+  `0 pass · 0 fail` and exits 0, which parses as a clean zero-count suite, so the member would
+  report done citing counts no suite of that repo ever produced. It FAILS CLOSED in three places a plausible
+  implementation would have passed: a runner nobody here can parse ("counts unavailable"), a repo
+  with no test command at all, and a non-zero `errors` beside zero `fail`. A failure attaches the
+  last 100 lines as the defect and feeds the implementer's fix loop exactly as a reviewer's defects
+  do. `concurrency.test` bounds how many suites run at once, else one at a time.
+
+- **RF-017 — the tool policy is data, and one function applies it** (§20.8). implementer:
+  read/edit/write/run, and every write path must resolve INSIDE that member's worktree; reviewer:
+  read + run, no write tool at all; planner and researcher: MCP + read-only, no shell. It fails
+  closed at every branch — an unknown role, an unlisted tool, a write whose path cannot be read.
+  Both providers read the same table, so they cannot drift into different ideas of what a reviewer
+  may do. **Every denial is a `deny` event** and carries its reason to the model.
+
+- **RF-018 — the per-run wall clock.** `limits.runSeconds` from the claim, default 3600. A member
+  that passes it is interrupted, torn down and reported `failed` / "time limit". A run that will
+  not stop is a slot that never comes back, which is worse for the next dispatch than this one
+  failing.
+
+## A dispatch becomes a team
+
+One claim → one member per item, fanned out up to the slots FREE at launch (a worker pool, so the
+third of three starts the moment either of the first two finishes). The machine-wide limit itself is
+enforced one layer down, in `RunStore.start()` (RF-005), which is the only thing two overlapping
+dispatches both go through. Each member gets its own worktree cut
+from `origin/<defaultBranch>` in the configured checkout — `run/<dispatchId>` for a single item,
+`run/<dispatchId>-<n>` for a team — with `bun install` and the base checkout's `.env*` copied.
+`KAIROKU_PAT` = that item's `runToken`, else `KAIROKU_AGENT_TOKEN` (RF-008). A role's prompt goes in
+on **stdin** for codex and as a streaming user message for the SDK — never argv, so it stays out of
+the process table and a prompt beginning with `-` is not read as a flag.
+
+`update running` once per member at launch (§20 addendum 6: a dispatch whose progress showed only
+in the beat's `runs[].state` would stay `claimed` in the app and be re-claimable after the lease);
+at the end, `update done|failed` with `artifacts.branch`, `artifacts.prUrl` (`gh pr view` /
+`glab mr view` on the branch, asked of the base checkout because the worktree is gone by then, and
+run through the RESOLVED binary path so `which` and `spawn` cannot answer from different PATHs),
+`artifacts.documentIds` when a planner or researcher filed any, and `counts` **measured by the QA
+step** — never parsed out of an agent's prose.
 
 **§20.9 — one checkout per daemon.** A claim naming a repo this daemon has no checkout of is
 reported `failed` with `no checkout for <owner/name>`, immediately. Never a hang, never an attempt.
@@ -185,17 +357,32 @@ line and a one-time copy of the directory.
 A daemon set up with a token minted in Settings → Daemons appears there **online within a minute**,
 claims a queued `implement` dispatch composed on a plan item, runs it, and the run shows a branch and
 (if the agent opened one) a PR url; killing the daemon turns it stale then offline on the app's
-clock. Plus: the full `bun test` suite green **with counts reported**, `tsc --noEmit` clean, and
-tests covering the beat cadence, the capacity gate, the double-claim guard, the 401 stop, the
-backoff, the report contents, the restart rule, the constraint pins, and setup's proving heartbeat.
+clock.
+
+**With teams (amended):** a `phase-team` dispatch queued for three items on a capacity-2 machine
+runs two members at once, one item goes through a reviewer fix loop and one through a QA fix loop,
+all three end with PR urls and four counts in the app, the run detail shows the curated events,
+cancelling one run interrupts only that member within one beat, and the beat advertises the repos,
+models and recipes the composer greys its dropdowns against.
+
+Plus: the full `bun test` suite green **with counts reported**, `tsc --noEmit` clean,
+`claude plugin validate plugin/` passing, and tests covering the beat cadence, the capacity gate,
+the double-claim guard, the 401 stop, the backoff, the report contents, the restart rule, the
+constraint pins, setup's proving heartbeat, each recipe against a fake provider, the QA parser per
+runner, the policy matrix, the PreToolUse deny event, a structured report failing closed, event
+truncation/masking/overflow, and cancel.
 
 ## Deliberately out of v1 (each is a named lane)
 
-Recipes beyond `solo`, the Agent SDK provider and the four plugin agents, the per-role tool policy,
-curated events over the heartbeat, cancel from the app (all **O-3**) · `kairoku.json`, environments,
-compose per run, secrets client-side (**O-4**) · per-run MCP tokens and the runs/events tables
-(**O-2**) · live terminal attach/steering · scheduling · providers beyond two · any auto-approval of
-agent permission requests (no trigger — this is a gate, not a backlog item).
+`kairoku.json` environments, compose per run, per-run ports, secrets client-side (**O-4** — the QA
+step reads the manifest's `check`/`test`/`concurrency.test` and nothing else) · live terminal
+attach/steering · scheduling · providers beyond two · custom recipes and an agent-led lead role ·
+per-item claims across daemons · a repo map with auto-clone · any auto-approval of agent permission
+requests (no trigger — this is a gate, not a backlog item).
+
+Delivered since v1 was ratified, and no longer out: recipes beyond `solo`, the Agent SDK provider,
+the four role agents, the per-role tool policy, curated events over the beat, cancel from the app
+(**O-3**) · per-run MCP tokens and the runs/events tables (**O-2**).
 
 ---
 

@@ -126,10 +126,11 @@ describe("config", () => {
 
   test("the test seams are never populated from the config file", () => {
     const path = join(tmp(), "config.json");
-    writeFileSync(path, JSON.stringify({ commandOverride: ["rm", "-rf"], worktreeOps: {} }));
+    writeFileSync(path, JSON.stringify({ worktreeOps: {}, pluginPath: 42 }));
     const config = loadConfig(path, { KAIROKU_DAEMON_TOKEN: "t" });
-    expect(config.commandOverride).toBeUndefined();
     expect(config.worktreeOps).toBeUndefined();
+    // `pluginPath` IS a real config key, but only a non-empty string is one.
+    expect(config.pluginPath).toBeUndefined();
   });
 
   test("a malformed config file fails loudly rather than silently defaulting", () => {

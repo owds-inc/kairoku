@@ -11,8 +11,8 @@
  * happened, and a caller reading numbers would eventually get one wrong:
  *
  *   unauthorized — the app refuses this credential. STOP; a retry cannot help.
- *   rejected     — the app understood and said no (404 not held, 422 invalid).
- *                  The run is wrong, not the link.
+ *   rejected     — the app understood and said no (404 not held, 409 already
+ *                  terminal, 422 invalid). The run is wrong, not the link.
  *   server       — the app is up and unwell. Back off.
  *   network      — nothing answered. Back off.
  *
@@ -32,9 +32,10 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 
 // ---------------------------------------------------------------- wire shapes
 //
-// Vendored from the app at `a986e23b`: `src/lib/orchestration/dispatches.ts`
-// and the three route handlers. Fields protocol v1 adds are optional here, so
-// today's app and tomorrow's both parse.
+// Protocol v1, vendored from the app at `eab363ea`:
+// `src/lib/comms/protocol/index.ts` and the three route handlers. Every field
+// the app treats as optional is optional here too, so a daemon one version
+// ahead of its app and one version behind both parse.
 
 export interface SuiteCounts {
   readonly pass: number;
@@ -47,27 +48,65 @@ export interface RunArtifacts {
   readonly prUrl?: string;
   readonly branch?: string;
   readonly documentIds?: string[];
-  readonly jsonl?: string;
 }
 
-export interface HeartbeatMeta {
+/** The word the Floor prints while a run is still happening. Not its status. */
+export type RunState = "starting" | "running" | "needs_input" | "finishing";
+
+export interface RunEvent {
+  readonly seq: number;
+  readonly ts: string;
+  readonly kind: "text" | "tool" | "ok" | "deny" | "error";
+  readonly text: string;
+}
+
+export interface DaemonMeta {
+  readonly protocol: string;
   readonly host: string;
   readonly version: string;
   readonly capacity: { running: number; max: number };
+  /** `owner/repo` for every checkout this machine holds. The claim filter reads it. */
+  readonly repos?: string[];
+  /** provider → the models it can actually drive, as the tool itself reported them. */
+  readonly providers?: Record<string, string[]>;
+  readonly recipes?: string[];
 }
 
-export interface DispatchUpdate {
+/**
+ * One report about one RUN. `status` is optional on a beat and required on
+ * `/update`: a beat says what is happening, an update says what happened.
+ */
+export interface RunReport {
   readonly dispatchId: string;
-  readonly status: "running" | "done" | "failed";
+  readonly runId: string;
+  readonly role?: string;
+  readonly state?: RunState;
+  readonly status?: "running" | "done" | "failed";
   readonly summary?: string;
   readonly artifacts?: RunArtifacts;
   readonly counts?: SuiteCounts;
+  readonly events?: RunEvent[];
 }
 
 export interface HeartbeatBody {
-  readonly meta: HeartbeatMeta;
+  readonly meta: DaemonMeta;
   /** The app caps this at 50; the loop never sends more. */
-  readonly runs?: DispatchUpdate[];
+  readonly runs?: RunReport[];
+}
+
+/** One thing the app wants stopped. `runId` absent means the whole dispatch. */
+export interface CancelInstruction {
+  readonly dispatchId: string;
+  readonly runId?: string;
+}
+
+export interface RunOutcome {
+  readonly ok: boolean;
+  readonly id?: string;
+  readonly runId?: string;
+  readonly status?: string;
+  readonly reason?: string;
+  readonly issues?: string[];
 }
 
 export interface HeartbeatResponse {
@@ -75,22 +114,44 @@ export interface HeartbeatResponse {
   readonly liveness: "online" | "stale" | "offline";
   readonly heartbeatIntervalMs: number;
   readonly protocol?: string;
-  /** One outcome per piggybacked report, in the order they were sent. */
-  readonly runs: Array<{ ok: boolean; id?: string; status?: string; reason?: string; issues?: string[] }>;
+  readonly cancel?: CancelInstruction[];
+  /** One outcome per piggybacked report. Paired by `runId` where the app sends one. */
+  readonly runs?: RunOutcome[];
 }
 
-/** What the app hands over at claim. Only the first six fields exist today. */
+/** One item of a claim: the plan item, the run row it becomes, and that run's credential. */
+export interface ClaimItem {
+  readonly id: string;
+  readonly key: string | null;
+  readonly title: string;
+  /** The six-section body written at plan time. THIS is the brief (invariant 3). */
+  readonly body: string;
+  readonly runId: string;
+  readonly runToken: string;
+}
+
+export interface ClaimTeam {
+  readonly recipe?: string;
+  readonly roles?: Record<string, { provider?: string; model?: string; effort?: string }>;
+}
+
+/** What the app hands over at claim (protocol v1). */
 export interface ClaimedDispatch {
   readonly id: string;
-  readonly targetKind: string;
-  readonly targetId: string;
   readonly taskType: string;
   readonly brief: string;
-  readonly createdAt: string;
-  readonly repo?: { provider?: string; fullName?: string; defaultBranch?: string };
-  readonly items?: Array<{ id?: string; runToken?: string }>;
-  /** Protocol v1 may carry the run token at the top level instead. */
-  readonly runToken?: string;
+  readonly project?: { id: string; slug: string };
+  readonly target?: { kind: string; id: string; title: string };
+  readonly repo?: {
+    provider?: string;
+    fullName?: string;
+    defaultBranch?: string;
+    defaultBranchSource?: string;
+  } | null;
+  readonly team?: ClaimTeam | null;
+  readonly items?: ClaimItem[];
+  readonly env?: { profile?: string };
+  readonly limits?: { runSeconds?: number | null };
 }
 
 export interface ClaimResponse {
@@ -100,6 +161,7 @@ export interface ClaimResponse {
 export interface UpdateResponse {
   readonly ok: boolean;
   readonly id?: string;
+  readonly runId?: string;
   readonly status?: string;
 }
 
@@ -121,7 +183,7 @@ export interface AppClient {
   readonly appUrl: string;
   heartbeat(body: HeartbeatBody): Promise<AppResult<HeartbeatResponse>>;
   claim(): Promise<AppResult<ClaimResponse>>;
-  update(body: DispatchUpdate): Promise<AppResult<UpdateResponse>>;
+  update(body: RunReport): Promise<AppResult<UpdateResponse>>;
 }
 
 export interface AppClientOptions {
@@ -190,11 +252,6 @@ export function appClient(options: AppClientOptions): AppClient {
     claim: () => post<ClaimResponse>(DAEMON_ROUTES[1]),
     update: (body) => post<UpdateResponse>(DAEMON_ROUTES[2], body),
   };
-}
-
-/** The run token for a dispatch, wherever this protocol version puts it. */
-export function runTokenOf(dispatch: ClaimedDispatch): string | undefined {
-  return dispatch.items?.[0]?.runToken ?? dispatch.runToken ?? undefined;
 }
 
 function readIssues(parsed: unknown): string[] | undefined {

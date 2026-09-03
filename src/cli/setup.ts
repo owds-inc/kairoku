@@ -7,11 +7,11 @@
 
 import { join } from "node:path";
 import { parseArgs } from "node:util";
-import { appClient } from "../daemon/app";
+import { appClient, PROTOCOL_VERSION } from "../daemon/app";
 import { kairokuHome, migrateHome, normaliseAppUrl, parseTokenEnv } from "../daemon/config";
 import { version as cliVersion } from "../../package.json";
 import * as daemonCmd from "./daemon";
-import { daemonStatus, reachable } from "./doctor";
+import { daemonStatus, pluginPathFor, reachable } from "./doctor";
 import type { Io } from "./io";
 import * as plugin from "./plugin";
 import {
@@ -118,7 +118,12 @@ async function appLink(
   writeAppLink(io, appUrl, token);
 
   const result = await appClient({ appUrl, token, fetch: io.fetch }).heartbeat({
-    meta: { host: io.env.HOSTNAME ?? "this machine", version: cliVersion, capacity: { running: 0, max: 0 } },
+    meta: {
+      protocol: PROTOCOL_VERSION,
+      host: io.env.HOSTNAME ?? "this machine",
+      version: cliVersion,
+      capacity: { running: 0, max: 0 },
+    },
   });
   if (!result.ok) return { step: { name, outcome: "manual", detail: result.error }, stop: result.error };
   return { step: { name, outcome: "done", detail: `app link proved — ${appUrl} says ${result.body.liveness}` } };
@@ -150,7 +155,7 @@ export async function daemon(
   show(await checkout(io, repoUrl));
   show(await userns(io));
   show(await codexConfig(io));
-  for (const s of await daemonConfig(io, appCheckoutDir(io), repoUrl)) show(s);
+  for (const s of await daemonConfig(io, appCheckoutDir(io), repoUrl, await pluginPathFor(io))) show(s);
 
   const link = await appLink(io, { yes: opts.yes, appUrl: opts.appUrl, appToken: opts.appToken });
   show(link.step);

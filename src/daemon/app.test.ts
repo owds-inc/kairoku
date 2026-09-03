@@ -8,8 +8,8 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { appClient, DAEMON_ROUTES } from "./app";
-import { fakeApp, type FakeApp } from "./testkit";
+import { appClient, DAEMON_ROUTES, PROTOCOL_VERSION } from "./app";
+import { fakeApp, fakeItem, type FakeApp } from "./testkit";
 
 let app: FakeApp | undefined;
 afterEach(async () => {
@@ -22,7 +22,15 @@ function client(overrides: { token?: string; appUrl?: string; timeoutMs?: number
   return appClient({ appUrl: overrides.appUrl ?? app.url, token: overrides.token ?? app.token, ...overrides });
 }
 
-const meta = { host: "vm-1", version: "0.1.0", capacity: { running: 0, max: 2 } };
+const meta = {
+  protocol: PROTOCOL_VERSION,
+  host: "vm-1",
+  version: "0.1.0",
+  capacity: { running: 0, max: 2 },
+  repos: ["owds-inc/kairoku"],
+  providers: { claude: ["claude-opus-5"] },
+  recipes: ["solo", "build-verify"],
+};
 
 describe("app client — the three routes and nothing else", () => {
   test("the route table is exactly the three the app answers", () => {
@@ -49,26 +57,30 @@ describe("app client — heartbeat", () => {
     expect(result.body.heartbeatIntervalMs).toBe(12_345);
     expect(result.body.liveness).toBe("online");
     expect(result.body.protocol).toBe("1");
+    expect(result.body.cancel).toEqual([]);
     expect(app.calls[0]).toEqual({ route: "heartbeat", body: { meta } });
+    // meta travels whole: the composer greys models off this and the claim
+    // query filters on `repos`.
+    expect(app.metas[0]).toEqual(meta);
   });
 
   test("a heartbeat can piggyback reports, and each one is answered separately", async () => {
     app = fakeApp();
-    app.queue({ id: "d1", taskType: "research", brief: "look" });
+    app.queue({ id: "d1", taskType: "research", items: [fakeItem(1)] });
     const c = client();
     await c.claim();
 
     const result = await c.heartbeat({
       meta,
       runs: [
-        { dispatchId: "d1", status: "done", summary: "filed" },
-        { dispatchId: "nope", status: "done" },
+        { dispatchId: "d1", runId: "run-1", status: "done", summary: "filed" },
+        { dispatchId: "d1", runId: "run-nope", status: "done" },
       ],
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.body.runs[0]).toEqual({ ok: true, id: "d1", status: "done" });
-    expect(result.body.runs[1]).toEqual({ ok: false, reason: "not-found" });
+    expect(result.body.runs?.[0]).toEqual({ ok: true, id: "d1", runId: "run-1", status: "done" });
+    expect(result.body.runs?.[1]).toEqual({ ok: false, reason: "not-found", runId: "run-nope" });
   });
 });
 
@@ -87,7 +99,9 @@ describe("app client — claim", () => {
       taskType: "implement",
       brief: "Build the thing.",
       repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
-      items: [{ id: "i1", runToken: "kai_run_token" }],
+      team: { recipe: "build-verify", roles: { implementer: { provider: "claude", model: "claude-opus-5" } } },
+      items: [fakeItem(1)],
+      limits: { runSeconds: 900 },
     });
     const result = await client().claim();
     expect(result.ok).toBe(true);
@@ -97,52 +111,72 @@ describe("app client — claim", () => {
       taskType: "implement",
       brief: "Build the thing.",
       repo: { fullName: "owds-inc/kairoku", defaultBranch: "main" },
+      team: { recipe: "build-verify" },
+      limits: { runSeconds: 900 },
     });
-    expect(result.body.dispatch?.items?.[0]?.runToken).toBe("kai_run_token");
+    expect(result.body.dispatch?.items?.[0]).toMatchObject({ id: "item-1", runId: "run-1", runToken: "kai_run_token_1" });
   });
 });
 
 describe("app client — update", () => {
   test("a report the app accepts comes back ok", async () => {
     app = fakeApp();
-    app.queue({ id: "d3", taskType: "implement", brief: "go" });
+    app.queue({ id: "d3", taskType: "implement", items: [fakeItem(1)] });
     const c = client();
     await c.claim();
 
-    expect((await c.update({ dispatchId: "d3", status: "running" })).ok).toBe(true);
+    expect((await c.update({ dispatchId: "d3", runId: "run-1", status: "running" })).ok).toBe(true);
     const done = await c.update({
       dispatchId: "d3",
+      runId: "run-1",
       status: "done",
       summary: "green",
       counts: { pass: 4955, fail: 0, skip: 2, errors: 0 },
-      artifacts: { branch: "run/d3", jsonl: "/runs/d3/events.jsonl" },
+      artifacts: { branch: "run/d3", prUrl: "https://github.com/owds-inc/kairoku/pull/7" },
     });
     expect(done.ok).toBe(true);
-    expect(app.rows.get("d3")).toMatchObject({ status: "done", counts: { pass: 4955, fail: 0, skip: 2, errors: 0 } });
+    expect(app.runs.get("run-1")).toMatchObject({
+      status: "done",
+      counts: { pass: 4955, fail: 0, skip: 2, errors: 0 },
+    });
   });
 
   test("invariant 7: implement + done with no counts is `rejected`, and the app writes nothing", async () => {
     app = fakeApp();
-    app.queue({ id: "d4", taskType: "implement", brief: "go" });
+    app.queue({ id: "d4", taskType: "implement", items: [fakeItem(1)] });
     const c = client();
     await c.claim();
-    await c.update({ dispatchId: "d4", status: "running" });
+    await c.update({ dispatchId: "d4", runId: "run-1", status: "running" });
 
-    const refused = await c.update({ dispatchId: "d4", status: "done", summary: "green" });
+    const refused = await c.update({ dispatchId: "d4", runId: "run-1", status: "done", summary: "green" });
     expect(refused.ok).toBe(false);
     if (refused.ok) return;
     expect(refused.kind).toBe("rejected");
     expect(refused.status).toBe(422);
     expect(refused.issues?.[0]).toContain("pass/fail/skip/errors");
-    expect(app.rows.get("d4")?.status).toBe("running");
+    expect(app.runs.get("run-1")?.status).toBe("running");
   });
 
   test("a dispatch this daemon does not hold is `rejected`, not a crash", async () => {
-    const refused = await client().update({ dispatchId: "made-up", status: "failed" });
+    const refused = await client().update({ dispatchId: "made-up", runId: "run-made-up", status: "failed" });
     expect(refused.ok).toBe(false);
     if (refused.ok) return;
     expect(refused.kind).toBe("rejected");
     expect(refused.status).toBe(404);
+  });
+
+  test("a run that already finished answers 409, which is `rejected` and never retried", async () => {
+    app = fakeApp();
+    app.queue({ id: "d5", taskType: "research", items: [fakeItem(1)] });
+    const c = client();
+    await c.claim();
+    expect((await c.update({ dispatchId: "d5", runId: "run-1", status: "done" })).ok).toBe(true);
+
+    const again = await c.update({ dispatchId: "d5", runId: "run-1", status: "failed" });
+    expect(again.ok).toBe(false);
+    if (again.ok) return;
+    expect(again.kind).toBe("rejected");
+    expect(again.status).toBe(409);
   });
 });
 
@@ -150,7 +184,7 @@ describe("app client — how a call can fail", () => {
   test("401 is `unauthorized` on every route, and the message never carries the token", async () => {
     app = fakeApp();
     const c = client({ token: "kai_wrong_token_value" });
-    for (const result of [await c.heartbeat({ meta }), await c.claim(), await c.update({ dispatchId: "x", status: "failed" })]) {
+    for (const result of [await c.heartbeat({ meta }), await c.claim(), await c.update({ dispatchId: "x", runId: "y", status: "failed" })]) {
       expect(result.ok).toBe(false);
       if (result.ok) return;
       expect(result.kind).toBe("unauthorized");

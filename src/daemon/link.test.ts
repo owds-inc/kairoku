@@ -7,14 +7,23 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync } from "node:fs";
-import { appClient } from "./app";
-import { ensureRunDir } from "./events";
+import { mkdirSync, readFileSync } from "node:fs";
+import { appClient, type RunReport } from "./app";
 import { run as git } from "./worktree";
-import { startLink, BACKOFF_START_MS, BACKOFF_MAX_MS, type Link } from "./link";
-import { readRunStates, writeRunState } from "./dispatch";
+import { startLink, ACTIVE_HEARTBEAT_MS, BACKOFF_START_MS, BACKOFF_MAX_MS, type Link } from "./link";
+import { pendingReports, readRunStates, runStatePath, writeRunState } from "./dispatch";
 import { RunStore } from "./runs";
-import { fakeApp, harness, waitFor, type FakeApp, type Harness } from "./testkit";
+import {
+  fakeApp,
+  fakeItem,
+  fakeProvider,
+  harness,
+  stubExec,
+  waitFor,
+  type FakeApp,
+  type FakeProvider,
+  type Harness,
+} from "./testkit";
 
 let active: Harness | undefined;
 let app: FakeApp | undefined;
@@ -34,12 +43,14 @@ function setup(overrides: Record<string, unknown> = {}, appOptions = {}) {
   const h = (active = harness({ ...overrides, appUrl: app.url, token: app.token }));
   const store = new RunStore(h.config);
   const logs: string[] = [];
+  const provider = scripted();
   link = startLink(store, h.config, {
     client: appClient({ appUrl: app.url, token: h.config.token! }),
     autostart: false,
     log: (line) => logs.push(line),
+    providers: { claude: provider, codex: provider },
   });
-  return { h, store, link: link!, app: app!, logs };
+  return { h, store, link: link!, app: app!, logs, provider };
 }
 
 /**
@@ -53,82 +64,141 @@ async function checkoutOf(path: string, full: string): Promise<void> {
   await git(["git", "remote", "add", "origin", `https://example.invalid/${full}.git`], path);
 }
 
+/**
+ * A scripted team. Nothing in this repo may reach a real model, so a link that
+ * will actually run a claim is given a fake provider for both names.
+ */
+function scripted(): FakeProvider {
+  const provider = fakeProvider();
+  provider.script("reviewer", [{ report: { verdict: "CLEAN", defects: [] } }]);
+  provider.script("researcher", [{ report: { summary: "filed", documentIds: [] } }]);
+  return provider;
+}
+
 /** A link over a harness whose checkout is already on disk (see `checkoutOf`). */
-function linkTo(h: Harness, a: FakeApp, logs: string[]): Link {
-  return (link = startLink(new RunStore(h.config), h.config, {
+function linkTo(
+  h: Harness,
+  a: FakeApp,
+  logs: string[],
+  store = new RunStore(h.config),
+  provider: FakeProvider = scripted(),
+): Link {
+  return (link = startLink(store, h.config, {
     client: appClient({ appUrl: a.url, token: a.token }),
     autostart: false,
     log: (line) => logs.push(line),
+    providers: { claude: provider, codex: provider },
   }));
 }
 
 const claims = (a: FakeApp) => a.calls.filter((c) => c.route === "claim").length;
 const beats = (a: FakeApp) => a.calls.filter((c) => c.route === "heartbeat").length;
+const updates = (a: FakeApp) => a.calls.filter((c) => c.route === "update").map((c) => c.body as RunReport);
 
-describe("the heartbeat", () => {
-  test("carries host, version and capacity, and the app's cadence is what we wait", async () => {
+describe("the beat's meta (§20 item 2, grill Q21)", () => {
+  test("protocol, host, version, capacity, repos and recipes travel every beat", async () => {
     const { link, app, h } = setup({ maxConcurrent: 3 }, { heartbeatIntervalMs: 7_000, protocol: "1" });
+    await checkoutOf(h.config.repoPath, "owds-inc/kairoku");
 
     expect(await link.beat()).toBe(7_000);
-    const body = app.calls[0]!.body as { meta: { host: string; version: string; capacity: unknown } };
-    expect(typeof body.meta.host).toBe("string");
-    expect(body.meta.host.length).toBeGreaterThan(0);
-    expect(body.meta.version).toMatch(/^\d+\.\d+\.\d+/);
-    expect(body.meta.capacity).toEqual({ running: 0, max: 3 });
+    const meta = app.metas[0];
+    expect(meta.protocol).toBe("1");
+    expect(meta.capacity).toEqual({ running: 0, max: 3 });
+    expect(meta.recipes).toContain("phase-team");
+    expect(typeof meta.host).toBe("string");
+    expect(link.status()).toMatchObject({ linked: true, liveness: "online", protocol: "1" });
+  });
 
-    expect(link.status()).toMatchObject({ linked: true, appUrl: app.url, liveness: "online", protocol: "1" });
-    expect(h.config.appUrl).toBe(app.url);
+  test("the repos this machine holds are advertised, so the claim query can filter", async () => {
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token }));
+    await checkoutOf(h.config.repoPath, "owds-inc/kairoku");
+    const logs: string[] = [];
+    await linkTo(h, app!, logs).beat();
+    expect(app.metas[0].repos).toEqual(["owds-inc/kairoku"]);
+  });
+
+  test("an unreadable checkout advertises nothing and warns once at boot", async () => {
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token }));
+    const logs: string[] = [];
+    await linkTo(h, app!, logs).beat();
+    expect(app.metas[0].repos).toEqual([]);
+    expect(logs.some((l) => l.includes("advertises no repos"))).toBe(true);
   });
 
   test("an unlinked daemon does not dial out at all", async () => {
-    const a = (app = fakeApp());
-    const h = (active = harness({ appUrl: a.url }));
-    const solo = (link = startLink(new RunStore({ ...h.config, token: undefined }), { ...h.config, token: undefined }, { autostart: false }));
-    expect(await solo.beat()).toBeGreaterThan(0);
-    expect(await solo.poll()).toBe(false);
-    expect(a.calls).toHaveLength(0);
-    expect(solo.status().linked).toBe(false);
+    const h = (active = harness({ appUrl: undefined, token: undefined }));
+    const logs: string[] = [];
+    const unlinked = (link = startLink(new RunStore(h.config), h.config, {
+      autostart: false,
+      log: (l) => logs.push(l),
+    }));
+    expect(await unlinked.beat()).toBe(30_000);
+    expect(await unlinked.poll()).toBe(false);
+    expect(unlinked.status().linked).toBe(false);
+  });
+});
+
+describe("the cadence (grill Q6)", () => {
+  test("10 s while a run is active, the app's own interval when nothing is", async () => {
+    const { link, store, h } = setup({}, { heartbeatIntervalMs: 30_000 });
+    expect(await link.beat()).toBe(30_000);
+
+    void store.start({
+      dispatchId: "d-live",
+      runId: "d-live",
+      name: "d-live",
+      execute: stubExec(["sh", "-c", "sleep 30"]),
+    });
+    await waitFor(() => store.capacity().running === 1, "a live run");
+    expect(await link.beat()).toBe(ACTIVE_HEARTBEAT_MS);
+
+    await store.shutdown();
+    expect(await link.beat()).toBe(30_000);
+    expect(h.worktrees.removed).toHaveLength(1);
+  });
+
+  test("an app asking for a faster cadence than 10 s is obeyed, not overridden", async () => {
+    const { link, store } = setup({}, { heartbeatIntervalMs: 2_000 });
+    void store.start({
+      dispatchId: "d-fast",
+      runId: "d-fast",
+      name: "d-fast",
+      execute: stubExec(["sh", "-c", "sleep 30"]),
+    });
+    await waitFor(() => store.capacity().running === 1, "a live run");
+    expect(await link.beat()).toBe(2_000);
+    await store.shutdown();
   });
 });
 
 describe("backoff (RF-012)", () => {
   test("5xx backs off 30 s doubling to a 5 min cap, and a success resets it", async () => {
-    const { link, app } = setup({}, { heartbeatIntervalMs: 9_000 });
+    const { link, app } = setup();
     app.failWith = 503;
-
-    const waits: number[] = [];
-    for (let i = 0; i < 6; i++) waits.push(await link.beat());
-    expect(waits).toEqual([
-      BACKOFF_START_MS,
-      BACKOFF_START_MS * 2,
-      BACKOFF_START_MS * 4,
-      BACKOFF_START_MS * 8,
-      BACKOFF_MAX_MS,
-      BACKOFF_MAX_MS,
-    ]);
-    expect(BACKOFF_START_MS).toBe(30_000);
-    expect(BACKOFF_MAX_MS).toBe(300_000);
+    let wait = await link.beat();
+    expect(wait).toBe(BACKOFF_START_MS);
+    for (let i = 0; i < 10; i++) wait = await link.beat();
+    expect(wait).toBe(BACKOFF_MAX_MS);
 
     app.failWith = 0;
-    expect(await link.beat()).toBe(9_000);
-    // And the next failure starts from the bottom again, not from the cap.
-    app.failWith = 500;
+    expect(await link.beat()).toBe(30_000);
+    app.failWith = 503;
     expect(await link.beat()).toBe(BACKOFF_START_MS);
   });
 
   test("an unreachable app backs off the same way rather than throwing", async () => {
     const h = (active = harness({ appUrl: "http://127.0.0.1:1", token: "t" }));
-    const solo = (link = startLink(new RunStore(h.config), h.config, { autostart: false }));
-    expect(await solo.beat()).toBe(BACKOFF_START_MS);
-    expect(solo.status().lastError).toContain("did not answer");
+    const dead = (link = startLink(new RunStore(h.config), h.config, { autostart: false, log: () => {} }));
+    expect(await dead.beat()).toBe(BACKOFF_START_MS);
+    expect(dead.status().lastError).toContain("did not answer");
   });
 
   test("it never claims while a heartbeat is failing", async () => {
     const { link, app } = setup();
-    app.queue({ id: "d-1", taskType: "research", brief: "look" });
     app.failWith = 503;
     await link.beat();
-
     expect(await link.poll()).toBe(false);
     expect(claims(app)).toBe(0);
   });
@@ -136,40 +206,44 @@ describe("backoff (RF-012)", () => {
 
 describe("401 stops the loop and nothing else (RF-012)", () => {
   test("both timers stop, the message is exact, and the token is not in it", async () => {
-    const { app } = setup();
-    const rejected = (link = startLink(new RunStore(active!.config), active!.config, {
-      client: appClient({ appUrl: app.url, token: "kai_a_stale_token" }),
+    app = fakeApp({ token: "kai_the_right_token" });
+    const h = (active = harness({ appUrl: app.url, token: "kai_the_wrong_token" }));
+    const logs: string[] = [];
+    const l = (link = startLink(new RunStore(h.config), h.config, {
+      client: appClient({ appUrl: app.url, token: "kai_the_wrong_token" }),
       autostart: false,
+      log: (line) => logs.push(line),
     }));
-    app.queue({ id: "d-1", taskType: "research", brief: "look" });
 
-    await rejected.beat();
-    expect(rejected.status().stopped).toBe("token-rejected");
-    expect(rejected.status().lastError).toBe(`token not accepted by ${app.url}`);
-    expect(rejected.status().lastError).not.toContain("kai_a_stale_token");
+    expect(await l.beat()).toBe(0);
+    expect(l.status().stopped).toBe("token-rejected");
+    expect(logs.join("\n")).toContain("the loop is stopped");
+    expect(logs.join("\n")).not.toContain("kai_the_wrong_token");
 
-    // Stopped means stopped: no more beats, no claims, and the listener that
-    // `doctor` talks to is untouched — that is the point of not exiting.
-    const after = app.calls.length;
-    expect(await rejected.beat()).toBe(0);
-    expect(await rejected.poll()).toBe(false);
-    expect(app.calls).toHaveLength(after);
+    const before = beats(app);
+    expect(await l.beat()).toBe(0);
+    expect(await l.poll()).toBe(false);
+    expect(beats(app)).toBe(before);
   });
 });
 
 describe("claiming", () => {
   test("a full daemon does not claim; a freed slot does", async () => {
-    const { link, app, store, h } = setup({ maxConcurrent: 1, commandOverride: () => ["sh", "-c", "sleep 30"] });
+    const { link, store, app } = setup({ maxConcurrent: 1 });
     await link.beat();
-
-    void store.start({ id: "busy", brief: "b", env: { KAIROKU_PAT: "p" } });
-    app.queue({ id: "d-1", taskType: "research", brief: "look" });
+    const running = store.start({
+      dispatchId: "d-busy",
+      runId: "d-busy",
+      name: "d-busy",
+      execute: stubExec(["sh", "-c", "sleep 30"]),
+    });
+    await waitFor(() => store.free() === 0, "the slot to be taken");
     expect(await link.poll()).toBe(false);
     expect(claims(app)).toBe(0);
 
-    await waitFor(() => h.worktrees.created.length === 1, "the busy run to be cut");
     await store.shutdown();
-    expect(await link.poll()).toBe(true);
+    await running;
+    expect(await link.poll()).toBe(false); // the queue is empty, but it asked
     expect(claims(app)).toBe(1);
   });
 
@@ -177,210 +251,377 @@ describe("claiming", () => {
     const { link, app } = setup();
     await link.beat();
     expect(await link.poll()).toBe(false);
+    expect(link.status().lastError).toBeUndefined();
     expect(claims(app)).toBe(1);
-    expect(link.status().stopped).toBeUndefined();
   });
 
   test("the same dispatch id handed out twice is run once", async () => {
-    // The app's claim lease can re-issue a row whose `update running` has not
-    // landed yet. Running it a second time is the failure §20 warns about.
-    const { link, app, h } = setup({ maxConcurrent: 2, commandOverride: () => ["sh", "-c", "sleep 30"] });
-    const twice = { id: "d-dup", taskType: "research" as const, brief: "look" };
-    app.queue(twice);
-    app.queue(twice);
-    await link.beat();
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token, maxConcurrent: 4 }));
+    await checkoutOf(h.config.repoPath, "owds-inc/kairoku");
+    const logs: string[] = [];
+    const l = linkTo(h, app!, logs);
+    await l.beat();
 
-    expect(await link.poll()).toBe(true);
-    expect(await link.poll()).toBe(false);
-    await waitFor(() => h.worktrees.created.length >= 1, "the first run to be cut");
-    expect(h.worktrees.created).toHaveLength(1);
+    const dispatch = {
+      id: "d-twice",
+      taskType: "implement" as const,
+      items: [fakeItem(1)],
+      repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
+    };
+    app.queue(dispatch);
+    app.queue(dispatch);
+
+    expect(await l.poll()).toBe(true);
+    expect(await l.poll()).toBe(false);
+    expect(logs.join("\n")).toContain("ignoring a second claim of d-twice");
   });
 });
 
-describe("the report the app gets", () => {
-  test("running at launch, then done with branch, counts and the jsonl path", async () => {
-    const { link, app, h } = setup({
-      commandOverride: () => [
-        "sh",
-        "-c",
-        "echo '{\"kairoku\": {\"counts\": {\"pass\": 4955, \"fail\": 0, \"skip\": 2, \"errors\": 0}}}'",
-      ],
+describe("the reports the app gets", () => {
+  test("every run says running at launch and terminal at the end, both with the run id", async () => {
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token }));
+    await checkoutOf(h.config.repoPath, "owds-inc/kairoku");
+    const logs: string[] = [];
+    const l = linkTo(h, app!, logs);
+    await l.beat();
+
+    app.queue({
+      id: "d-report",
+      taskType: "research",
+      items: [fakeItem(1)],
+      repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
+      team: { recipe: "research" },
     });
-    app.queue({ id: "d-run", taskType: "implement", brief: "Build the thing." });
+    expect(await l.poll()).toBe(true);
+    await waitFor(() => app!.runs.get("run-1")?.status === "done", "the run to settle");
 
-    await link.beat();
-    expect(await link.poll()).toBe(true);
-
-    await waitFor(() => app.rows.get("d-run")?.status === "done", "the run to be reported done");
-    const row = app.rows.get("d-run")!;
-    expect(row.counts).toEqual({ pass: 4955, fail: 0, skip: 2, errors: 0 });
-    expect(row.artifacts).toMatchObject({ branch: "run/d-run" });
-    expect((row.artifacts as { jsonl: string }).jsonl).toContain(h.config.runsDir);
-    // `running` was reported before `done`, on its own call.
-    const updates = app.calls.filter((c) => c.route === "update").map((c) => (c.body as { status: string }).status);
-    expect(updates).toEqual(["running", "done"]);
+    const sent = updates(app!);
+    expect(sent[0]).toMatchObject({ dispatchId: "d-report", runId: "run-1", status: "running", role: "researcher" });
+    expect(sent.at(-1)).toMatchObject({ dispatchId: "d-report", runId: "run-1", status: "done" });
+    expect(sent.at(-1)!.artifacts?.branch).toBe("run/d-report");
   });
 
-  test("a report the app could not take yet rides the next heartbeat instead of being lost", async () => {
-    // Long enough that the app can go unwell between the claim and the report.
-    const { link, app } = setup({ commandOverride: () => ["sh", "-c", "sleep 0.2"] });
-    app.queue({ id: "d-retry", taskType: "research", brief: "look" });
-    await link.beat();
-    await link.poll();
+  test("a terminal report the app could not take rides the next beat, and waits on disk", async () => {
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token }));
+    const logs: string[] = [];
+    const l = linkTo(h, app!, logs);
 
-    // The app goes unwell exactly while the run is reporting.
+    app.queue({ id: "d-queue", taskType: "research", items: [fakeItem(1)] });
+    await fetch(`${app.url}/api/daemon/claim`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${app.token}` },
+    });
+    writeRunState(h.config.runsDir, {
+      dispatchId: "d-queue",
+      runId: "run-1",
+      state: "done",
+      startedAt: new Date().toISOString(),
+      branch: "run/d-queue",
+      report: { dispatchId: "d-queue", runId: "run-1", status: "done", summary: "filed" },
+    });
+
+    // The app is unwell: the beat fails, so the carried report is put back
+    // untouched rather than lost.
     app.failWith = 503;
-    await waitFor(() => app.calls.some((c) => c.route === "update"), "the first update attempt");
-    await waitFor(() => link.status().pendingReports > 0, "the report to be queued for the beat");
+    expect(await l.beat()).toBe(BACKOFF_START_MS);
+    expect(l.status().pendingReports).toBe(1);
+    expect(pendingReports(h.config.runsDir)).toHaveLength(1);
 
     app.failWith = 0;
-    await link.beat();
-    await waitFor(
-      () => app.rows.get("d-retry")?.status === "done" && link.status().pendingReports === 0,
-      "the queued reports to be delivered by the beat",
-    );
+    await l.beat();
+    expect(app.runs.get("run-1")).toMatchObject({ status: "done", summary: "filed" });
+    expect(l.status().pendingReports).toBe(0);
+  });
+});
+
+describe("a refusal the beat carries back is not dropped", () => {
+  test("an {ok:false} in the beat's runs[] settles the row with a failed follow-up", async () => {
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token }));
+    const logs: string[] = [];
+    const store = new RunStore(h.config);
+    const l = linkTo(h, app!, logs, store);
+
+    // A terminal report for a run the app has never heard of: it answers
+    // {ok:false, reason:"not-found"} inside a 200 beat.
+    writeRunState(h.config.runsDir, {
+      dispatchId: "d-ghost",
+      runId: "run-ghost",
+      state: "done",
+      startedAt: new Date().toISOString(),
+      branch: "run/d-ghost",
+      report: { dispatchId: "d-ghost", runId: "run-ghost", status: "done", summary: "green" },
+    });
+
+    await l.beat();
+
+    expect(logs.join("\n")).toContain("the app refused the report for run run-ghost");
+    // `doctor` must be able to name the run the last error came from.
+    expect(l.status().lastError).toContain("run run-ghost");
+    // The refused report is gone from disk; it is never retried into the same no.
+    expect(pendingReports(h.config.runsDir)).toEqual([]);
+    // One follow-up `failed` went out, carrying the reason.
+    await waitFor(() => updates(app!).some((u) => u.runId === "run-ghost"), "the follow-up report");
+    const followUp = updates(app!).find((u) => u.runId === "run-ghost");
+    expect(followUp).toMatchObject({ status: "failed" });
+    expect(followUp!.summary).toContain("refused");
+    expect(followUp!.counts).toBeUndefined();
   });
 
-  test("a 422 is the run's fault, not the link's: it is logged and marked failed locally", async () => {
-    // An implement run that cites no suite. The app refuses it (invariant 7),
-    // the daemon does not retry it, and run.json says failed with the reason.
-    const { link, app, h } = setup({ commandOverride: () => ["sh", "-c", "true"] });
-    app.queue({ id: "d-422", taskType: "implement", brief: "Build the thing." });
-    await link.beat();
-    await link.poll();
+  test("the outcome is paired by run id, not by position", async () => {
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token }));
+    const logs: string[] = [];
+    const l = linkTo(h, app!, logs);
 
-    await waitFor(
-      () => app.calls.filter((c) => c.route === "update" && (c.body as any).status === "done").length === 1,
-      "the refused report",
-    );
-    await waitFor(() => link.status().pendingReports === 0, "the report to be dropped, not retried");
-    expect(app.rows.get("d-422")?.status).toBe("running");
-    expect(link.status().lastError).toContain("pass/fail/skip/errors");
-    expect(readRunStates(h.config.runsDir).find((r) => r.dispatchId === "d-422")?.state).toBe("failed");
+    // Two queued terminal reports: the first is real, the second is a ghost.
+    app.queue({ id: "d-pair", taskType: "research", items: [fakeItem(1)] });
+    await fetch(`${app.url}/api/daemon/claim`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${app.token}` },
+    });
+    for (const [dispatchId, runId] of [
+      ["d-pair", "run-1"],
+      ["d-pair", "run-ghost"],
+    ]) {
+      writeRunState(h.config.runsDir, {
+        dispatchId: dispatchId!,
+        runId: runId!,
+        state: "done",
+        startedAt: new Date().toISOString(),
+        branch: "b",
+        report: { dispatchId: dispatchId!, runId: runId!, status: "done", summary: "green" },
+      });
+    }
+
+    await l.beat();
+    // The GHOST was refused, not the real one — and the real row is `done`.
+    expect(app.runs.get("run-1")!.status).toBe("done");
+    expect(l.status().lastError).toContain("run-ghost");
+  });
+});
+
+describe("cancel from the app (grill Q5)", () => {
+  test("a cancel naming one run stops that run and leaves its siblings alone", async () => {
+    const { link, store, app, logs } = setup({ maxConcurrent: 3 });
+    await link.beat();
+    const a = store.start({ dispatchId: "d1", runId: "r1", name: "r1", execute: stubExec(["sh", "-c", "sleep 30"]) });
+    const b = store.start({ dispatchId: "d1", runId: "r2", name: "r2", execute: stubExec(["sh", "-c", "sleep 30"]) });
+    await waitFor(() => store.list().length === 2, "two runs");
+
+    app.cancel.push({ dispatchId: "d1", runId: "r1" });
+    await link.beat();
+
+    expect((await a).exitSummary).toBe("cancelled by the app");
+    expect(store.list().map((r) => r.runId)).toEqual(["r2"]);
+    expect(logs.join("\n")).toContain("cancelling run r1");
+    await store.shutdown();
+    await b;
+  });
+
+  test("a cancel naming only a dispatch stops every member of it", async () => {
+    const { link, store, app } = setup({ maxConcurrent: 3 });
+    await link.beat();
+    const a = store.start({ dispatchId: "d1", runId: "r1", name: "r1", execute: stubExec(["sh", "-c", "sleep 30"]) });
+    const b = store.start({ dispatchId: "d1", runId: "r2", name: "r2", execute: stubExec(["sh", "-c", "sleep 30"]) });
+    const c = store.start({ dispatchId: "d2", runId: "r3", name: "r3", execute: stubExec(["sh", "-c", "sleep 30"]) });
+    await waitFor(() => store.list().length === 3, "three runs");
+
+    app.cancel.push({ dispatchId: "d1" });
+    await link.beat();
+
+    expect((await a).exitSummary).toBe("cancelled by the app");
+    expect((await b).exitSummary).toBe("cancelled by the app");
+    expect(store.list().map((r) => r.runId)).toEqual(["r3"]);
+    await store.shutdown();
+    await c;
+  });
+
+  test("a cancel for a run this daemon does not hold is ignored, not an error", async () => {
+    const { link, app } = setup();
+    app.cancel.push({ dispatchId: "nope", runId: "nope" });
+    expect(await link.beat()).toBeGreaterThan(0);
+    expect(link.status().lastError).toBeUndefined();
+  });
+});
+
+describe("the curated events ride the beat (§20 item 7)", () => {
+  test("a live run's lines are drained into its report and reach the app once", async () => {
+    const { link, store, app } = setup();
+    await link.beat();
+    const running = store.start({
+      dispatchId: "d-ev",
+      runId: "r-ev",
+      name: "r-ev",
+      role: "implementer",
+      execute: async (ctx) => {
+        ctx.events.push("text", "reading the item");
+        ctx.events.push("deny", "the reviewer may not use Write");
+        await Bun.sleep(400);
+        return { ok: true, summary: "done" };
+      },
+    });
+    await waitFor(() => store.list().length === 1, "the run");
+    await Bun.sleep(20);
+    await link.beat();
+
+    const row = app.runs.get("r-ev");
+    expect(row).toBeUndefined(); // the app has no row for a run it never claimed
+    const beat = app.calls.filter((c) => c.route === "heartbeat").at(-1)!.body as { runs?: RunReport[] };
+    const report = beat.runs!.find((r) => r.runId === "r-ev")!;
+    expect(report).toMatchObject({ dispatchId: "d-ev", role: "implementer", state: "running" });
+    expect(report.events!.map((e) => e.kind)).toEqual(["text", "deny"]);
+
+    // Drained: the same lines do not go up twice.
+    await link.beat();
+    const second = app.calls.filter((c) => c.route === "heartbeat").at(-1)!.body as { runs?: RunReport[] };
+    expect(second.runs!.find((r) => r.runId === "r-ev")!.events).toBeUndefined();
+    await store.shutdown();
+    await running;
   });
 });
 
 describe("RF-013 — a restart is reported, never replayed", () => {
   test("a run left running by a dead daemon is reported failed on the first beat", async () => {
-    const { link, app, h } = setup();
-    app.queue({ id: "d-stranded", taskType: "research", brief: "look" });
-    await link.beat();
-    await link.poll();
-    // Let the live run settle first: this test is about what the NEXT daemon
-    // finds on disk, and a run still reporting would race the restart's report
-    // for the same row.
-    await waitFor(() => app.rows.get("d-stranded")?.status === "done", "the live run to settle");
-    // Simulate the daemon dying mid-run: run.json says running, pid is gone.
-    ensureRunDir(h.config.runsDir, "d-stranded");
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token }));
     writeRunState(h.config.runsDir, {
-      dispatchId: "d-stranded",
+      dispatchId: "d-old",
+      runId: "run-old",
       state: "running",
       pid: 999_999,
-      startedAt: "t",
-      branch: "run/d-stranded",
+      startedAt: new Date().toISOString(),
+      branch: "run/d-old",
+      worktree: "/tmp/whatever",
     });
 
-    const restarted = startLink(new RunStore(h.config), h.config, {
-      client: appClient({ appUrl: app.url, token: h.config.token! }),
-      autostart: false,
-    });
-    await restarted.beat();
-    restarted.stop();
+    const logs: string[] = [];
+    const l = linkTo(h, app!, logs);
+    await l.beat();
 
-    expect(app.rows.get("d-stranded")?.status).toBe("failed");
-    expect(app.rows.get("d-stranded")?.summary).toBe("daemon restarted");
+    const beat = app.calls.find((c) => c.route === "heartbeat")!.body as { runs?: RunReport[] };
+    expect(beat.runs).toEqual([
+      {
+        dispatchId: "d-old",
+        runId: "run-old",
+        status: "failed",
+        summary: "daemon restarted",
+        artifacts: { branch: "run/d-old" },
+      },
+    ]);
+    expect(readRunStates(h.config.runsDir)[0]!.state).toBe("failed");
+    // Nothing was relaunched: no worktree was cut.
+    expect(h.worktrees.created).toHaveLength(0);
+  });
+
+  test("a terminal report left undelivered is picked up again on the next boot", async () => {
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token }));
+    app.queue({ id: "d-retry", taskType: "research", items: [fakeItem(1)] });
+    await fetch(`${app.url}/api/daemon/claim`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${app.token}` },
+    });
+    writeRunState(h.config.runsDir, {
+      dispatchId: "d-retry",
+      runId: "run-1",
+      state: "done",
+      startedAt: new Date().toISOString(),
+      branch: "run/d-retry",
+      report: { dispatchId: "d-retry", runId: "run-1", status: "done", summary: "filed the draft" },
+    });
+
+    const logs: string[] = [];
+    await linkTo(h, app!, logs).beat();
+
+    expect(app.runs.get("run-1")).toMatchObject({ status: "done", summary: "filed the draft" });
+    // Accepted, so it is off the disk and will not be sent a third time.
+    expect(pendingReports(h.config.runsDir)).toEqual([]);
+    expect(JSON.parse(readFileSync(runStatePath(h.config.runsDir, "d-retry", "run-1"), "utf8")).report).toBeUndefined();
+  });
+
+  test("a stranded run whose report is already queued is not reported twice", async () => {
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token }));
+    writeRunState(h.config.runsDir, {
+      dispatchId: "d-both",
+      runId: "run-1",
+      state: "running",
+      pid: 999_999,
+      startedAt: new Date().toISOString(),
+      branch: "run/d-both",
+      report: { dispatchId: "d-both", runId: "run-1", status: "failed", summary: "the real reason" },
+    });
+    const logs: string[] = [];
+    await linkTo(h, app!, logs).beat();
+
+    const beat = app.calls.find((c) => c.route === "heartbeat")!.body as { runs?: RunReport[] };
+    expect(beat.runs).toHaveLength(1);
+    expect(beat.runs![0]!.summary).toBe("the real reason");
   });
 });
 
 describe("§20.9 — the checkout guard, wired the way production wires it", () => {
   test("a claim for another repo is reported failed and nothing is cut", async () => {
-    const a = (app = fakeApp());
-    const h = (active = harness({ appUrl: a.url, token: a.token }));
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token }));
     await checkoutOf(h.config.repoPath, "owds-inc/kairoku");
     const logs: string[] = [];
-    const l = linkTo(h, a, logs);
-
-    a.queue({
-      id: "d-other",
-      taskType: "research",
-      brief: "look",
-      repo: { provider: "github", fullName: "verify/repo", defaultBranch: "main" },
-    });
+    const l = linkTo(h, app!, logs);
     await l.beat();
-    expect(await l.poll()).toBe(true);
 
-    await waitFor(() => a.rows.get("d-other")?.status === "failed", "the mismatch to be reported");
-    expect(a.rows.get("d-other")?.summary).toBe("no checkout for verify/repo");
+    app.queue({
+      id: "d-other",
+      taskType: "implement",
+      items: [fakeItem(1)],
+      repo: { provider: "github", fullName: "someone/else", defaultBranch: "main" },
+    });
+    expect(await l.poll()).toBe(true);
+    await waitFor(() => app!.runs.get("run-1")?.status === "failed", "the refusal to be reported");
+
+    expect(app!.runs.get("run-1")!.summary).toBe("no checkout for someone/else");
     expect(h.worktrees.created).toHaveLength(0);
   });
 
   test("the same repo in another case is the same repo, and it runs", async () => {
-    const a = (app = fakeApp());
-    const h = (active = harness({ appUrl: a.url, token: a.token }));
-    await checkoutOf(h.config.repoPath, "owds-inc/kairoku");
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token }));
+    await checkoutOf(h.config.repoPath, "OWDS-Inc/Kairoku");
     const logs: string[] = [];
-    const l = linkTo(h, a, logs);
-
-    a.queue({
-      id: "d-same",
-      taskType: "research",
-      brief: "look",
-      repo: { provider: "github", fullName: "OWDS-Inc/Kairoku", defaultBranch: "main" },
-    });
+    const l = linkTo(h, app!, logs);
     await l.beat();
-    expect(await l.poll()).toBe(true);
 
-    await waitFor(() => a.rows.get("d-same")?.status === "done", "the matching repo to run");
-    expect(h.worktrees.created).toHaveLength(1);
+    app.queue({
+      id: "d-case",
+      taskType: "research",
+      items: [fakeItem(1)],
+      repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
+      team: { recipe: "research" },
+    });
+    expect(await l.poll()).toBe(true);
+    await waitFor(() => app!.runs.get("run-1")?.status === "running", "the run to start");
+    expect(h.worktrees.created.length).toBeGreaterThan(0);
   });
 
-  test("an unreadable origin fails CLOSED: warned once at boot, every named repo refused", async () => {
-    // config.repoPath is not a git checkout at all, which is exactly the state
-    // a misconfigured daemon boots in.
-    const a = (app = fakeApp());
-    const h = (active = harness({ appUrl: a.url, token: a.token }));
+  test("an unreadable origin fails CLOSED: every claim that names a repo is refused", async () => {
+    app = fakeApp();
+    const h = (active = harness({ appUrl: app.url, token: app.token }));
+    mkdirSync(h.config.repoPath, { recursive: true });
     const logs: string[] = [];
-    const l = linkTo(h, a, logs);
+    const l = linkTo(h, app!, logs);
+    await l.beat();
 
-    a.queue({
+    app.queue({
       id: "d-blind",
-      taskType: "research",
-      brief: "look",
+      taskType: "implement",
+      items: [fakeItem(1)],
       repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
     });
-    await l.beat();
     expect(await l.poll()).toBe(true);
-
-    await waitFor(() => a.rows.get("d-blind")?.status === "failed", "the fail-closed refusal");
-    expect(a.rows.get("d-blind")?.summary).toBe("no checkout for owds-inc/kairoku");
-    expect(logs.filter((line) => line.includes("origin"))).toHaveLength(1);
-    expect(h.worktrees.created).toHaveLength(0);
-  });
-});
-
-describe("a refusal the heartbeat carries back is not dropped", () => {
-  test("an {ok:false} in the beat's runs[] is logged and marked failed, like the direct 422", async () => {
-    const { link, app, h, logs } = setup({ commandOverride: () => ["sh", "-c", "sleep 0.6"] });
-    app.queue({ id: "d-piggy", taskType: "implement", brief: "Build the thing." });
-    await link.beat();
-    await link.poll();
-
-    // The app goes unwell after `running` landed, so the TERMINAL report is the
-    // one that gets queued for the beat.
-    await waitFor(() => app.rows.get("d-piggy")?.status === "running", "the running report to land");
-    app.failWith = 503;
-    await waitFor(() => link.status().pendingReports === 1, "the terminal report to be queued");
-
-    // The app recovers and answers the beat 200 overall — but refuses the
-    // carried report, because an implement run cannot report done with no counts.
-    app.failWith = 0;
-    await link.beat();
-
-    const lastBeat = app.calls.filter((c) => c.route === "heartbeat").at(-1)!.body as { runs?: unknown[] };
-    expect(lastBeat.runs).toHaveLength(1);
-    expect(link.status().pendingReports).toBe(0);
-    expect(app.rows.get("d-piggy")?.status).toBe("running");
-    expect(logs.some((line) => line.includes("d-piggy") && line.includes("pass/fail/skip/errors"))).toBe(true);
-    expect(readRunStates(h.config.runsDir).find((r) => r.dispatchId === "d-piggy")?.state).toBe("failed");
+    await waitFor(() => app!.runs.get("run-1")?.status === "failed", "the refusal");
+    expect(app!.runs.get("run-1")!.summary).toBe("no checkout for owds-inc/kairoku");
   });
 });

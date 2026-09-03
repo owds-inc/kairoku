@@ -6,7 +6,7 @@
     {
       "name": "kairoku",
       "source": "./plugin/",
-      "description": "Kairoku's MCP tools over OAuth (no pasted tokens), the jira-ops / git-pr / kairoku-mcp protocol skills, and the implementer agent."
+      "description": "Kairoku's MCP tools over OAuth (no pasted tokens), the jira-ops / git-pr / kairoku-mcp protocol skills, and the implementer, reviewer, planner and researcher role agents."
     }
   ]
 }

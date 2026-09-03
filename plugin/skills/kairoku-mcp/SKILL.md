@@ -353,6 +353,7 @@ anything that fires the app's outbound sync — and that omission is deliberate:
 | **Push plan → Jira** (Sync tab) | The only writer that creates `sync_mappings`. No `push_plan` tool exists |
 | **Publish document → Confluence** | Same: the publish path is what records the page mapping |
 | Changing a release stage | A gate, not a status |
+| **The Done transition on a plan item** | Done comes from the merge, or from a person. `update_item_status` REFUSES `done` from an agent credential and answers with an error; `in_progress` and `blocked` are yours. An item with **needs manual check** set waits for a person's Mark done even after its pull request merges |
 
 So the shape is: **agents write into Kairoku, the human pushes out of it.** Write the document
 or the plan, then say plainly what the user needs to click and what scope to push. Do not

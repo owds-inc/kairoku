@@ -8,16 +8,16 @@
  * now a gate on CLAIMING — `link.test.ts` — and credential distinctness moves
  * to issuance when the app mints one token per run (RF-008 amended).
  *
- * No real `codex`, no network. Agent commands are stubbed through
- * Config.commandOverride (RF-009's test-only config).
+ * No real `codex`, no `claude`, no network. The stub agent is the smallest
+ * possible member body — one shell command — through `stubExec`.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { RunStore } from "./runs";
-import { eventsPath } from "./events";
-import { harness, waitFor, type Harness } from "./testkit";
+import { eventsPath, stdoutPath } from "./events";
+import { harness, stubExec, waitFor, type Harness } from "./testkit";
 
 let active: Harness | undefined;
 afterEach(() => {
@@ -26,7 +26,7 @@ afterEach(() => {
 });
 
 function events(h: Harness, runId: string): Array<Record<string, unknown>> {
-  const path = eventsPath(h.config.runsDir, runId);
+  const path = eventsPath(h.config.runsDir, runId, runId);
   if (!existsSync(path)) return [];
   return readFileSync(path, "utf8")
     .split("\n")
@@ -43,10 +43,15 @@ function alive(pid: number): boolean {
   }
 }
 
-const spec = (id: string, extra: Record<string, unknown> = {}) => ({
-  id,
-  brief: "build the thing",
-  env: { KAIROKU_PAT: `pat-${id}` },
+const spec = (h: Harness, id: string, command: (cwd: string) => string, extra: Record<string, unknown> = {}) => ({
+  dispatchId: id,
+  runId: id,
+  name: id,
+  execute: async (ctx: Parameters<Parameters<RunStore["start"]>[0]["execute"]>[0]) =>
+    stubExec(["sh", "-c", command(ctx.worktree.path)], {
+      env: { KAIROKU_PAT: `pat-${id}` },
+      stdoutPath: () => stdoutPath(h.config.runsDir, id, id),
+    })(ctx),
   ...extra,
 });
 
@@ -55,11 +60,11 @@ describe("supervision", () => {
     // The stub agent backgrounds a grandchild and records its pid. Killing only
     // the direct child would leave that grandchild running — the exact leak
     // RF-010's process-group kill exists to prevent.
-    const h = (active = harness({
-      commandOverride: (spec) => ["sh", "-c", `sleep 30 & echo $! > ${spec.cwd}/grandchild.pid; sleep 30`],
-    }));
+    const h = (active = harness());
     const store = new RunStore(h.config);
-    const running = store.start(spec("r-orphan"));
+    const running = store.start(
+      spec(h, "r-orphan", (cwd) => `sleep 30 & echo $! > ${cwd}/grandchild.pid; sleep 30`),
+    );
 
     const worktree = join(h.config.worktreesDir, "r-orphan");
     const pidFile = join(worktree, "grandchild.pid");
@@ -69,7 +74,7 @@ describe("supervision", () => {
     expect(alive(grandchild)).toBe(true);
 
     expect(store.cancel("r-orphan")).toBe(true);
-    expect(await running).toMatchObject({ status: "error", exitSummary: "cancelled" });
+    expect(await running).toMatchObject({ status: "error", exitSummary: "cancelled by the app" });
     await waitFor(() => !alive(grandchild), "orphaned grandchild to be reaped");
 
     // And teardown still ran on this exit path.
@@ -78,11 +83,11 @@ describe("supervision", () => {
   });
 
   test("timeout kills the agent, marks `timeout`, and tears the worktree down", async () => {
-    const h = (active = harness({ commandOverride: () => ["sh", "-c", "sleep 30"] }));
+    const h = (active = harness());
     const store = new RunStore(h.config);
 
-    const result = await store.start(spec("r-timeout", { timeoutSec: 0.5 }));
-    expect(result).toMatchObject({ status: "timeout", exitSummary: "timeout after 0.5s" });
+    const result = await store.start(spec(h, "r-timeout", () => "sleep 30", { timeoutSec: 0.5 }));
+    expect(result).toMatchObject({ status: "timeout", exitSummary: "time limit: 0.5s" });
 
     const worktree = join(h.config.worktreesDir, "r-timeout");
     expect(h.worktrees.removed.map((w) => w.path)).toContain(worktree);
@@ -95,11 +100,11 @@ describe("supervision", () => {
   test("daemon SIGTERM kills children, marks runs, and tears worktrees down", async () => {
     // store.shutdown() is exactly what the SIGTERM handler in server.ts calls;
     // a separate test proves that handler is wired to a real signal.
-    const h = (active = harness({ commandOverride: () => ["sh", "-c", "sleep 30"] }));
+    const h = (active = harness());
     const store = new RunStore(h.config);
 
-    const a = store.start(spec("r-sd-a"));
-    const b = store.start(spec("r-sd-b"));
+    const a = store.start(spec(h, "r-sd-a", () => "sleep 30"));
+    const b = store.start(spec(h, "r-sd-b", () => "sleep 30"));
     await waitFor(() => h.worktrees.created.length === 2, "both worktrees to be set up");
 
     await store.shutdown();
@@ -114,9 +119,20 @@ describe("supervision", () => {
   });
 
   test("no credential ever reaches the event log", async () => {
-    const h = (active = harness({ commandOverride: () => ["sh", "-c", "exit 0"] }));
+    const h = (active = harness());
     const store = new RunStore(h.config);
-    await store.start(spec("r-secret", { env: { KAIROKU_PAT: "a-shared-secret-value" } }));
-    expect(readFileSync(eventsPath(h.config.runsDir, "r-secret"), "utf8")).not.toContain("a-shared-secret-value");
+    await store.start({
+      ...spec(h, "r-secret", () => 'echo "$KAIROKU_PAT"'),
+      secrets: ["a-shared-secret-value"],
+      execute: async (ctx) => {
+        // The worst case: the agent echoes its own credential back at us.
+        ctx.events.push("text", "my token is a-shared-secret-value");
+        return { ok: true, summary: "exit 0" };
+      },
+    });
+    expect(readFileSync(eventsPath(h.config.runsDir, "r-secret", "r-secret"), "utf8")).not.toContain(
+      "a-shared-secret-value",
+    );
+    expect(JSON.stringify(store.drainEvents("r-secret"))).not.toContain("a-shared-secret-value");
   });
 });

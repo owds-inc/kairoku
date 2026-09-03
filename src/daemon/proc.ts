@@ -9,7 +9,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { closeSync, openSync } from "node:fs";
+import { closeSync, openSync, writeSync } from "node:fs";
 
 export type Outcome = "exited" | "timeout" | "cancelled" | "shutdown";
 
@@ -38,6 +38,12 @@ export interface LaunchOptions {
   readonly stdin?: string;
   /** stdout and stderr are both appended here. */
   readonly stdoutPath: string;
+  /**
+   * O-3: every line the child prints, as it prints it. The file above is still
+   * written in full — this is the same bytes, forwarded, so a provider can turn
+   * its tool's event stream into curated events without tailing a log.
+   */
+  readonly onLine?: (line: string) => void;
   readonly timeoutMs: number;
   /** Grace between SIGTERM and SIGKILL on a group kill. */
   readonly killGraceMs?: number;
@@ -99,12 +105,44 @@ export function launch(opts: LaunchOptions): ProcHandle {
       // setsid: the child becomes a process-group leader, so -pid reaches the
       // agent and everything it spawns.
       detached: true,
-      stdio: ["pipe", fd, fd],
+      // PIPED, then written through to the log ourselves. Handing the fd
+      // straight to the child would be one syscall fewer and no way to see a
+      // line while the run is still happening, which is the whole of the
+      // curated event channel.
+      stdio: ["pipe", "pipe", "pipe"],
     });
   } catch (err) {
     closeSync(fd);
     throw err;
   }
+
+  // Line-buffered on purpose: a JSONL event stream is only parseable whole
+  // lines at a time, and the tail that never ends with a newline is flushed
+  // when the stream closes.
+  let partial = "";
+  const forward = (chunk: Buffer | string) => {
+    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    try {
+      writeSync(fd, text);
+    } catch {
+      // The log is diagnostics; a failed write must not take the run down.
+    }
+    if (!opts.onLine) return;
+    partial += text;
+    let cut = partial.indexOf("\n");
+    while (cut >= 0) {
+      const line = partial.slice(0, cut);
+      partial = partial.slice(cut + 1);
+      if (line.trim() !== "") opts.onLine(line);
+      cut = partial.indexOf("\n");
+    }
+  };
+  const flush = () => {
+    if (opts.onLine && partial.trim() !== "") opts.onLine(partial);
+    partial = "";
+  };
+  child.stdout?.on("data", forward);
+  child.stderr?.on("data", forward);
 
   /** Set by cancel/shutdown/timeout so the exit handler reports the cause. */
   let pending: Outcome | null = null;
@@ -119,6 +157,7 @@ export function launch(opts: LaunchOptions): ProcHandle {
   const settle = (result: ProcResult) => {
     if (settled) return;
     settled = true;
+    flush();
     clearTimeout(timeoutTimer);
     clearTimeout(graceTimer);
     try {

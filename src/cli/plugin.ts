@@ -9,7 +9,9 @@ import type { Io } from "./io";
 
 export const MARKETPLACE_SOURCE = "owds-inc/kairoku";
 export const MARKETPLACE = "kairoku-marketplace";
-export const PLUGIN = `kairoku@${MARKETPLACE}`;
+/** The plugin's own name — also the directory `claude plugin install` creates. */
+export const PLUGIN_NAME = "kairoku";
+export const PLUGIN = `${PLUGIN_NAME}@${MARKETPLACE}`;
 
 export const usage = `usage: kairoku plugin install|update|status
 
@@ -34,11 +36,32 @@ async function json<T>(io: Io, argv: string[]): Promise<T | null> {
   }
 }
 
-export type InstalledPlugin = { id: string; version?: string; enabled?: boolean; scope?: string };
+export type InstalledPlugin = {
+  id: string;
+  version?: string;
+  enabled?: boolean;
+  scope?: string;
+  /** Where claude unpacked it — `~/.claude/plugins/cache/<marketplace>/<name>/<version>`. */
+  installPath?: string;
+};
+
+/**
+ * The kairoku entry in `claude plugin list --json`. THE ONE PARSER of that
+ * output: `doctor`, `setup` and the daemon's own `resolvePluginPath` all read
+ * the installed plugin through this, so none of them can learn a different
+ * answer to "is it installed, and where".
+ */
+export function pickPlugin(stdout: string): InstalledPlugin | null {
+  try {
+    return (JSON.parse(stdout) as InstalledPlugin[]).find((p) => p.id === PLUGIN) ?? null;
+  } catch {
+    return null;
+  }
+}
 
 export async function installedPlugin(io: Io): Promise<InstalledPlugin | null> {
-  const list = await json<InstalledPlugin[]>(io, ["claude", "plugin", "list", "--json"]);
-  return list?.find((p) => p.id === PLUGIN) ?? null;
+  const r = await io.shell(["claude", "plugin", "list", "--json"]);
+  return r.code === 0 ? pickPlugin(r.stdout) : null;
 }
 
 export async function install(io: Io): Promise<number> {

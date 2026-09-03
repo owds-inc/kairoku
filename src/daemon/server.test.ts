@@ -8,7 +8,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { createDaemon, type Daemon } from "./server";
-import { harness, waitFor, type Harness } from "./testkit";
+import { harness, stubExec, waitFor, type Harness } from "./testkit";
 
 let active: Harness | undefined;
 let daemon: Daemon | undefined;
@@ -21,13 +21,19 @@ afterEach(async () => {
 });
 
 function start(overrides = {}, deps = {}): { h: Harness; d: Daemon } {
-  const h = (active = harness({
-    commandOverride: () => ["sh", "-c", "sleep 30"],
-    ...overrides,
-  }));
+  const h = (active = harness(overrides));
   const d = (daemon = createDaemon(h.config, deps));
   return { h, d };
 }
+
+/** One member, one sleeping stub agent — enough to occupy a slot. */
+const member = (id: string, role?: "implementer") => ({
+  dispatchId: id,
+  runId: id,
+  name: id,
+  ...(role === undefined ? {} : { role }),
+  execute: stubExec(["sh", "-c", "sleep 30"]),
+});
 
 const get = (d: Daemon, path: string, init: RequestInit = {}) => fetch(`${d.url}${path}`, init);
 
@@ -68,7 +74,7 @@ describe("listener — /capacity and /status (RF-005, RF-011)", () => {
     const { h, d } = start({ maxConcurrent: 2 });
     expect(await (await get(d, "/capacity")).json()).toEqual({ running: 0, max: 2 });
 
-    void d.store.start({ id: "d-cap", brief: "work", env: { KAIROKU_PAT: "pat" } });
+    void d.store.start(member("d-cap"));
     expect(await (await get(d, "/capacity")).json()).toEqual({ running: 1, max: 2 });
     await waitFor(() => h.worktrees.created.length === 1, "worktree setup");
   });
@@ -76,7 +82,7 @@ describe("listener — /capacity and /status (RF-005, RF-011)", () => {
   test("GET /status is what `doctor` reads: version, capacity, the app link, runs in flight", async () => {
     const { h, d } = start({ maxConcurrent: 2 }, { link: { status: () => ({ linked: true, appUrl: "https://app.test", liveness: "online" }) } });
 
-    void d.store.start({ id: "d-status", brief: "work", env: { KAIROKU_PAT: "pat" } });
+    void d.store.start(member("d-status", "implementer"));
     await waitFor(() => h.worktrees.created.length === 1, "worktree setup");
 
     const body = (await (await get(d, "/status")).json()) as Record<string, any>;
@@ -84,7 +90,13 @@ describe("listener — /capacity and /status (RF-005, RF-011)", () => {
     expect(body.capacity).toEqual({ running: 1, max: 2 });
     expect(body.link).toEqual({ linked: true, appUrl: "https://app.test", liveness: "online" });
     expect(body.runs).toHaveLength(1);
-    expect(body.runs[0]).toMatchObject({ dispatchId: "d-status", status: "running", branch: "run/d-status" });
+    expect(body.runs[0]).toMatchObject({
+      dispatchId: "d-status",
+      runId: "d-status",
+      role: "implementer",
+      status: "running",
+      branch: "run/d-status",
+    });
   });
 
   test("an unlinked daemon says so rather than omitting the field", async () => {
@@ -103,7 +115,7 @@ describe("listener — /capacity and /status (RF-005, RF-011)", () => {
 describe("listener — shutdown", () => {
   test("stop() drains running agents rather than abandoning them", async () => {
     const { h, d } = start();
-    const finished = d.store.start({ id: "d-drain", brief: "work", env: { KAIROKU_PAT: "pat" } });
+    const finished = d.store.start(member("d-drain"));
     await waitFor(() => h.worktrees.created.length === 1, "worktree setup");
 
     await d.stop();

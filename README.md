@@ -99,9 +99,35 @@ All keys optional:
   "runsDir": "/home/neil/.kairoku/runs",
   "keepWorktreeOnFailure": false,
   "defaultTimeoutSec": 3600,
-  "killGraceMs": 5000
+  "killGraceMs": 5000,
+  "pluginPath": "/opt/kairoku/plugin"
 }
 ```
+
+`maxConcurrent` is a hard gate, not a hint: a member claimed past the limit
+waits for a slot rather than being refused, and two overlapping dispatches can
+never put more members on the machine than it has slots.
+
+`pluginPath` is written for you by `kairoku setup --daemon` and is only worth
+setting by hand when the plugin lives somewhere unusual. Left out, the daemon
+takes the first of these that contains `.claude-plugin/plugin.json`: the
+`installPath` `claude plugin list --json` reports for `kairoku@kairoku-marketplace`;
+`~/.claude/plugins/cache/<marketplace>/kairoku/<version>` (where Claude Code
+unpacks a plugin), newest version first; and, only when running from a checkout
+rather than a released binary, `plugin/` beside the source. A `pluginPath` that
+no longer exists — a plugin update moves the version directory — is skipped
+rather than trusted. `kairoku doctor` prints the one it will use:
+
+```
+PASS  kairoku plugin installed           2.3.0 enabled
+PASS  kairoku plugin path                /Users/you/.claude/plugins/cache/kairoku-marketplace/kairoku/2.3.0
+```
+
+**A Claude run with no plugin fails closed**, naming what is missing, and the
+machine advertises no Claude models: the role agents and the `mcp__kairoku__*`
+tools are the plugin, so a "run" without it would be a model with the role's
+prose and none of its reach. Codex roles are unaffected — their contracts ship
+inside the binary.
 
 No credential is in that file. `KAIROKU_DAEMON_TOKEN` (the app credential) and
 `KAIROKU_AGENT_TOKEN` (the interim `KAIROKU_PAT` for a run whose claim carried
@@ -172,24 +198,35 @@ and the formula in `owds-inc/homebrew-tap` all read from it (copy the released
 | `src/cli/doctor.ts`, `plugin.ts`, `update.ts` | the other commands; `io.ts` is the seam every command is tested through |
 | `src/daemon/app.ts` | the app client — the ONLY outbound module; three routes, four result tags |
 | `src/daemon/link.ts` | the loop: the two timers, backoff, the 401 stop, the reports |
-| `src/daemon/dispatch.ts` | a claim becomes a run: run.json, counts, the PR url, the restart rule |
+| `src/daemon/dispatch.ts` | a claim becomes a TEAM: one member per item, the run files, the PR url, the restart rule |
+| `src/daemon/recipes.ts` | the six teams as state machines over run records — the fix loops live here |
+| `src/daemon/qa.ts` | the deterministic QA step: the repo's own commands — its own package scripts, through the package manager its lockfile names — and one summary parser per runner |
+| `src/daemon/policy.ts` | the per-role tool policy as data, and the one function both providers apply |
+| `src/daemon/models.ts` | what this machine advertises: repos, providers → models, recipes |
+| `src/daemon/providers/` | `claude.ts` (the ONLY module importing the Agent SDK), `codex.ts`, and `index.ts`'s `productionProviders()` — the one constructor every production call site builds through |
+| `src/daemon/roles/` | the four role contracts as markdown, embedded in the binary; `withRoleContract()` prepends one to every prompt on BOTH providers |
 | `src/daemon/server.ts` | the loopback listener, the bind, SIGTERM wiring |
-| `src/daemon/runs.ts` | the run `Map`, lifecycle, teardown policy |
-| `src/daemon/roles.ts` | the fixed role table — the only place a command line is built |
-| `src/daemon/proc.ts` | process-group spawn, timeout, group kill, escalation |
+| `src/daemon/runs.ts` | the live-run registry: capacity (the one gate), worktrees, teardown, cancel |
+| `src/daemon/proc.ts` | process-group spawn, timeout, group kill, escalation, line streaming |
 | `src/daemon/worktree.ts` | `git worktree` create/teardown, `.env*` seeding, enumeration |
-| `src/daemon/events.ts` | per-run JSONL + stdout capture |
+| `src/daemon/events.ts` | the full per-run JSONL, and the bounded curated buffer the beat drains |
 | `src/daemon/config.ts` | config file, env token, bind validation |
 | `src/daemon/prune.ts` | the human-run cleanup CLI |
 | `plugin/`, `.claude-plugin/` | the Claude Code plugin and its marketplace manifest |
 
-Zero runtime dependencies; `bun test` covers each module, and the supervision
-cases the SPEC's exit criterion names live together in `supervision.test.ts`.
-The loop and the client are tested against a fake app (`fakeApp()` in
-`src/daemon/testkit.ts`, a `Bun.serve` speaking the three routes with the app's
-exact shapes), so no test touches the network or a real Kairoku.
-`constraints.test.ts` asserts RF-007 and RF-011 mechanically over `src/daemon/`:
-one outbound module, three routes, no hardcoded host.
+**One runtime dependency**, `@anthropic-ai/claude-agent-sdk`, pinned and
+imported by `src/daemon/providers/claude.ts` alone (DECISIONS §20.2 amends the
+zero-dependency rule to name exactly that one). `bun test` covers each module,
+and the supervision cases the SPEC's exit criterion names live together in
+`supervision.test.ts`. The loop and the client are tested against a fake app
+(`fakeApp()` in `src/daemon/testkit.ts`, a `Bun.serve` speaking the three routes
+with the app's exact shapes) and the teams against a fake provider, so no test
+touches the network, a real Kairoku, a real `claude` or a real `codex`.
+`e2e.test.ts` runs the SPEC's whole team exit criterion against that fake app
+with production code everywhere else. `constraints.test.ts` asserts RF-007,
+RF-011 and the amended dependency rule mechanically over all of `src/daemon/`,
+recursing into subdirectories: one outbound module, three routes, no hardcoded
+host, one dependency, one file allowed to import it.
 
 ## Two things worth knowing before you edit
 
@@ -204,6 +241,19 @@ one outbound module, three routes, no hardcoded host.
 - **A run left non-terminal by a daemon that died is reported failed, never
   replayed** (SPEC RF-013). Re-running a prompt whose first attempt may have
   committed, pushed or opened a PR is worse than any stuck row.
+- **A reviewer's verdict is structured output, never prose, and a missing one
+  fails the run closed** (SPEC RF-015). The same goes for a planner's or
+  researcher's report. "It looked fine to the reviewer" read out of free text is
+  exactly the claim invariant 7 exists to refuse, so the daemon would rather
+  stop than record a review that did not happen.
+- **QA has no model in it** (SPEC RF-016, grill Q2). The counts on a run come
+  from the repo's own runner, parsed by the daemon, or the run fails — including
+  when the runner prints a summary no parser here can read, and when `errors` is
+  non-zero beside zero `fail`.
+- **The tool gate is a `PreToolUse` hook, not `allowedTools` alone** (SPEC
+  RF-017). `canUseTool` is last in the permission chain and is shadowed by a
+  bypass or allow rule; a hook deny wins even under `bypassPermissions`. The
+  option list is belt beside braces.
 - **One checkout per daemon, and the daemon works out which one at boot**
   (SPEC §20.9) — `git remote get-url origin` on `repoPath`, parsed to
   `owner/name`, compared case-insensitively against the claim's `repo.fullName`.

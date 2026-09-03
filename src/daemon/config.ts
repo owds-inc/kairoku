@@ -25,7 +25,6 @@
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import type { CommandSpec } from "./roles";
 import type { WorktreeOps } from "./worktree";
 import { DEFAULT_KILL_GRACE_MS } from "./proc";
 
@@ -57,9 +56,13 @@ export interface Config {
   readonly agentToken?: string;
   /** The branch runs are cut from: `origin/<defaultBranch>`. */
   readonly defaultBranch: string;
+  /**
+   * O-3 — where the Kairoku plugin lives, when it is not where the daemon
+   * would look. Absent is the ordinary case: `resolvePluginPath` finds the
+   * source tree or the copy `kairoku plugin install` left under ~/.claude.
+   */
+  readonly pluginPath?: string;
 
-  /** Test-only (RF-009): substitute the role's command construction. */
-  readonly commandOverride?: (spec: CommandSpec) => string[];
   /** Test-only: substitute real git worktree operations. */
   readonly worktreeOps?: WorktreeOps;
 }
@@ -202,6 +205,7 @@ export function loadConfig(
     defaultTimeoutSec: (file.defaultTimeoutSec as number) ?? DEFAULT_TIMEOUT_SEC,
     killGraceMs: (file.killGraceMs as number) ?? DEFAULT_KILL_GRACE_MS,
     defaultBranch: (file.defaultBranch as string) ?? "main",
+    ...(typeof file.pluginPath === "string" && file.pluginPath ? { pluginPath: file.pluginPath } : {}),
     ...(appUrl === undefined ? {} : { appUrl }),
     ...(token === undefined ? {} : { token }),
     ...(agentToken === undefined ? {} : { agentToken }),
