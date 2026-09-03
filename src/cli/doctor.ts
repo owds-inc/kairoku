@@ -346,6 +346,24 @@ export async function checks(io: Io, probe?: PortDeps): Promise<Check[]> {
   // run, and Codex prefers the bearer path once it is configured, so the
   // OPERATOR's own Codex gets 401 and its OAuth login is ignored.
   const codexConfig = io.readFile(join(io.home, ".codex", "config.toml")) ?? "";
+  // plugin/codex-manifest — a Codex install of the plugin gets its `kairoku`
+  // entry from the PLUGIN's own manifest (Codex ≥ 0.146 infers a Claude-Code
+  // marketplace and installs it), not a `[mcp_servers.kairoku]` block in
+  // config.toml, so the text check above never sees it at all. `codex mcp get`
+  // is the only view that resolves what the entry actually IS — including the
+  // defect this lane exists for: Claude Code's `${user_config.kairoku_url}`
+  // interpolation has no Codex equivalent, so an out-of-date plugin manifest
+  // keeps it as literal text and every MCP call fails on a relative URL.
+  let resolvedCodexUrl: string | undefined;
+  if (io.which("codex")) {
+    try {
+      const got = await io.shell(["codex", "mcp", "get", "kairoku", "--json"]);
+      resolvedCodexUrl = (JSON.parse(got.stdout) as { transport?: { url?: string } }).transport?.url;
+    } catch {
+      // no `kairoku` entry, or codex answered something doctor cannot parse —
+      // the config.toml text below is still checked.
+    }
+  }
   const name = "codex MCP is a human login";
   out.push(
     /bearer_token_env_var\s*=\s*"KAIROKU_PAT"/.test(codexConfig)
@@ -353,9 +371,14 @@ export async function checks(io: Io, probe?: PortDeps): Promise<Check[]> {
           name,
           "the global kairoku entry carries bearer_token_env_var — that variable is only set inside a run, so your own Codex gets 401. `codex mcp remove kairoku`, re-add with no bearer flag, then `codex mcp login kairoku`",
         )
-      : codexConfig.includes("[mcp_servers.kairoku]")
-        ? pass(name, "OAuth; a run brings its own credential")
-        : warn(name, "no kairoku MCP entry — `codex mcp add kairoku --url <app>/api/mcp` then `codex mcp login kairoku`"),
+      : resolvedCodexUrl?.includes("${")
+        ? fail(
+            name,
+            `the resolved MCP URL is still the unresolved placeholder "${resolvedCodexUrl}" — the Codex plugin manifest is out of date: \`codex plugin update\` (or reinstall from the marketplace), or set it by hand with \`codex mcp add kairoku --url <app>/api/mcp\``,
+          )
+        : codexConfig.includes("[mcp_servers.kairoku]") || resolvedCodexUrl !== undefined
+          ? pass(name, "OAuth; a run brings its own credential")
+          : warn(name, "no kairoku MCP entry — `codex mcp add kairoku --url <app>/api/mcp` then `codex mcp login kairoku`"),
   );
 
   const configPath = join(home, "config.json");
