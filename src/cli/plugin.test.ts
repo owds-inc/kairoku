@@ -27,6 +27,35 @@ describe("plugin manifests", () => {
   });
 });
 
+// -------------------------------------------------------- plugin/codex-manifest
+//
+// Codex has no `${user_config...}` interpolation (Claude Code's own plugin
+// syntax) and keeps the placeholder as literal text, so the Codex manifest
+// names the MCP server with an absolute URL instead of pointing at the same
+// `.mcp.json` Claude reads.
+describe("the Codex manifest", () => {
+  test("parses and names the kairoku MCP server with a literal, bearer-free URL", () => {
+    const codex = read("plugin/.codex-plugin/plugin.json");
+    expect(codex.name).toBe("kairoku");
+    expect(codex.mcpServers.kairoku.type).toBe("http");
+    expect(codex.mcpServers.kairoku.url).toBe("https://kairoku.io/api/mcp");
+    expect(codex.mcpServers.kairoku.url).not.toContain("${");
+    expect(codex.mcpServers.kairoku).not.toHaveProperty("bearer_token_env_var");
+  });
+
+  test("Claude Code's .mcp.json still carries the ${user_config...} interpolation Codex cannot read", () => {
+    const mcp = read("plugin/.mcp.json");
+    expect(mcp.mcpServers.kairoku.url).toBe("${user_config.kairoku_url}/api/mcp");
+  });
+
+  test("both manifests agree on the plugin's own version", () => {
+    const claude = read("plugin/.claude-plugin/plugin.json");
+    const codex = read("plugin/.codex-plugin/plugin.json");
+    expect(codex.version).toBe(claude.version);
+    expect(claude.version).toBe("2.4.1");
+  });
+});
+
 const noMarketplaces = JSON.stringify([{ name: "claude-plugins-official", source: "github" }]);
 const withMarketplace = JSON.stringify([
   { name: "kairoku-marketplace", source: "github", repo: "owds-inc/kairoku" },

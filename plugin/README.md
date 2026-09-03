@@ -13,6 +13,16 @@ pasted tokens), and ships the protocol skills (`jira-ops`, `git-pr`,
 Then `/mcp` → kairoku → **Authenticate**. The only config key is the app URL,
 and it defaults to https://kairoku.io — a fresh install prompts for nothing.
 
+## Codex
+
+Codex ≥ 0.146 infers a Claude Code marketplace and installs this plugin too, but it has no
+equivalent of Claude Code's `${user_config.kairoku_url}` interpolation — a manifest that relied on
+it would leave Codex with that placeholder as literal text and every MCP call failing on a
+relative URL. So this plugin ships a second, Codex-native manifest, `.codex-plugin/plugin.json`,
+naming the `kairoku` MCP server with the literal `https://kairoku.io/api/mcp` (OAuth only, no
+bearer token); after install, `codex mcp login kairoku`. A self-hoster on Codex overrides that URL
+with their own `[mcp_servers.kairoku]` block in `~/.codex/config.toml`.
+
 ## Verified clients (KAIR-301 sitting, 2026-08-18)
 
 CIMD was not advertised at verification time (beta, support-gated), so every

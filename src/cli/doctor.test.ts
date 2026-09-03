@@ -409,4 +409,41 @@ describe("§21 — doctor's three new lines", () => {
     io.files["/home/tester/.codex/config.toml"] = '[mcp_servers.kairoku]\nurl = "https://kairoku.io/api/mcp"\n';
     expect(byName(await checks(io, { probe: () => true }), "codex MCP is a human login")?.status).toBe("PASS");
   });
+
+  // ---------------------------------------------------------- plugin/codex-manifest
+  //
+  // The defect this lane exists for: a Codex install of the plugin gets its
+  // `kairoku` MCP entry from the PLUGIN's own manifest, not a machine-wide
+  // `[mcp_servers.kairoku]` block in config.toml — so the config.toml text
+  // check above never sees it, placeholder or not. Only `codex mcp get` (the
+  // resolved view) surfaces the entry at all.
+
+  test("item 2 — a resolved URL still carrying the unresolved placeholder FAILs, naming the fix", async () => {
+    const io = linuxDaemon();
+    delete io.files["/home/tester/.codex/config.toml"];
+    io.canned["codex mcp get kairoku --json"] = {
+      stdout: JSON.stringify({ transport: { url: "${user_config.kairoku_url}/api/mcp" } }),
+    };
+    const check = byName(await checks(io, { probe: () => true }), "codex MCP is a human login");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain("${user_config.kairoku_url}/api/mcp");
+    expect(check?.detail).toContain("codex plugin update");
+    expect(check?.detail).toContain("codex mcp add kairoku --url");
+  });
+
+  test("item 2 — a resolved absolute URL passes even with no config.toml entry at all", async () => {
+    const io = linuxDaemon();
+    delete io.files["/home/tester/.codex/config.toml"];
+    io.canned["codex mcp get kairoku --json"] = {
+      stdout: JSON.stringify({ transport: { url: "https://kairoku.io/api/mcp" } }),
+    };
+    expect(byName(await checks(io, { probe: () => true }), "codex MCP is a human login")?.status).toBe("PASS");
+  });
+
+  test("item 2 — codex not on PATH never crashes the check; it falls back to config.toml", async () => {
+    const io = linuxDaemon();
+    io.bins.delete("codex");
+    const list = await checks(io, { probe: () => true });
+    expect(byName(list, "codex MCP is a human login")?.status).toBe("PASS");
+  });
 });

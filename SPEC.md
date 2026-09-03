@@ -7,6 +7,14 @@ Build lanes: `planned/kairoku-cli-phase5-daemon-client.md` (the link) and
 `docs/plans/2026-09-02-kairoku-cli-phase6-teams.md`. This file is the build contract; changes
 to it are explicit amendments, never silent divergence. No dates, no estimates.*
 
+**Amended for the plugin's own Codex manifest (`plugin/codex-manifest`), same v1 — no RF changed
+and the wire did not move.** The fix lives entirely in the plugin repo's own marketplace manifest,
+not in anything below. Claude Code's `${user_config.kairoku_url}` interpolation has no Codex
+equivalent, so `plugin/.codex-plugin/plugin.json` now names the `kairoku` MCP server with the
+literal `https://kairoku.io/api/mcp` inline, `plugin/.mcp.json` is unchanged for Claude Code, and
+`kairoku doctor`'s "codex MCP is a human login" check reads `codex mcp get kairoku` and FAILs when
+the resolved URL still carries the placeholder.
+
 **Amended again for CodeGraph on probation (§21 Q2/Q4/Q15/Q19), same v1.** The wire did not change
 a sixth time. What changed is what a member is OFFERED: a repo opts in per `kairoku.json`
 (`intelligence: ["codegraph"]`), and when it has, the daemon indexes the run's own worktree after
@@ -444,7 +452,11 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   is trusted as a SESSION FLAG (`-c projects."<worktree>".trust_level="trusted"`) rather than by a
   write to `~/.codex/config.toml`, because trust cannot be self-declared from inside a project config
   and the machine should keep nothing after the run; `--dangerously-bypass-hook-trust` is passed only
-  when this daemon itself wrote a hook to run.
+  when this daemon itself wrote a hook to run. This is the daemon's PER-RUN write, distinct from the
+  human's own interactive Codex, which gets its `kairoku` entry from the plugin's marketplace
+  install instead — that manifest (`plugin/.codex-plugin/plugin.json`) names a literal `https://`
+  URL rather than Claude Code's `${user_config.kairoku_url}` interpolation, which Codex has no
+  syntax for and would otherwise keep as text (`plugin/codex-manifest`).
 
   **Exact resolution.** `setup` installs `typescript-language-server` (with `typescript`) through bun
   when the configured checkout has a `tsconfig.json`; Claude Code's built-in LSP tool finds it on
