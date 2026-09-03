@@ -53,7 +53,7 @@ describe("parseManifest", () => {
     const result = parseManifest("{}");
     expect(result).toEqual({
       ok: true,
-      manifest: { setup: [], env: {}, check: [], concurrency: { test: 1 } },
+      manifest: { setup: [], env: {}, check: [], intelligence: [], concurrency: { test: 1 } },
     });
   });
 
@@ -71,6 +71,8 @@ describe("parseManifest", () => {
     [JSON.stringify({ env: { test: { compose: 5 } } }), "kairoku.json: env.test.compose must be a string"],
     [JSON.stringify({ env: { test: { inject: { A: 1 } } } }), "kairoku.json: env.test.inject.A must be a string"],
     [JSON.stringify({ env: { test: { init: "x" } } }), "kairoku.json: env.test.init must be an array of strings"],
+    [JSON.stringify({ intelligence: "codegraph" }), "kairoku.json: intelligence must be an array of strings"],
+    [JSON.stringify({ intelligence: [1] }), "kairoku.json: intelligence[0] must be a string"],
   ])("an invalid manifest fails with the PATH of the error: %p", (text, error) => {
     const result = parseManifest(text);
     expect(result.ok).toBe(false);
@@ -83,6 +85,29 @@ describe("parseManifest", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.error).toContain("env.test.compose must stay inside the repo");
+  });
+});
+
+describe("§21 Q15 — `intelligence`, the opt-in that makes the CodeGraph probation on/off by config", () => {
+  test("a repo opts CodeGraph in by naming it", () => {
+    const result = parseManifest(JSON.stringify({ intelligence: ["codegraph"] }));
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.manifest.intelligence).toEqual(["codegraph"]);
+  });
+
+  test("absent, or empty, means nothing changes — the flag is opt-in and off is the default", () => {
+    for (const source of ["{}", JSON.stringify({ intelligence: [] })]) {
+      const result = parseManifest(source);
+      expect(result.ok && result.manifest.intelligence).toEqual([]);
+    }
+  });
+
+  test("an intelligence this daemon does not know is REFUSED, with its JSON path", () => {
+    const result = parseManifest(JSON.stringify({ intelligence: ["codegraph", "telepathy"] }));
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toBe(
+      "kairoku.json: intelligence[1] is not one of: codegraph",
+    );
   });
 });
 

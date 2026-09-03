@@ -105,6 +105,7 @@ export class EventBuffer {
   readonly #max: number;
   readonly #pending: CuratedEvent[] = [];
   #seq = 0;
+  #tools = 0;
   #dropped = 0;
   /** The seq of the FIRST line dropped since the last drain — the notice takes it. */
   #dropSeq = 0;
@@ -123,6 +124,7 @@ export class EventBuffer {
   }
 
   push(kind: EventKind, text: string): void {
+    if (kind === "tool") this.#tools++;
     const event = this.#event(kind, text);
     writeLine(this.#path, event);
     // The DISK keeps everything; only the wire buffer is bounded.
@@ -139,6 +141,18 @@ export class EventBuffer {
 
   pending(): number {
     return this.#pending.length;
+  }
+
+  /**
+   * §21 Q19 — every tool call this run has made, counted on the way in.
+   *
+   * The DISK log already has them all, but the wire buffer is bounded and drops
+   * its oldest lines, so counting what is pending would answer "how many tool
+   * calls are still waiting to be sent" — which is not the number the
+   * measurement compares.
+   */
+  tools(): number {
+    return this.#tools;
   }
 
   /**

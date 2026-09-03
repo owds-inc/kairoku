@@ -20,14 +20,15 @@
  * decides what a role may do and both providers read it.
  */
 
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join } from "node:path";
+import { CODEGRAPH_NOTE, codegraphTomlTable } from "../codegraph";
 import { launch as procLaunch } from "../proc";
 import { withRoleContract } from "../roles";
 import type { RoleName } from "../policy";
 import type { Rules } from "../rules";
-import { run as execArgv } from "../worktree";
+import { excludeFromGit, run as execArgv } from "../worktree";
 import type { LaunchedRun, Provider, ProviderEvent, RoleRun } from "./types";
 
 /** `read-only` still runs commands; it only refuses writes — which IS §20.8's "read + run". */
@@ -128,6 +129,10 @@ export function codexConfigToml(run: RoleRun): string {
       "",
     );
   }
+  // §21 — the same CodeGraph server Claude gets from `mcpServers`, in the form
+  // Codex's project layer takes. Nothing machine-wide: this file is written
+  // fresh into the run's worktree and excluded from the diff.
+  if (run.codegraph) lines.push(codegraphTomlTable(run.codegraph));
   return lines.join("\n");
 }
 
@@ -156,43 +161,6 @@ export function codexHooksJson(rules: Rules): string {
   );
 }
 
-/**
- * A linked worktree's `.git` is a FILE pointing at
- * `<repo>/.git/worktrees/<name>`, and git reads `info/exclude` from the COMMON
- * dir — verified, not assumed: an exclude written under the per-worktree gitdir
- * is silently ignored. So this walks back to `<repo>/.git`, which is shared with
- * the base checkout, and appends idempotently.
- */
-function gitCommonDir(worktree: string): string | undefined {
-  const dotGit = join(worktree, ".git");
-  try {
-    if (statSync(dotGit).isDirectory()) return dotGit;
-    const pointer = readFileSync(dotGit, "utf8").trim();
-    const target = pointer.startsWith("gitdir:") ? pointer.slice("gitdir:".length).trim() : "";
-    if (!target) return undefined;
-    // <repo>/.git/worktrees/<name> → <repo>/.git
-    return resolve(dirname(resolve(worktree, target)), "..");
-  } catch {
-    return undefined;
-  }
-}
-
-function exclude(worktree: string, lines: readonly string[]): void {
-  const common = gitCommonDir(worktree);
-  if (!common) return;
-  const path = join(common, "info", "exclude");
-  let current = "";
-  try {
-    current = readFileSync(path, "utf8");
-  } catch {
-    mkdirSync(dirname(path), { recursive: true });
-  }
-  const have = new Set(current.split("\n").map((line) => line.trim()));
-  const missing = lines.filter((line) => !have.has(line));
-  if (missing.length === 0) return;
-  appendFileSync(path, `${current.endsWith("\n") || current === "" ? "" : "\n"}${missing.join("\n")}\n`);
-}
-
 /** Both files, fresh, plus the exclusion. Idempotent; never throws a run over. */
 export function writeCodexFiles(run: RoleRun): void {
   try {
@@ -200,7 +168,7 @@ export function writeCodexFiles(run: RoleRun): void {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "config.toml"), codexConfigToml(run));
     if (run.rules) writeFileSync(join(dir, "hooks.json"), codexHooksJson(run.rules));
-    exclude(run.cwd, CODEX_FILES);
+    excludeFromGit(run.cwd, CODEX_FILES);
   } catch {
     // A worktree we cannot write is a run that is about to fail anyway, and it
     // fails on the agent's own error rather than on this.
@@ -397,7 +365,7 @@ export function codexProvider(deps: CodexDeps = {}): Provider {
         command: codexArgv(run, paths),
         cwd: run.cwd,
         env: run.env,
-        stdin: `${withRoleContract(run.role, run.prompt)}\n`,
+        stdin: `${withRoleContract(run.role, run.prompt, run.codegraph && CODEGRAPH_NOTE)}\n`,
         stdoutPath: run.logPath,
         timeoutMs: run.timeoutMs,
         onLine: (line) => emit(codexEvent(line)),

@@ -31,6 +31,16 @@ export function isRole(name: string): name is RoleName {
 /** The MCP server a run's token is scoped to. Any other server is not ours. */
 export const MCP_PREFIX = "mcp__kairoku__";
 
+/**
+ * §21 — the second, and only other, MCP server a run may be given: CodeGraph,
+ * read-only code intelligence over the run's OWN worktree, wired only when the
+ * repo opted in (`kairoku.json`'s `intelligence`). Listing it here rather than
+ * gating on the flag is deliberate: `decide()` sees one tool call, not the
+ * manifest, and a run that was never given the server cannot call a tool the
+ * SDK never offered it. A THIRD prefix is still denied.
+ */
+export const CODEGRAPH_MCP_PREFIX = "mcp__codegraph__";
+
 export interface RolePolicy {
   /**
    * `acceptEdits` for the one role that edits, so a file write never stalls on
@@ -48,7 +58,16 @@ export interface RolePolicy {
 // daemon). The implementer runs with no schema, so the SDK never offers it
 // the tool; listing it for all four roles here is simpler than a per-schema
 // branch and keeps the hook and the SDK's option list agreeing.
-const READ_ONLY = ["Read", "Glob", "Grep", "TodoWrite", "Skill", MCP_PREFIX, "StructuredOutput"] as const;
+const READ_ONLY = [
+  "Read",
+  "Glob",
+  "Grep",
+  "TodoWrite",
+  "Skill",
+  MCP_PREFIX,
+  CODEGRAPH_MCP_PREFIX,
+  "StructuredOutput",
+] as const;
 
 export const POLICY: Record<RoleName, RolePolicy> = {
   implementer: {
@@ -97,8 +116,12 @@ export function decide(ask: ToolAsk): Decision {
   if (!isRole(ask.role)) return deny(`no tool policy for role "${ask.role}"`);
   const policy = POLICY[ask.role];
 
+  // An entry ending in `__` is a SERVER prefix (`mcp__kairoku__`), which admits
+  // every tool that server offers; everything else is an exact tool name. One
+  // rule rather than one special case per server — the second server was where
+  // a special case would have been copied.
   const listed = policy.allowedTools.some((allowed) =>
-    allowed === MCP_PREFIX ? ask.tool.startsWith(MCP_PREFIX) : ask.tool === allowed,
+    allowed.endsWith("__") ? ask.tool.startsWith(allowed) : ask.tool === allowed,
   );
   if (!listed) return deny(`the ${ask.role} may not use ${ask.tool}`);
 

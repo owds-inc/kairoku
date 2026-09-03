@@ -138,9 +138,15 @@ is editing in. No `kairoku.json` means the previous behaviour, unchanged.
   },
   "check": ["bunx tsc --noEmit", "bun run lint"],
   "test": "bun test",
+  "intelligence": ["codegraph"],
   "concurrency": { "test": 2 }
 }
 ```
+
+`intelligence` opts a repo into CodeGraph, on probation (§21 Q2/Q4/Q15/Q19): the daemon indexes
+each run's own worktree before the first role turn and hands both hosts a read-only MCP server
+pointed at it, degrading silently — no `codegraph` on the machine or a failed index just runs the
+role without it — rather than failing the run.
 
 Unknown keys are ignored, so a `"$comment"` costs nothing. Anything the daemon
 does read is type-checked, and an error names the path: `kairoku.json:
@@ -233,6 +239,7 @@ rather than trusted. `kairoku doctor` prints the one it will use:
 ```
 PASS  kairoku plugin installed           2.4.0 enabled
 PASS  kairoku plugin path                /Users/you/.claude/plugins/cache/kairoku-marketplace/kairoku/2.4.0
+WARN  codegraph                          absent — a repo whose kairoku.json lists it under `intelligence` runs without the index
 ```
 
 **A Claude run with no plugin fails closed**, naming what is missing, and the

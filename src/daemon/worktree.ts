@@ -10,8 +10,9 @@
  * branch to remain checkable from its ledger entry alone.
  */
 
+import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { copyFile, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 export interface Worktree {
   readonly path: string;
@@ -34,6 +35,57 @@ export const DEFAULT_BASE = "origin/main";
 
 export function branchFor(runId: string): string {
   return `${RUN_BRANCH_PREFIX}${runId}`;
+}
+
+/**
+ * A linked worktree's `.git` is a FILE pointing at
+ * `<repo>/.git/worktrees/<name>`, and git reads `info/exclude` from the COMMON
+ * dir — verified, not assumed: an exclude written under the per-worktree gitdir
+ * is silently ignored. So this walks back to `<repo>/.git`, which is shared with
+ * the base checkout.
+ */
+function gitCommonDir(worktree: string): string | undefined {
+  const dotGit = join(worktree, ".git");
+  try {
+    if (statSync(dotGit).isDirectory()) return dotGit;
+    const pointer = readFileSync(dotGit, "utf8").trim();
+    const target = pointer.startsWith("gitdir:") ? pointer.slice("gitdir:".length).trim() : "";
+    if (!target) return undefined;
+    // <repo>/.git/worktrees/<name> → <repo>/.git
+    return resolve(dirname(resolve(worktree, target)), "..");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Keep the daemon's own per-run plumbing out of the agent's diff.
+ *
+ * TWO CALLERS, ONE HELPER, and the second is why it lives here rather than
+ * inside `providers/codex.ts` where it started: `.codex/` and `.codegraph/` are
+ * the same defect one `git add -A` away, and a second copy of this walk is
+ * exactly the drift `constraints.test.ts` exists to refuse. Idempotent, and it
+ * never throws — a worktree whose exclude cannot be written is a run that fails
+ * on the agent's own error, not on this.
+ */
+export function excludeFromGit(worktree: string, lines: readonly string[]): void {
+  try {
+    const common = gitCommonDir(worktree);
+    if (!common) return;
+    const path = join(common, "info", "exclude");
+    let current = "";
+    try {
+      current = readFileSync(path, "utf8");
+    } catch {
+      mkdirSync(dirname(path), { recursive: true });
+    }
+    const have = new Set(current.split("\n").map((line) => line.trim()));
+    const missing = lines.filter((line) => !have.has(line));
+    if (missing.length === 0) return;
+    appendFileSync(path, `${current.endsWith("\n") || current === "" ? "" : "\n"}${missing.join("\n")}\n`);
+  } catch {
+    // Unwritable, or a checkout shape we do not know. The run still runs.
+  }
 }
 
 /**

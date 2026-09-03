@@ -79,6 +79,18 @@ describe("policy — the matrix (§20.8, fail closed)", () => {
     expect(ask("implementer", "mcp__kairoku__update_item_status", {}).allow).toBe(true);
   });
 
+  test("§21 — every role may query CodeGraph, and only CodeGraph's own tools", () => {
+    // The server is read-only code intelligence over the run's own worktree,
+    // and it is only ever wired when the repo opted in — an agent on a run
+    // without it cannot call a tool that was never offered. A THIRD server is
+    // still not smuggled in.
+    for (const role of ROLE_NAMES) {
+      expect({ [role]: ask(role, "mcp__codegraph__codegraph_explore", {}).allow }).toEqual({ [role]: true });
+      expect({ [role]: ask(role, "mcp__codegraph__codegraph_callers", {}).allow }).toEqual({ [role]: true });
+    }
+    expect(ask("implementer", "mcp__codegraphx__anything", {}).allow).toBe(false);
+  });
+
   test("every role may answer with StructuredOutput", () => {
     // Production, 2026-09-03: the SDK's own tool for `outputFormat` was on no
     // role's list, so a reviewer/planner/researcher run with a schema was

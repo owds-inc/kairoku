@@ -10,9 +10,12 @@
  * NON-STRICT ON PURPOSE. Unknown keys are ignored rather than refused: the app
  * repo's own manifest carries a `"$comment"` pointing at the ruling, and a
  * schema that rejected it would make documenting the file a build failure. What
- * IS strict is the type of every key we do read, and the error names the JSON
- * PATH — `env.test.ports[1]`, not "invalid manifest" — because the reader is an
- * operator looking at a run that failed on a machine they cannot see.
+ * IS strict is the type of every key we do read — and, in one place, its VALUE:
+ * `intelligence` names a daemon capability, and a typo silently given nothing
+ * would be indistinguishable from a capability that did not help (see below).
+ * Either way the error names the JSON PATH — `env.test.ports[1]`, not "invalid
+ * manifest" — because the reader is an operator looking at a run that failed on
+ * a machine they cannot see.
  *
  * The validator is hand-written rather than Zod: this daemon has exactly one
  * runtime dependency (§20.2) and `constraints.test.ts` enforces it. The property
@@ -22,6 +25,17 @@
 import { run as execArgv } from "./worktree";
 
 export const MANIFEST_FILE = "kairoku.json";
+
+/**
+ * §21 Q15 — the code intelligences a repo may opt into, and the whole list of
+ * them. The value is REFUSED rather than ignored when it is not one of these,
+ * which is the one place this reader is strict about a value and not just a
+ * type: a repo that typed `codegrpah` and was silently given nothing would look
+ * exactly like a repo the index did not help, and the Q4 measurement would read
+ * a typo as a verdict.
+ */
+export const INTELLIGENCE = ["codegraph"] as const;
+export type Intelligence = (typeof INTELLIGENCE)[number];
 
 /** One environment profile: what to give a run, and what to stand up for it. */
 export interface EnvProfile {
@@ -41,6 +55,8 @@ export interface Manifest {
   readonly setup: string[];
   readonly env: Record<string, EnvProfile>;
   readonly check: string[];
+  /** Opt-in per repo. Empty is the default and means nothing changes. */
+  readonly intelligence: Intelligence[];
   readonly test?: string;
   readonly concurrency: { readonly test: number };
 }
@@ -135,6 +151,13 @@ export function parseManifest(source: string): ManifestResult {
       concurrentTests = n as number;
     }
 
+    const intelligence = strings(top.intelligence, "intelligence").map((entry, i) => {
+      if (!(INTELLIGENCE as readonly string[]).includes(entry)) {
+        bad(`intelligence[${i}]`, `is not one of: ${INTELLIGENCE.join(", ")}`);
+      }
+      return entry as Intelligence;
+    });
+
     const test = text(top.test, "test");
     return {
       ok: true,
@@ -142,6 +165,7 @@ export function parseManifest(source: string): ManifestResult {
         setup: strings(top.setup, "setup"),
         env,
         check: strings(top.check, "check"),
+        intelligence,
         ...(test === undefined ? {} : { test }),
         concurrency: { test: concurrentTests },
       },

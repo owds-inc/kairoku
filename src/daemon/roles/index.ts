@@ -28,8 +28,12 @@ export function rolePrompt(role: RoleName): string {
  * found `claude.ts` sending the bare prompt — which is why it is a shared
  * function now rather than a line each provider is trusted to remember.
  */
-export function withRoleContract(role: RoleName, prompt: string): string {
-  return `${rolePrompt(role)}\n\n---\n\n${prompt}`;
+export function withRoleContract(role: RoleName, prompt: string, extra?: string): string {
+  // `extra` is what only THIS run knows — today, the one sentence naming
+  // CodeGraph (§21 item 2). It cannot live in the markdown: a static line would
+  // advertise a tool to every run of every repo that never opted in.
+  const contract = extra ? `${rolePrompt(role)}\n\n${extra}` : rolePrompt(role);
+  return `${contract}\n\n---\n\n${prompt}`;
 }
 
 export function rolesWithPrompts(): string[] {

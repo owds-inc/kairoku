@@ -12,6 +12,7 @@
  * file in the daemon that has ever heard of the SDK.
  */
 
+import type { CodeGraph } from "../codegraph";
 import type { EventKind } from "../events";
 import type { RoleName } from "../policy";
 import type { Rules } from "../rules";
@@ -48,6 +49,12 @@ export interface RoleRun {
    * per dispatch. Absent means the repo declares none, and nothing scans.
    */
   readonly rules?: Rules;
+  /**
+   * §21 — this run's own CodeGraph index, when the repo opted in and the
+   * machine could build one. Absent means no MCP server and no prompt line:
+   * the probation is off, or it degraded (§21 item 3).
+   */
+  readonly codegraph?: CodeGraph;
   readonly timeoutMs: number;
   /** Where the raw provider stream is captured, for the post-mortem. */
   readonly logPath: string;

@@ -31,6 +31,7 @@
  */
 
 import { isAbsolute, resolve } from "node:path";
+import { CODEGRAPH_NOTE, codegraphMcpServers } from "../codegraph";
 import { POLICY, decide, insideWorktree, toolSummary } from "../policy";
 import { withRoleContract } from "../roles";
 import { formatMatches, scanRules, type Rules, type ScanResult } from "../rules";
@@ -140,6 +141,10 @@ export function claudeQueryOptions(
       PreToolUse: [{ hooks: [preToolUseHook(run, onDeny)] }],
       ...(run.rules === undefined ? {} : { PostToolUse: [{ matcher: "Write|Edit", hooks: [postToolUseHook(run)] }] }),
     },
+    // §21 — CodeGraph, when this run has an index. `mcpServers` is additive to
+    // whatever the plugin brings; the tools it exposes are read-only and
+    // `policy.ts` admits exactly this one server beside Kairoku's own.
+    ...(run.codegraph === undefined ? {} : { mcpServers: codegraphMcpServers(run.codegraph) }),
     ...(deps.pluginPath === undefined ? {} : { plugins: [{ type: "local", path: deps.pluginPath }] }),
     ...(deps.claudePath === undefined ? {} : { pathToClaudeCodeExecutable: deps.claudePath }),
     ...(run.model === undefined ? {} : { model: run.model }),
@@ -212,7 +217,7 @@ export function claudeProvider(deps: ClaudeDeps = {}): Provider {
       const pump = (async () => {
         try {
           handle = await open({
-            prompt: oneTurn(withRoleContract(run.role, run.prompt)),
+            prompt: oneTurn(withRoleContract(run.role, run.prompt, run.codegraph && CODEGRAPH_NOTE)),
             options: claudeQueryOptions(run, deps, (reason) => emit({ kind: "deny", text: reason })),
           });
           if (interruptWanted) await handle.interrupt().catch(() => {});

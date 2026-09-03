@@ -7,6 +7,15 @@ Build lanes: `planned/kairoku-cli-phase5-daemon-client.md` (the link) and
 `docs/plans/2026-09-02-kairoku-cli-phase6-teams.md`. This file is the build contract; changes
 to it are explicit amendments, never silent divergence. No dates, no estimates.*
 
+**Amended again for CodeGraph on probation (§21 Q2/Q4/Q15/Q19), same v1.** The wire did not change
+a sixth time. What changed is what a member is OFFERED: a repo opts in per `kairoku.json`
+(`intelligence: ["codegraph"]`), and when it has, the daemon indexes the run's own worktree after
+it is cut and before the first role turn, then hands both hosts a second MCP server pointed at that
+index — read-only orientation and blast radius, named to the role in one prompt sentence only on a
+run that actually has it. It degrades silently rather than failing: a rule nobody checked is a
+false clean report, but an index nobody built is only a slower agent, and `doctor` is where an
+operator learns the machine has none. The amendment is marked inline: RF-022 is new.
+
 **Amended again for code intelligence (§21), same v1.** The wire did not change a fifth time.
 What changed is what a member is HELD to while it writes: the target repo's own
 `.kairoku/rules/*.yml`, read from the base branch and never the worktree, blocked at the write by
@@ -447,6 +456,52 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   first write. One writer per resource: an agent may change `patterns.md` only inside its own item's
   scope, and the reviewer treats any other change to it as a defect, so the human merge stays the
   gate on what a repo says about itself. No injection machinery.
+
+- **RF-022 — CodeGraph, on probation, opt-in per repo (§21 Q2/Q4/Q15/Q19).** `kairoku.json` gains
+  `intelligence: string[]`, read from the base branch like every other manifest key. Only
+  `"codegraph"` is known today; any other entry is REFUSED with its JSON path
+  (`intelligence[1] is not one of: codegraph`) rather than ignored, because a typo silently given
+  nothing would look exactly like a repo the index did not help and the Q4 measurement would read
+  the typo as a verdict. Absent or empty changes nothing.
+
+  **Per run, when it is on.** After the worktree is cut and before the first role turn, the daemon
+  resolves `codegraph` on PATH and, if found, runs `codegraph init <worktree>` — ONE index per
+  worktree, and not a choice: CodeGraph refuses to share a `.codegraph` across git worktrees ("a
+  single index can't correctly represent multiple branches at once", its own issues #155/#1236), so
+  N concurrent members pay N cold indexes, which is exactly what Q4 measures. The file count comes
+  from `codegraph status --json`'s `fileCount`, never a regex over `init`'s ANSI progress output,
+  and the pair is recorded as one curated event: `codegraph: <n> files in <s>s` (or `not indexed —
+  <reason>` on a failed or unspawnable index). `.codegraph/` is excluded from the run's git through
+  the checkout's common `info/exclude`, the same helper `.codex/` already uses, before the index is
+  written — a failed index still leaves nothing committable.
+
+  On a usable index the run is handed a second MCP server, pinned to its own worktree with `-p`:
+  Claude through the SDK's `mcpServers` option in `providers/claude.ts`, Codex through a
+  `[mcp_servers.codegraph]` table appended to the worktree's own per-run `.codex/config.toml`
+  (RF-021's writer). `mcp__codegraph__` is admitted by the policy matrix as a second, read-only
+  server prefix beside `mcp__kairoku__` — a THIRD prefix is still denied — and every role's prompt
+  gains one sentence, only on a run that actually has the index: "`codegraph_explore` is available
+  for orientation and blast radius; read the file before you edit it."
+
+  **Degrade silently (§21 item 3).** No `codegraph` on the machine, or an index that fails: the run
+  proceeds without it, no event beyond the one failure line, never a failure of the run itself.
+  This is the opposite of RF-021's rules, which fail a run CLOSED — a probation, not a dependency.
+  `kairoku doctor` reports the binary as **PASS**/**WARN**, never FAIL, beside the version when
+  present.
+
+  **The Q19 instrumentation, on every run, indexed or not** (a measurement needs both arms): the
+  event buffer counts tool calls on the way in (`EventBuffer.tools()`), and at the end of the
+  member's own work — before the teardown and PR-lookup tail, which is daemon time and not agent
+  time — the daemon pushes one curated event, `run: <n> tool calls in <s>s`, and records the same
+  two numbers as `measure` on the run's own state file, so a post-mortem with no app still has them.
+
+  **Two disclosed substitutions.** The event above carries `kind: "ok"`, not a distinct `"index"`
+  kind: the app's own wire vocabulary (`"text" | "tool" | "ok" | "deny" | "error"`) is untouched by
+  this lane's Boundary ("no app change"), so a sixth kind is a follow-up, not this entry. And
+  `kairoku setup --daemon` does **not** provision `codegraph` the way it provisions `ast-grep`
+  (RF-021) and `typescript-language-server`: CodeGraph is still on probation, and installing it by
+  default would commit the machine to a thing that has not passed its trial — `doctor` names it
+  instead.
 
 ## A dispatch becomes a team
 

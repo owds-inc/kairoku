@@ -22,7 +22,7 @@ function laptop(): FakeIo {
 function linuxDaemon(): FakeIo {
   const home = "/home/tester";
   const io = fakeIo({ platform: "linux", home, uid: 1000 });
-  for (const b of ["node", "bun", "claude", "codex", "paseo", "git", "systemctl", "docker", "op", "ast-grep", "typescript-language-server"]) io.bins.add(b);
+  for (const b of ["node", "bun", "claude", "codex", "paseo", "git", "systemctl", "docker", "op", "ast-grep", "typescript-language-server", "codegraph"]) io.bins.add(b);
   Object.assign(io.files, {
     [`${home}/.bashrc`]: `export PATH="${home}/.bun/bin:${home}/.nvm/versions/node/v24.1.0/bin:$PATH"\n# interactive guard below\n`,
     [`${home}/.bun/bin`]: "",
@@ -56,6 +56,7 @@ function linuxDaemon(): FakeIo {
     "docker compose version": { stdout: "Docker Compose version v5.4.0\n" },
     "ast-grep --version": { stdout: "ast-grep 0.45.2\n" },
     "typescript-language-server --version": { stdout: "5.1.0\n" },
+    "codegraph --version": { stdout: "1.0.1\n" },
     [`git -C ${home}/work/kairoku ls-tree -r --name-only origin/main -- .kairoku/rules`]: {
       stdout: ".kairoku/rules/bun-spawn-resolved-path.yml\n.kairoku/rules/compose-loopback-ports.yml\n",
     },
@@ -174,6 +175,7 @@ describe("kairoku doctor", () => {
       "ast-grep": "PASS",
       "rules on base branch": "PASS",
       "typescript-language-server": "PASS",
+      codegraph: "PASS",
       "secret resolvers": "PASS",
       "repo clean": "PASS",
     });
@@ -380,6 +382,16 @@ describe("§21 — doctor's three new lines", () => {
     io.bins.delete("typescript-language-server");
     const list = await checks(io, { probe: () => true });
     expect(byName(list, "typescript-language-server")?.status).toBe("WARN");
+    expect(list.filter((c) => c.status === "FAIL")).toEqual([]);
+  });
+
+  test("§21 item 3 — codegraph absent is a WARN, never a FAIL: the probation degrades, it does not block", async () => {
+    const io = linuxDaemon();
+    expect(byName(await checks(io, { probe: () => true }), "codegraph")?.detail).toBe("1.0.1");
+    io.bins.delete("codegraph");
+    const list = await checks(io, { probe: () => true });
+    expect(byName(list, "codegraph")?.status).toBe("WARN");
+    expect(byName(list, "codegraph")?.detail).toContain("intelligence");
     expect(list.filter((c) => c.status === "FAIL")).toEqual([]);
   });
 
