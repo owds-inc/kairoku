@@ -88,6 +88,21 @@ export async function prepareEnvironment(
     });
   }
 
+  // The two layers that can THROW are read before a single port is held, so a
+  // profile or repo name that cannot be turned into a store path fails without
+  // leaking a reservation nothing will ever release.
+  let checkout: Record<string, string>;
+  let store: Record<string, string>;
+  try {
+    checkout = readCheckoutEnv(spec.worktree, profile?.files ?? []);
+    store =
+      spec.repoFullName && spec.envDir
+        ? readEnvStore(envStorePath(spec.envDir, spec.repoFullName, spec.profileName))
+        : {};
+  } catch (err) {
+    return settled({ ok: false, summary: `the run's environment could not be read: ${message(err)}`, values: {}, ports: {} });
+  }
+
   let ports: Record<string, number> = {};
   try {
     ports = allocatePorts(profile?.ports ?? [], spec.portRange, deps.ports);
@@ -101,11 +116,8 @@ export async function prepareEnvironment(
   );
 
   const values = mergeEnv({
-    checkout: readCheckoutEnv(spec.worktree, profile?.files ?? []),
-    store:
-      spec.repoFullName && spec.envDir
-        ? readEnvStore(envStorePath(spec.envDir, spec.repoFullName, spec.profileName))
-        : {},
+    checkout,
+    store,
     secrets: spec.secrets,
     // The ports come first so `inject` can be read against them, and the run's
     // own ids and credential come LAST: a manifest that named `KAIROKU_PAT` in

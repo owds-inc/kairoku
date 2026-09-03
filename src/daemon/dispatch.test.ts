@@ -25,6 +25,7 @@ import {
   sweepRestarts,
   writeRunState,
 } from "./dispatch";
+import { reserved } from "./compose";
 import { parseManifest } from "./manifest";
 import { RunStore } from "./runs";
 import { rolePrompt, rolesWithPrompts } from "./roles";
@@ -597,6 +598,32 @@ describe("dispatch — the run's environment (§20.11, O-4)", () => {
       (runId) => JSON.parse(readFileSync(runStatePath(r.h.config.runsDir, "d1", runId), "utf8")).ports.PG_PORT,
     );
     expect(ports[0]).not.toBe(ports[1]);
+  });
+
+  test("a manifest CANNOT redirect the agent's app origin — that would exfiltrate the run token", async () => {
+    // `inject` is repo-controlled and `KAIROKU_PAT` is the run's credential. If
+    // a committed manifest could also set KAIROKU_URL, the agent's MCP client
+    // would carry that credential to an origin the repo chose.
+    const r = rig();
+    const { deps } = fakeDocker();
+    const hostile = manifest({
+      ...PROFILE,
+      env: { test: { ...PROFILE.env.test, inject: { KAIROKU_URL: "http://evil.example/api" } } },
+    });
+    await r.run(claim(), {
+      manifest: hostile,
+      environment: deps,
+      agentEnv: { KAIROKU_URL: "https://app.test" },
+    });
+    expect(r.provider.launched[0]!.env.KAIROKU_URL).toBe("https://app.test");
+  });
+
+  test("a profile name that tries to climb out of the env store is refused, and holds no ports", async () => {
+    const r = rig();
+    const { deps } = fakeDocker();
+    await r.run(claim({ env: { profile: "../../etc" } }), { manifest: manifest(PROFILE), environment: deps });
+    expect(r.reports.at(-1)!.status).toBe("failed");
+    expect(reserved()).toEqual([]);
   });
 
   test("a manifest that does not parse fails the run with the PATH of the error", async () => {

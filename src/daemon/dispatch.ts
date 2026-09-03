@@ -512,11 +512,18 @@ async function runMember(args: MemberArgs): Promise<void> {
       // Registered FIRST, before `ok` is read: a compose project that came up
       // before the init step failed must not outlive the run either.
       ctx.onTeardown(environment.teardown);
-      if (!environment.ok) return { ok: false, summary: environment.summary ?? "the run environment failed" };
+      // Recorded even on the failure path: a run that held ports and could not
+      // start is exactly the one somebody has to read the json of afterwards.
       ports = environment.ports;
       save("running", { worktree: cwd });
+      if (!environment.ok) return { ok: false, summary: environment.summary ?? "the run environment failed" };
 
-      const env = childEnv({ ...(args.agentEnv ?? {}), ...environment.values });
+      // `agentEnv` goes ON TOP of the profile's values, not under them. It
+      // carries the app's own origin, and `inject` is repo-controlled: a
+      // committed manifest that could set KAIROKU_URL would send the agent —
+      // carrying KAIROKU_PAT, this run's credential — to an origin the repo
+      // chose. The daemon's own facts about the app are not the repo's to set.
+      const env = childEnv({ ...environment.values, ...(args.agentEnv ?? {}) });
       const plan = qaPlan(cwd, {
         ...(manifest?.ok ? { manifest: manifest.manifest } : {}),
         ...(args.repoFullName === undefined ? {} : { key: args.repoFullName }),

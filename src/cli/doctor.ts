@@ -169,7 +169,7 @@ export async function environment(io: Io, config: DoctorConfig, probe?: PortDeps
   if (!range) {
     out.push(fail("run port range", `"${text}" in config.json is not a range like "${DEFAULT_PORT_RANGE}"`));
   } else {
-    const test = probe ?? bindProbeFor(io);
+    const test = probe ?? BIND_PROBE;
     // A handful, not the whole range: the question is "is this range usable",
     // and probing ten thousand ports to answer it is its own kind of wrong.
     let free = 0;
@@ -208,20 +208,18 @@ export async function environment(io: Io, config: DoctorConfig, probe?: PortDeps
   return out;
 }
 
-/** The real probe, kept out of `environment` so a test never binds a port. */
-function bindProbeFor(_io: Io): PortDeps {
-  return {
-    probe(port) {
-      try {
-        const socket = Bun.listen({ hostname: "127.0.0.1", port, socket: { data() {} } });
-        socket.stop(true);
-        return true;
-      } catch {
-        return false;
-      }
-    },
-  };
-}
+/** The real probe, injectable so a unit test never binds a port. */
+const BIND_PROBE: PortDeps = {
+  probe(port) {
+    try {
+      const socket = Bun.listen({ hostname: "127.0.0.1", port, socket: { data() {} } });
+      socket.stop(true);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+};
 
 /** Only the fields the checks read. */
 interface DoctorConfig {
