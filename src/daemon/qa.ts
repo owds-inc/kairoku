@@ -17,6 +17,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { SuiteCounts } from "./app";
 import type { Manifest } from "./manifest";
+import { formatMatches, type ScanResult } from "./rules";
 import { run as execArgv } from "./worktree";
 
 // ------------------------------------------------------------------- parsers
@@ -223,6 +224,17 @@ export interface QaDeps {
     cwd: string,
     env?: Record<string, string>,
   ) => Promise<{ code: number; stdout: string; stderr: string }>;
+  /**
+   * §21 layer two — the repo's own rules over the WHOLE worktree, run before
+   * anything else. A thunk rather than the rules themselves so this module
+   * never learns what ast-grep is: `dispatch.ts` binds it when, and only when,
+   * the base branch declared rules. Absent = the repo declares none.
+   *
+   * No manifest entry asks for this. §21's lead ruling makes it automatic
+   * whenever `.kairoku/rules/` is on the base branch, so a repo cannot opt its
+   * own gate out in the same file the gate reads.
+   */
+  readonly scan?: () => Promise<ScanResult>;
 }
 
 /** The last `lines` lines — what a failing run attaches as its defect. */
@@ -236,6 +248,30 @@ const shell = (command: string, cwd: string, env?: Record<string, string>) =>
 export async function runQa(worktree: string, deps: QaDeps): Promise<QaResult> {
   const { plan, env } = deps;
   const exec = deps.exec ?? shell;
+
+  // FIRST, before the repo's own commands. A violation is a defect the fix loop
+  // can act on in seconds; making the agent wait out a full suite to hear it is
+  // the same information an hour later.
+  if (deps.scan) {
+    const scan = await deps.scan();
+    if (!scan.ok) {
+      // Fail closed, for the reason the counts do: a step that cannot look may
+      // not report that it looked and found nothing.
+      return {
+        ok: false,
+        summary: "QA: the repo's rules could not be checked",
+        defect: scan.error,
+      };
+    }
+    if (scan.matches.length > 0) {
+      const n = scan.matches.length;
+      return {
+        ok: false,
+        summary: `QA: ${n} violation(s) of this repo's own rules (${[...new Set(scan.matches.map((m) => m.ruleId))].join(", ")})`,
+        defect: formatMatches(scan.matches),
+      };
+    }
+  }
 
   for (const command of plan.check) {
     const result = await exec(command, worktree, env);

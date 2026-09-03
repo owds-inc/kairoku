@@ -1,0 +1,18 @@
+id: bun-spawn-resolved-path
+snapshots:
+  ? |
+    const gh = Bun.which("gh");
+    export const p = Bun.spawn(["gh", "pr", "view"], { cwd: repo });
+  : labels:
+    - source: 'Bun.spawn(["gh", "pr", "view"], { cwd: repo })'
+      style: primary
+      start: 45
+      end: 91
+    - source: Bun.which("gh")
+      style: secondary
+      start: 11
+      end: 26
+    - source: Bun.which("gh")
+      style: secondary
+      start: 11
+      end: 26

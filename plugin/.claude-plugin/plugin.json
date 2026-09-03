@@ -2,8 +2,8 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "kairoku",
   "displayName": "Kairoku",
-  "version": "2.3.0",
-  "description": "Connect a session to the Kairoku app over MCP (OAuth browser sign-in, no pasted tokens), with the protocol skills — jira-ops, git-pr, kairoku-mcp — and the four orchestration role agents the daemon drives: implementer, reviewer, planner, researcher.",
+  "version": "2.4.0",
+  "description": "Connect a session to the Kairoku app over MCP (OAuth browser sign-in, no pasted tokens), with the protocol skills — jira-ops, git-pr, kairoku-mcp — and the four orchestration role agents the daemon drives: implementer, reviewer, planner, researcher. The roles read the target repo's own `AGENTS.md`/`CLAUDE.md` and `.kairoku/patterns.md` before their first write.",
   "author": {
     "name": "Neil Pandit"
   },

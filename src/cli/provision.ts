@@ -9,6 +9,7 @@
 import { dirname, join } from "node:path";
 import { DEFAULT_PORT_RANGE } from "../daemon/compose";
 import { kairokuHome } from "../daemon/config";
+import { AST_GREP } from "../daemon/rules";
 import { version, type Io } from "./io";
 
 export type Step = { name: string; outcome: "done" | "skipped" | "manual"; detail: string };
@@ -17,6 +18,13 @@ const skipped = (name: string, detail: string): Step => ({ name, outcome: "skipp
 const manual = (name: string, detail: string): Step => ({ name, outcome: "manual", detail });
 
 export const NODE_MAJOR = 24;
+
+/** ast-grep ships a per-platform release binary through this npm wrapper. */
+export const AST_GREP_PACKAGE = "@ast-grep/cli";
+export { AST_GREP };
+
+/** §21 item 6 — Claude Code's built-in LSP tool finds this on PATH. */
+export const LSP_PACKAGES = ["typescript-language-server", "typescript"] as const;
 
 /**
  * The app checkout the daemon cuts worktrees from. DECISIONS §18: the app is
@@ -34,8 +42,19 @@ export const DEFAULT_APP_REPO = "https://github.com/bikerwhocodes/kairoku.git";
  */
 export const DEFAULT_APP_URL = "https://kairoku.io";
 
-export const CODEX_MCP_ADD =
-  "timeout 15 codex mcp add kairoku --url https://kairoku.io/api/mcp --bearer-token-env-var KAIROKU_PAT";
+/**
+ * §21 item 5b — NO BEARER FLAG, and the human logs in with OAuth.
+ *
+ * The bearer form provisioned a machine-wide `bearer_token_env_var =
+ * "KAIROKU_PAT"`. `KAIROKU_PAT` is only ever set INSIDE a run, and Codex prefers
+ * the bearer path once the variable is configured, so the operator's own
+ * interactive Codex on the same machine got `401 No authorization provided` and
+ * its own OAuth login was ignored (found 2026-09-03 on Neil's Mac). The run's
+ * credential now lives in the run's own `.codex/config.toml`, written per
+ * dispatch by `providers/codex.ts`, and the machine keeps none of it.
+ */
+export const CODEX_MCP_ADD = "timeout 15 codex mcp add kairoku --url https://kairoku.io/api/mcp";
+export const CODEX_MCP_LOGIN = "codex mcp login kairoku            # (browser)";
 
 const sudoOk = async (io: Io) => (await io.shell(["sudo", "-n", "true"])).code === 0;
 
@@ -84,6 +103,21 @@ export async function runtimes(io: Io): Promise<Step[]> {
   } else {
     const install = await io.shell(["npm", "install", "-g", ...missing], { live: true });
     steps.push(install.code === 0 ? done("agent CLIs", `npm install -g ${missing.join(" ")}`) : manual("agent CLIs", `npm install -g ${missing.join(" ")} failed (exit ${install.code})`));
+  }
+
+  // §21 Q25 — ast-grep is ONE BINARY, and a repo that declares
+  // `.kairoku/rules/` fails its runs closed on a machine without it. Installed
+  // the way every other CLI here is installed, and SKIPPED when present for the
+  // same reason as the rest: this is provisioning, not an update channel.
+  if (io.which(AST_GREP)) {
+    steps.push(skipped(AST_GREP, `${await version(io, AST_GREP)} already installed`));
+  } else {
+    const install = await io.shell(["npm", "install", "-g", AST_GREP_PACKAGE], { live: true });
+    steps.push(
+      install.code === 0
+        ? done(AST_GREP, `npm install -g ${AST_GREP_PACKAGE}`)
+        : manual(AST_GREP, `npm install -g ${AST_GREP_PACKAGE} failed (exit ${install.code}) — a repo with .kairoku/rules cannot run here until it is present`),
+    );
   }
   return steps;
 }
@@ -196,21 +230,64 @@ export async function userns(io: Io): Promise<Step> {
 }
 
 /**
- * approval_policy "never" auto-DENIES approval requests, and a Kairoku MCP
- * write generates one unless the server's mode is "approve" (pre-approved).
- * "auto" is NOT enough — writes still prompt, and then get denied.
+ * §21 item 5b — the machine-wide kairoku MCP entry must carry NO bearer.
+ *
+ * This step used to ADD `default_tools_approval_mode = "approve"` beside a
+ * machine-wide `bearer_token_env_var = "KAIROKU_PAT"`. Both now belong to the
+ * RUN, written per dispatch into the worktree's own `.codex/config.toml`. What
+ * is checked here is the opposite property: that the human's own Codex reaches
+ * Kairoku through `codex mcp login` (OAuth) and is not silently pushed onto a
+ * bearer path whose variable is never set outside a run.
+ *
+ * It REPORTS rather than rewrites. `~/.codex/config.toml` is the operator's own
+ * file, and a provisioning step that edits a human's credentials out from under
+ * them is worse than a line of output.
  */
 export async function codexConfig(io: Io): Promise<Step> {
-  const name = "codex MCP approval mode";
+  const name = "codex MCP (human login)";
   const path = join(io.home, ".codex", "config.toml");
   const text = io.readFile(path);
-  if (text === null) return manual(name, "no ~/.codex/config.toml yet — run `codex login`, add the kairoku MCP server, then rerun `kairoku setup --daemon`");
-  if (text.includes("default_tools_approval_mode")) return skipped(name, "default_tools_approval_mode already set");
-  if (!text.includes('bearer_token_env_var = "KAIROKU_PAT"')) {
-    return manual(name, `kairoku MCP entry not found in ${path} — add it with:\n     ${CODEX_MCP_ADD}\n     (the add command hangs after writing; the config still lands), then rerun`);
+  if (text === null) {
+    return manual(
+      name,
+      `no ~/.codex/config.toml yet — run \`codex login\`, then:\n     ${CODEX_MCP_ADD}\n     ${CODEX_MCP_LOGIN}`,
+    );
   }
-  io.writeFile(path, text.replace(/^(bearer_token_env_var = "KAIROKU_PAT")$/m, '$1\ndefault_tools_approval_mode = "approve"'));
-  return done(name, 'default_tools_approval_mode = "approve"');
+  if (/bearer_token_env_var\s*=\s*"KAIROKU_PAT"/.test(text)) {
+    return manual(
+      name,
+      "the kairoku MCP entry in ~/.codex/config.toml carries bearer_token_env_var — that variable is only set\n" +
+        "     inside a run, so your own Codex gets 401 and ignores its OAuth login. Remove it and re-add:\n" +
+        "     codex mcp remove kairoku\n" +
+        `     ${CODEX_MCP_ADD}\n     ${CODEX_MCP_LOGIN}`,
+    );
+  }
+  if (!text.includes("[mcp_servers.kairoku]")) {
+    return manual(name, `kairoku MCP entry not found in ${path} — add it with:\n     ${CODEX_MCP_ADD}\n     ${CODEX_MCP_LOGIN}`);
+  }
+  return skipped(name, "OAuth entry, no bearer — a run brings its own credential");
+}
+
+/**
+ * §21 item 6 — EXACT RESOLUTION. Claude Code's built-in LSP tool finds a
+ * language server on PATH; a TypeScript repo therefore gets one, so an
+ * implementer can resolve a symbol instead of grepping for its name.
+ *
+ * Through BUN, not npm: the daemon's own runtime, already provisioned, and the
+ * one every machine here has. Absent is a WARN in `doctor` and never a FAIL, so
+ * a failed install is a `manual` line rather than a stopped setup — the
+ * degraded path (grep, and a Codex implementer) still works.
+ */
+export async function languageServer(io: Io, repoPath: string): Promise<Step> {
+  const name = "typescript-language-server (exact resolution)";
+  if (!io.exists(join(repoPath, "tsconfig.json"))) {
+    return skipped(name, `no tsconfig.json in ${repoPath} — nothing here needs a TypeScript server`);
+  }
+  if (io.which(LSP_PACKAGES[0])) return skipped(name, `${await version(io, LSP_PACKAGES[0])} already installed`);
+  const install = await io.shell(["bun", "add", "-g", ...LSP_PACKAGES], { live: true });
+  return install.code === 0
+    ? done(name, `bun add -g ${LSP_PACKAGES.join(" ")}`)
+    : manual(name, `bun add -g ${LSP_PACKAGES.join(" ")} failed (exit ${install.code}) — runs still work, symbols are grepped`);
 }
 
 export function configuredRepoUrl(io: Io): string | undefined {
@@ -324,8 +401,8 @@ export function remainder(io: Io, steps: Step[]): string[] {
   const owed: string[] = [];
   if (!io.exists(join(io.home, ".claude"))) owed.push("claude                       # then /login (browser)");
   if (!io.exists(join(io.home, ".codex", "auth.json"))) owed.push("codex login                  # (browser)");
-  if (!(io.readFile(join(io.home, ".codex", "config.toml")) ?? "").includes("default_tools_approval_mode")) {
-    owed.push(`${CODEX_MCP_ADD}\n     # the add command hangs after writing; the config still lands.\n     # Then rerun \`kairoku setup --daemon\` to pre-approve MCP writes.`);
+  if (!(io.readFile(join(io.home, ".codex", "config.toml")) ?? "").includes("[mcp_servers.kairoku]")) {
+    owed.push(`${CODEX_MCP_ADD}\n     # the add command hangs after writing; the config still lands.\n     ${CODEX_MCP_LOGIN}`);
   }
   for (const s of steps) if (s.outcome === "manual") owed.push(`${s.name}: ${s.detail}`);
   return owed;

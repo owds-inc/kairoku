@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { rolePrompt } from "../roles";
-import { claudeProvider, claudeQueryOptions, preToolUseHook } from "./claude";
+import type { Rules } from "../rules";
+import { claudeProvider, claudeQueryOptions, postToolUseHook, preToolUseHook } from "./claude";
 import type { RoleRun } from "./types";
 
 const run = (over: Partial<RoleRun> = {}): RoleRun => ({
@@ -259,5 +260,82 @@ describe("claude — the model list", () => {
       throw new Error("spawn claude ENOENT");
     };
     expect(await claudeProvider({ query: query as never }).models()).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------- §21 layer one
+
+const RULES: Rules = {
+  dir: "/tmp/runs/d1/rules",
+  config: "/tmp/runs/d1/rules/sgconfig.yml",
+  bin: "/opt/homebrew/bin/ast-grep",
+  ids: ["bun-spawn-resolved-path.yml"],
+  scanScript: "/tmp/runs/d1/rules/kairoku-rules-scan.sh",
+};
+
+const MATCH = {
+  ruleId: "bun-spawn-resolved-path",
+  file: "src/a.ts",
+  line: 12,
+  message: "Bun.spawn must run the path Bun.which resolved.",
+  note: "CLI PR #7 defect 5.",
+};
+
+describe("claude — §21 layer one: the hook at the write", () => {
+  test("a PostToolUse hook on Write|Edit is installed beside the policy hook, only when rules exist", () => {
+    const withRules = claudeQueryOptions(run({ rules: RULES }), {}).hooks as {
+      PreToolUse?: unknown[];
+      PostToolUse?: Array<{ matcher?: string; hooks: unknown[] }>;
+    };
+    expect(withRules.PreToolUse).toHaveLength(1);
+    expect(withRules.PostToolUse).toHaveLength(1);
+    expect(withRules.PostToolUse![0]!.matcher).toBe("Write|Edit");
+
+    const without = claudeQueryOptions(run(), {}).hooks as Record<string, unknown>;
+    expect(without.PostToolUse).toBeUndefined();
+  });
+
+  test("a write that matches a rule returns the SDK's blocking result with the message AND the note", async () => {
+    const hook = postToolUseHook(run({ rules: RULES }), async () => ({ ok: true, matches: [MATCH] }));
+    const answer = (await hook({
+      tool_name: "Write",
+      tool_input: { file_path: "/tmp/wt/r1/src/a.ts" },
+    })) as { decision?: string; reason?: string };
+    expect(answer.decision).toBe("block");
+    expect(answer.reason).toContain("bun-spawn-resolved-path");
+    expect(answer.reason).toContain("src/a.ts:12");
+    expect(answer.reason).toContain("Bun.spawn must run the path");
+    expect(answer.reason).toContain("CLI PR #7 defect 5.");
+  });
+
+  test("a write that matches nothing passes with an empty answer", async () => {
+    const hook = postToolUseHook(run({ rules: RULES }), async () => ({ ok: true, matches: [] }));
+    expect(await hook({ tool_name: "Write", tool_input: { file_path: "/tmp/wt/r1/src/a.ts" } })).toEqual({});
+  });
+
+  test("a file OUTSIDE the worktree is ignored, and is never even scanned", async () => {
+    let scanned = 0;
+    const hook = postToolUseHook(run({ rules: RULES }), async () => {
+      scanned++;
+      return { ok: true as const, matches: [MATCH] };
+    });
+    expect(await hook({ tool_name: "Write", tool_input: { file_path: "/etc/hosts" } })).toEqual({});
+    expect(await hook({ tool_name: "Write", tool_input: {} })).toEqual({});
+    expect(scanned).toBe(0);
+  });
+
+  test("a scan this daemon cannot read does NOT block — QA is the gate of record", async () => {
+    const hook = postToolUseHook(run({ rules: RULES }), async () => ({ ok: false as const, error: "ast-grep died" }));
+    expect(await hook({ tool_name: "Write", tool_input: { file_path: "/tmp/wt/r1/src/a.ts" } })).toEqual({});
+  });
+
+  test("the hook scans the WRITTEN FILE, in the worktree, with the run's rules", async () => {
+    const calls: Array<{ rules: Rules; cwd: string; paths: string[] }> = [];
+    const hook = postToolUseHook(run({ rules: RULES }), async (rules, cwd, paths) => {
+      calls.push({ rules, cwd, paths });
+      return { ok: true, matches: [] };
+    });
+    await hook({ tool_name: "Edit", tool_input: { file_path: "src/a.ts" } });
+    expect(calls).toEqual([{ rules: RULES, cwd: "/tmp/wt/r1", paths: ["/tmp/wt/r1/src/a.ts"] }]);
   });
 });

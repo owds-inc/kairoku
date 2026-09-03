@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseManifest, type Manifest } from "./manifest";
-import { parseSummary, qaPlan, runQa, tail } from "./qa";
+import { parseSummary, qaPlan, runQa, tail, type QaPlan } from "./qa";
 
 function manifestOf(source: unknown): Manifest {
   const parsed = parseManifest(JSON.stringify(source));
@@ -266,5 +266,68 @@ describe("qa — tail", () => {
     expect(tail("a\nb\nc", 2)).toBe("b\nc");
     expect(tail("a", 100)).toBe("a");
     expect(tail("", 100)).toBe("");
+  });
+});
+
+// ------------------------------------------------------- §21 layer two: the gate
+
+describe("qa — §21 layer two: the repo's own rules, before the check commands", () => {
+  const plan: QaPlan = { check: ["true"], test: "bun test", concurrency: 1, key: "owner/repo", source: "kairoku.json" };
+  const green = async () => ({ code: 0, stdout: " 10 pass\n 0 fail\n", stderr: "" });
+
+  test("a match fails QA with the rule ids and file:line, BEFORE anything else runs", async () => {
+    const ran: string[] = [];
+    const result = await runQa("/wt", {
+      plan,
+      exec: async (command) => {
+        ran.push(command);
+        return green();
+      },
+      scan: async () => ({
+        ok: true,
+        matches: [
+          { ruleId: "bun-spawn-resolved-path", file: "src/a.ts", line: 12, message: "resolve it first", note: "CLI PR #7" },
+          { ruleId: "mock-module-self-delegating", file: "src/b.test.ts", line: 4, message: "capture by value" },
+        ],
+      }),
+    });
+    expect(result.ok).toBe(false);
+    expect(ran).toEqual([]);
+    expect(result.summary).toContain("2");
+    expect(result.defect).toContain("bun-spawn-resolved-path");
+    expect(result.defect).toContain("src/a.ts:12");
+    expect(result.defect).toContain("mock-module-self-delegating");
+    expect(result.defect).toContain("src/b.test.ts:4");
+    expect(result.counts).toBeUndefined();
+  });
+
+  test("no match runs the rest of QA exactly as before", async () => {
+    const ran: string[] = [];
+    const result = await runQa("/wt", {
+      plan,
+      exec: async (command) => {
+        ran.push(command);
+        return green();
+      },
+      scan: async () => ({ ok: true, matches: [] }),
+    });
+    expect(ran).toEqual(["true", "bun test"]);
+    expect(result).toMatchObject({ ok: true, counts: { pass: 10, fail: 0, skip: 0, errors: 0 } });
+  });
+
+  test("a scan this daemon cannot read FAILS QA — it may not report clean without having looked", async () => {
+    const result = await runQa("/wt", {
+      plan,
+      exec: green,
+      scan: async () => ({ ok: false, error: "ast-grep printed no result this daemon can read" }),
+    });
+    expect(result.ok).toBe(false);
+    expect(result.summary).toContain("rules");
+    expect(result.defect).toContain("ast-grep");
+  });
+
+  test("a repo with no rules never scans, and QA is unchanged", async () => {
+    const result = await runQa("/wt", { plan: { ...plan, check: [] }, exec: green });
+    expect(result).toMatchObject({ ok: true, counts: { pass: 10, fail: 0, skip: 0, errors: 0 } });
   });
 });

@@ -19,10 +19,12 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appClient, type RunReport } from "./app";
+import { postToolUseHook } from "./providers/claude";
+import { RULES_PATH } from "./rules";
 import { startLink, type Link } from "./link";
 import type { LaunchedRun, Provider, RoleRun } from "./providers";
 import { RunStore } from "./runs";
@@ -63,6 +65,18 @@ function fakeGhOnPath(): void {
   pathBefore = process.env.PATH;
   process.env.PATH = `${binDir}:${process.env.PATH ?? ""}`;
 }
+
+/**
+ * §21 — rule 3, exactly as this repo dogfoods it. Read from THIS checkout so the
+ * e2e cannot drift from the rule the daemon would actually be handed.
+ */
+const RULE_3 = readFileSync(
+  join(import.meta.dir, "..", "..", RULES_PATH, "bun-spawn-resolved-path.yml"),
+  "utf8",
+);
+
+/** Same commands, plus nothing: the rules gate needs no manifest entry. */
+const RULED_MANIFEST = JSON.stringify({ check: [], test: "sh ./run-tests.sh", concurrency: { test: 1 } });
 
 /** The manifest the fixture repo commits to its base branch. */
 const FIXTURE_MANIFEST = JSON.stringify({
@@ -443,5 +457,205 @@ describe("the done-condition, against the fake app", () => {
       await waitFor(() => fake.runs.get("run-1")?.status !== undefined, "the run to settle", 30_000);
     },
     30_000,
+  );
+});
+
+/**
+ * §21 — the two layers, end to end, over a fixture repo whose BASE BRANCH
+ * carries rule 3. Nothing here is stubbed but the model: the rules are read
+ * from `origin/main` by the production reader, materialised by the production
+ * materialiser, and checked by the real `ast-grep` binary on this machine.
+ */
+describe("the two layers of §21, against a base branch that declares a rule", () => {
+  const violating = [
+    "export async function findPr(repo: string) {",
+    '  const gh = Bun.which("gh");',
+    "  if (!gh) return;",
+    '  return Bun.spawn(["gh", "pr", "view"], { cwd: repo });',
+    "}",
+    "",
+  ].join("\n");
+
+  /** The base branch carries the rule; the worktrees never do. */
+  async function ruledMachine() {
+    const made = await machine({ maxConcurrent: 1 }, RULED_MANIFEST);
+    const repo = made.h.config.repoPath;
+    mkdirSync(join(repo, RULES_PATH), { recursive: true });
+    writeFileSync(join(repo, RULES_PATH, "bun-spawn-resolved-path.yml"), RULE_3);
+    await git(["git", "add", "-A"], repo);
+    await git(["git", "commit", "-qm", "the repo's own rules"], repo);
+    await git(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], repo);
+    return made;
+  }
+
+  /**
+   * An implementer that writes a violating file. `viaHook` decides whether the
+   * PRODUCTION `PostToolUse` hook sees the write — layer one — or whether the
+   * violation slips past it and has to be caught by QA — layer two.
+   */
+  function writer(options: { viaHook: boolean }) {
+    const blocks: string[] = [];
+    const prompts: string[] = [];
+    const provider: Provider & { blocks: string[]; prompts: string[] } = {
+      name: "claude",
+      blocks,
+      prompts,
+      models: async () => ["claude-opus-5"],
+      launch(run: RoleRun): LaunchedRun {
+        prompts.push(run.prompt);
+        const work = (async () => {
+          if (run.role !== "implementer") return;
+          // Round two of the fix loop repairs it, so the member can finish.
+          const fixing = run.prompt.includes("did not pass");
+          const file = join(run.cwd, "src", "pr.ts");
+          mkdirSync(join(run.cwd, "src"), { recursive: true });
+          writeFileSync(file, fixing ? violating.replace('["gh",', "[gh,") : violating);
+          if (!options.viaHook || fixing) return;
+          const answer = await postToolUseHook(run)({ tool_name: "Write", tool_input: { file_path: file } });
+          if (answer.decision === "block") blocks.push(String(answer.reason));
+        })();
+        return {
+          events: {
+            async *[Symbol.asyncIterator]() {
+              await work;
+              yield { kind: "text" as const, text: `${run.role} ran` };
+            },
+          },
+          interrupt() {},
+          exit: work.then(() => ({
+            ok: true,
+            summary: `${run.role} finished`,
+            ...(run.role === "reviewer" ? { report: { verdict: "CLEAN", defects: [] } } : {}),
+          })),
+        };
+      },
+    };
+    return provider;
+  }
+
+  test.if(Boolean(Bun.which("ast-grep", { PATH: process.env.PATH ?? "" })))(
+    "layer one: the write is BLOCKED with the rule's message and the defect it exists for",
+    async () => {
+      fakeGhOnPath();
+      const { h, app: fake } = await ruledMachine();
+      const provider = writer({ viaHook: true });
+      const config = { ...h.config, worktreeOps: seedingWorktrees(h.config.worktreesDir, () => false) };
+      const l = (link = startLink(new RunStore(config), config, {
+        client: appClient({ appUrl: fake.url, token: fake.token }),
+        autostart: false,
+        log: () => {},
+        providers: { claude: provider, codex: provider },
+      }));
+      await l.beat();
+      fake.queue({
+        id: "d-rules",
+        taskType: "implement",
+        target: { kind: "plan_item", id: "t1", title: "one" },
+        repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
+        team: { recipe: "build-verify", roles: {} },
+        items: [fakeItem(1)],
+      });
+      expect(await l.poll()).toBe(true);
+      await waitFor(
+        () => [...fake.runs.values()].every((r) => r.status === "done" || r.status === "failed"),
+        "the member to settle",
+        60_000,
+      );
+      expect(provider.blocks).toHaveLength(1);
+      expect(provider.blocks[0]).toContain("bun-spawn-resolved-path");
+      expect(provider.blocks[0]).toContain("src/pr.ts:4");
+      expect(provider.blocks[0]).toContain("Bun.spawn must run the path");
+      expect(provider.blocks[0]).toContain("PR #7 defect 5");
+    },
+    90_000,
+  );
+
+  test.if(Boolean(Bun.which("ast-grep", { PATH: process.env.PATH ?? "" })))(
+    "layer two: a violation that slipped past the hook FAILS QA, and the fix loop's next prompt carries it",
+    async () => {
+      fakeGhOnPath();
+      const { h, app: fake } = await ruledMachine();
+      const provider = writer({ viaHook: false });
+      const config = { ...h.config, worktreeOps: seedingWorktrees(h.config.worktreesDir, () => false) };
+      const l = (link = startLink(new RunStore(config), config, {
+        client: appClient({ appUrl: fake.url, token: fake.token }),
+        autostart: false,
+        log: () => {},
+        providers: { claude: provider, codex: provider },
+      }));
+      await l.beat();
+      fake.queue({
+        id: "d-qa",
+        taskType: "implement",
+        target: { kind: "plan_item", id: "t1", title: "one" },
+        repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
+        team: { recipe: "build-verify", roles: {} },
+        items: [fakeItem(1)],
+      });
+      expect(await l.poll()).toBe(true);
+      await waitFor(
+        () => [...fake.runs.values()].every((r) => r.status === "done" || r.status === "failed"),
+        "the member to settle",
+        60_000,
+      );
+      // Nothing blocked at the write, so QA is what caught it — and the
+      // implementer's next turn was given the rule id and the file:line.
+      expect(provider.blocks).toEqual([]);
+      const fix = provider.prompts.find((p) => p.includes("did not pass"));
+      expect(fix).toBeDefined();
+      expect(fix).toContain("bun-spawn-resolved-path");
+      expect(fix).toContain("src/pr.ts:4");
+      // The fix round repaired it, so the run finished green on the repo's suite.
+      expect(fake.runs.get("run-1")!.status).toBe("done");
+      expect(fake.runs.get("run-1")!.counts).toEqual({ pass: 10, fail: 0, skip: 0, errors: 0 });
+    },
+    90_000,
+  );
+
+  test.if(Boolean(Bun.which("ast-grep", { PATH: process.env.PATH ?? "" })))(
+    "the rule survives a worktree that deletes it — it is read from the base branch",
+    async () => {
+      fakeGhOnPath();
+      const { h, app: fake } = await ruledMachine();
+      const inner = writer({ viaHook: false });
+      const deleting: Provider = {
+        ...inner,
+        launch(run: RoleRun): LaunchedRun {
+          // The PR's own first act is to delete the rules directory it is
+          // about to violate. The daemon never read that copy.
+          rmSync(join(run.cwd, ".kairoku"), { recursive: true, force: true });
+          return inner.launch(run);
+        },
+      };
+      const config = { ...h.config, worktreeOps: seedingWorktrees(h.config.worktreesDir, () => false) };
+      const l = (link = startLink(new RunStore(config), config, {
+        client: appClient({ appUrl: fake.url, token: fake.token }),
+        autostart: false,
+        log: () => {},
+        providers: { claude: deleting, codex: deleting },
+      }));
+      await l.beat();
+      fake.queue({
+        id: "d-del",
+        taskType: "implement",
+        target: { kind: "plan_item", id: "t1", title: "one" },
+        repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
+        team: { recipe: "build-verify", roles: {} },
+        items: [fakeItem(1)],
+      });
+      expect(await l.poll()).toBe(true);
+      await waitFor(
+        () => [...fake.runs.values()].every((r) => r.status === "done" || r.status === "failed"),
+        "the member to settle",
+        60_000,
+      );
+      // The rule the worktree deleted is still the one that caught it: QA
+      // failed on it and the fix round was handed its id and file:line.
+      const fix = inner.prompts.find((p) => p.includes("did not pass"));
+      expect(fix).toBeDefined();
+      expect(fix).toContain("bun-spawn-resolved-path");
+      expect(fix).toContain("src/pr.ts:4");
+    },
+    90_000,
   );
 });

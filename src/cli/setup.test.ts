@@ -26,7 +26,7 @@ function withClaude(io = fakeIo()): FakeIo {
 /** A linux VM with everything already in place: every provisioning step is a skip. */
 function provisionedVm(): FakeIo {
   const io = withClaude(fakeIo({ platform: "linux", home, env: { USER: "neil", PATH: "/usr/bin:/bin" } }));
-  for (const b of ["node", "bun", "codex", "paseo", "git", "docker"]) io.bins.add(b);
+  for (const b of ["node", "bun", "codex", "paseo", "git", "docker", "ast-grep"]) io.bins.add(b);
   Object.assign(io.canned, {
     "node --version": { stdout: "v24.1.0\n" },
     "bun --version": { stdout: "1.3.14\n" },
@@ -38,7 +38,7 @@ function provisionedVm(): FakeIo {
     [`${home}/work/kairoku/.git`]: "",
     "/proc/sys/kernel/apparmor_restrict_unprivileged_userns": "0\n",
     "/etc/sysctl.d/99-codex-userns.conf": "kernel.apparmor_restrict_unprivileged_userns=0\n",
-    [`${home}/.codex/config.toml`]: 'bearer_token_env_var = "KAIROKU_PAT"\ndefault_tools_approval_mode = "approve"\n',
+    [`${home}/.codex/config.toml`]: '[mcp_servers.kairoku]\nurl = "https://kairoku.io/api/mcp"\n',
     [`${home}/.codex/auth.json`]: "{}",
     [`${home}/.claude`]: "",
     [`${home}/.kairoku/token.env`]: "KAIROKU_DAEMON_TOKEN=kai_secret_token\n",
@@ -131,7 +131,7 @@ describe("kairoku setup — daemon", () => {
     expect(await run(["--daemon", "--yes"], io)).toBe(0);
     expect(io.questions).toEqual([]);
     const out = io.lines.join("\n");
-    for (const skipped of ["not upgrading", "already above the interactive guard", `already at ${home}/work/kairoku`, "already 0 and persisted", "already set", "v5.4.0 already installed"]) {
+    for (const skipped of ["not upgrading", "already above the interactive guard", `already at ${home}/work/kairoku`, "already 0 and persisted", "OAuth entry, no bearer", "v5.4.0 already installed"]) {
       expect(out).toContain(skipped);
     }
     expect(out).toContain("unit written to /etc/systemd/system/kairoku-daemon.service");
@@ -304,7 +304,7 @@ describe("kairoku setup — daemon migrates a pre-rename home first", () => {
         mode: realIo.mode,
         writeFile: realIo.writeFile,
       }));
-      for (const b of ["node", "bun", "codex", "paseo", "git", "docker"]) io.bins.add(b);
+      for (const b of ["node", "bun", "codex", "paseo", "git", "docker", "ast-grep"]) io.bins.add(b);
       Object.assign(io.canned, { "node --version": { stdout: "v24.1.0\n" }, "bun --version": { stdout: "1.3.14\n" }, "sudo -n true": { code: 0 } });
       const seen: string[] = [];
       io.fetch = async (url, init) => {

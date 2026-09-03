@@ -27,6 +27,7 @@ import {
 } from "./dispatch";
 import { reserved } from "./compose";
 import { parseManifest } from "./manifest";
+import { PATTERNS_PATH, type Rules } from "./rules";
 import { RunStore } from "./runs";
 import { rolePrompt, rolesWithPrompts } from "./roles";
 import { ROLE_NAMES } from "./policy";
@@ -683,5 +684,81 @@ describe("dispatch — the run's environment (§20.11, O-4)", () => {
     // No manifest and no package.json in the fake worktree: QA fails closed,
     // which is invariant 7 and not an environment problem.
     expect(r.reports.at(-1)!.summary).toContain("no test command");
+  });
+});
+
+// -------------------------------------------------------------- §21 the rules
+
+const RULES: Rules = {
+  dir: "/tmp/runs/d1/rules",
+  config: "/tmp/runs/d1/rules/sgconfig.yml",
+  bin: "/opt/homebrew/bin/ast-grep",
+  ids: ["bun-spawn-resolved-path.yml"],
+  scanScript: "/tmp/runs/d1/rules/kairoku-rules-scan.sh",
+};
+
+describe("dispatch — §21 the repo's own rules", () => {
+  test("rules on the base branch reach every role turn AND the QA step", async () => {
+    const r = rig();
+    await r.run(claim(), { rules: async () => ({ ok: true, rules: RULES }) });
+    expect(r.provider.launched.length).toBeGreaterThan(0);
+    for (const launched of r.provider.launched) expect(launched.rules).toEqual(RULES);
+  });
+
+  test("no rules on the base branch leaves every turn without them", async () => {
+    const r = rig();
+    await r.run(claim(), { rules: async () => ({ ok: true }) });
+    for (const launched of r.provider.launched) expect(launched.rules).toBeUndefined();
+  });
+
+  test("rules the machine cannot check fails the run CLOSED, before a worktree is cut", async () => {
+    const r = rig();
+    await r.run(claim(), { rules: async () => ({ ok: false, error: "…and ast-grep is not installed on this machine" }) });
+    expect(r.h.worktrees.created).toEqual([]);
+    expect(r.reports).toHaveLength(1);
+    expect(r.reports[0]).toMatchObject({ status: "failed" });
+    expect(r.reports[0]!.summary).toContain("ast-grep is not installed");
+  });
+
+  test("they are read ONCE per dispatch, not once per member", async () => {
+    const r = rig({ maxConcurrent: 3 });
+    let reads = 0;
+    await r.run(claim({ items: [fakeItem(1), fakeItem(2), fakeItem(3)] }), {
+      rules: async () => {
+        reads++;
+        return { ok: true, rules: RULES };
+      },
+    });
+    expect(reads).toBe(1);
+  });
+
+});
+
+describe("§21 Q6/Q7 — the patterns.md convention reaches every role, on both hosts", () => {
+  const repoDir = join(import.meta.dir, "..", "..");
+
+  test("every daemon role prompt names the memory files it must read first", () => {
+    for (const role of ROLE_NAMES) {
+      const prompt = rolePrompt(role);
+      expect({ [role]: prompt.includes(PATTERNS_PATH) }).toEqual({ [role]: true });
+      expect({ [role]: /AGENTS\.md|CLAUDE\.md/.test(prompt) }).toEqual({ [role]: true });
+    }
+  });
+
+  test("the plugin's implementer and reviewer say the same thing — one convention, two hosts", () => {
+    for (const agent of ["implementer", "reviewer"]) {
+      const text = readFileSync(join(repoDir, "plugin", "agents", `${agent}.md`), "utf8");
+      expect({ [agent]: text.includes(PATTERNS_PATH) }).toEqual({ [agent]: true });
+    }
+  });
+
+  test("ONE WRITER (§21 Q7): the reviewer treats a change outside the item's scope as a defect", () => {
+    for (const text of [
+      rolePrompt("reviewer"),
+      readFileSync(join(repoDir, "plugin", "agents", "reviewer.md"), "utf8"),
+    ]) {
+      expect(text).toContain(PATTERNS_PATH);
+      expect(text.toLowerCase()).toContain("defect");
+    }
   });
 });

@@ -1,0 +1,7 @@
+{
+  "$comment": "DECISIONS §21 Q23 — this repo dogfoods its own manifest, so a Kairoku daemon can run the CLI repo's own plan items. The daemon reads this file from origin/main, never from a run's worktree. `.kairoku/rules/` is picked up automatically (§21's lead ruling): no entry here asks for it, because a repo must not be able to opt its own gate out in the same file the gate reads.",
+  "setup": ["bun install"],
+  "check": ["bunx tsc --noEmit", "ast-grep test"],
+  "test": "bun test",
+  "concurrency": { "test": 1 }
+}

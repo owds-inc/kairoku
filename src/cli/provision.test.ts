@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { checkout, codexConfig, daemonConfig, DEFAULT_APP_REPO, docker, remainder, runtimes, shellPath, userns, type Step } from "./provision";
+import { checkout, codexConfig, CODEX_MCP_ADD, CODEX_MCP_LOGIN, daemonConfig, DEFAULT_APP_REPO, docker, languageServer, remainder, runtimes, shellPath, userns, type Step } from "./provision";
 import { fakeIo, type FakeIo } from "./testkit";
 
 const calls = (io: FakeIo) => io.calls.map((c) => c.join(" "));
@@ -7,7 +7,7 @@ const home = "/home/neil";
 
 function vm(): FakeIo {
   const io = fakeIo({ platform: "linux", home, env: { USER: "neil", PATH: "/usr/bin:/bin" } });
-  for (const b of ["node", "bun", "claude", "codex", "paseo", "git"]) io.bins.add(b);
+  for (const b of ["node", "bun", "claude", "codex", "paseo", "git", "ast-grep"]) io.bins.add(b);
   io.canned["node --version"] = { stdout: "v24.1.0\n" };
   io.canned["bun --version"] = { stdout: "1.3.14\n" };
   io.canned["sudo -n true"] = { code: 0 };
@@ -18,7 +18,7 @@ describe("runtimes", () => {
   test("everything present is skipped, nothing installed", async () => {
     const io = vm();
     const steps = await runtimes(io);
-    expect(steps.map((s) => s.outcome)).toEqual(["skipped", "skipped", "skipped"]);
+    expect(steps.map((s) => s.outcome)).toEqual(["skipped", "skipped", "skipped", "skipped"]);
     expect(calls(io).filter((c) => /curl|npm/.test(c))).toEqual([]);
   });
 
@@ -28,8 +28,9 @@ describe("runtimes", () => {
     io.bins.delete("bun");
     io.bins.delete("codex");
     io.bins.delete("paseo");
+    io.bins.delete("ast-grep");
     const steps = await runtimes(io);
-    expect(steps.map((s) => s.outcome)).toEqual(["done", "done", "done"]);
+    expect(steps.map((s) => s.outcome)).toEqual(["done", "done", "done", "done"]);
     const c = calls(io);
     expect(c.find((l) => l.includes("nvm-sh/nvm") && l.includes("nvm install 24"))).toBeDefined();
     expect(c.find((l) => l.includes("https://bun.sh/install"))).toBeDefined();
@@ -112,18 +113,11 @@ describe("user namespaces (codex sandbox)", () => {
   });
 });
 
-describe("codex MCP approval mode", () => {
+describe("codex MCP entry", () => {
   const cfg = `${home}/.codex/config.toml`;
   test("no config yet is a manual step naming codex login", async () => {
     const io = vm();
     expect(await codexConfig(io)).toMatchObject({ outcome: "manual", detail: expect.stringContaining("codex login") });
-  });
-  test("inserts the approve line after the kairoku MCP entry, once", async () => {
-    const io = vm();
-    io.files[cfg] = '[mcp_servers.kairoku]\nurl = "https://kairoku.io/api/mcp"\nbearer_token_env_var = "KAIROKU_PAT"\n';
-    expect((await codexConfig(io)).outcome).toBe("done");
-    expect(io.files[cfg]).toBe('[mcp_servers.kairoku]\nurl = "https://kairoku.io/api/mcp"\nbearer_token_env_var = "KAIROKU_PAT"\ndefault_tools_approval_mode = "approve"\n');
-    expect((await codexConfig(io)).outcome).toBe("skipped");
   });
   test("without the kairoku MCP entry the add command is handed back", async () => {
     const io = vm();
@@ -198,7 +192,7 @@ describe("what is left is human-only", () => {
     const io = vm();
     io.files[`${home}/.claude`] = "";
     io.files[`${home}/.codex/auth.json`] = "";
-    io.files[`${home}/.codex/config.toml`] = 'default_tools_approval_mode = "approve"\n';
+    io.files[`${home}/.codex/config.toml`] = '[mcp_servers.kairoku]\nurl = "https://kairoku.io/api/mcp"\n';
     const steps: Step[] = [{ name: "userns", outcome: "manual", detail: "sudo …" }];
     const owed = remainder(io, steps);
     expect(owed).toHaveLength(1);
@@ -261,5 +255,83 @@ describe("O-4: docker", () => {
     expect(step.detail).toContain("OrbStack");
     expect(step.detail).toContain("Docker Desktop");
     expect(calls(io).some((c) => c.startsWith("sudo"))).toBe(false);
+  });
+});
+
+// -------------------------------------------------------------------- §21 CI-1
+
+describe("§21 — ast-grep is one binary setup installs", () => {
+  test("absent, it is installed with the other CLIs in one npm call", async () => {
+    const io = vm();
+    io.bins.delete("ast-grep");
+    const steps = await runtimes(io);
+    expect(calls(io)).toContain("npm install -g @ast-grep/cli");
+    expect(steps.find((s) => s.name === "ast-grep")).toBeDefined();
+  });
+
+  test("present, it is skipped — provisioning is not an update channel", async () => {
+    const io = vm();
+    io.bins.add("ast-grep");
+    const steps = await runtimes(io);
+    expect(steps.find((s) => s.name === "ast-grep")?.outcome).toBe("skipped");
+    expect(calls(io).filter((c) => c.startsWith("npm install"))).toEqual([]);
+  });
+});
+
+describe("§21 — the language server, for a repo that has a tsconfig", () => {
+  test("a TypeScript checkout gets typescript-language-server through bun", async () => {
+    const io = vm();
+    io.files[`${home}/work/kairoku/tsconfig.json`] = "{}";
+    const step = await languageServer(io, `${home}/work/kairoku`);
+    expect(step.outcome).toBe("done");
+    expect(calls(io)).toContain("bun add -g typescript-language-server typescript");
+  });
+
+  test("a checkout with no tsconfig installs nothing", async () => {
+    const io = vm();
+    const step = await languageServer(io, `${home}/work/kairoku`);
+    expect(step.outcome).toBe("skipped");
+    expect(calls(io).filter((c) => c.includes("typescript-language-server"))).toEqual([]);
+  });
+
+  test("already installed is skipped, never reinstalled", async () => {
+    const io = vm();
+    io.files[`${home}/work/kairoku/tsconfig.json`] = "{}";
+    io.bins.add("typescript-language-server");
+    expect((await languageServer(io, `${home}/work/kairoku`)).outcome).toBe("skipped");
+    expect(calls(io).filter((c) => c.includes("bun add"))).toEqual([]);
+  });
+
+  test("a failed install is a MANUAL step, never a stopped setup — the LSP is a WARN", async () => {
+    const io = vm();
+    io.files[`${home}/work/kairoku/tsconfig.json`] = "{}";
+    io.canned["bun add -g"] = { code: 1 };
+    expect((await languageServer(io, `${home}/work/kairoku`)).outcome).toBe("manual");
+  });
+});
+
+describe("§21 item 5b — the machine-wide codex MCP entry stops carrying a bearer", () => {
+  const cfg = `${home}/.codex/config.toml`;
+
+  test("the add command is OAuth, with no bearer flag, followed by a login", () => {
+    expect(CODEX_MCP_ADD).not.toContain("bearer");
+    expect(CODEX_MCP_ADD).toContain("codex mcp add kairoku --url https://kairoku.io/api/mcp");
+    expect(CODEX_MCP_LOGIN).toContain("codex mcp login kairoku");
+  });
+
+  test("a global entry carrying the bearer env var is reported, and never rewritten in place", async () => {
+    const io = vm();
+    io.files[cfg] = '[mcp_servers.kairoku]\nurl = "https://kairoku.io/api/mcp"\nbearer_token_env_var = "KAIROKU_PAT"\n';
+    const step = await codexConfig(io);
+    expect(step.outcome).toBe("manual");
+    expect(step.detail).toContain("bearer_token_env_var");
+    // The daemon does not edit a human's own codex config out from under them.
+    expect(io.files[cfg]).toContain('bearer_token_env_var = "KAIROKU_PAT"');
+  });
+
+  test("an OAuth-only kairoku entry is what this step wants to see", async () => {
+    const io = vm();
+    io.files[cfg] = '[mcp_servers.kairoku]\nurl = "https://kairoku.io/api/mcp"\n';
+    expect((await codexConfig(io)).outcome).toBe("skipped");
   });
 });

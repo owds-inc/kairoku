@@ -20,12 +20,13 @@
  * decides what a role may do and both providers read it.
  */
 
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { launch as procLaunch } from "../proc";
 import { withRoleContract } from "../roles";
 import type { RoleName } from "../policy";
+import type { Rules } from "../rules";
 import { run as execArgv } from "../worktree";
 import type { LaunchedRun, Provider, ProviderEvent, RoleRun } from "./types";
 
@@ -42,6 +43,20 @@ export interface CodexPaths {
   readonly outPath?: string;
 }
 
+/**
+ * §15 of the Codex surfaces fact: a project's own `.codex/config.toml` is read
+ * ONLY if the project is trusted, and trust cannot be self-declared from inside
+ * it — that is precisely what stops a cloned repo loosening its own sandbox. So
+ * the daemon trusts the worktree as a SESSION FLAG, per invocation, rather than
+ * writing `[projects]` into `~/.codex/config.toml`: the run gets its config and
+ * the machine keeps none of it. Escaped the way codex escapes it itself
+ * (`config_update.rs`), so a path with a quote in it cannot inject a key.
+ */
+function trustFlag(cwd: string): string {
+  const key = cwd.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return `projects."${key}".trust_level="trusted"`;
+}
+
 export function codexArgv(run: RoleRun, paths: CodexPaths): string[] {
   const argv = [
     "codex",
@@ -51,9 +66,15 @@ export function codexArgv(run: RoleRun, paths: CodexPaths): string[] {
     SANDBOX[run.role],
     "-c",
     'approval_policy="never"',
+    "-c",
+    trustFlag(run.cwd),
     "-C",
     run.cwd,
   ];
+  // Only when this daemon actually wrote a hook. The flag is documented as "for
+  // automation that already vets hook sources", which is true of a file we
+  // generated a moment ago and of nothing else.
+  if (run.rules) argv.push("--dangerously-bypass-hook-trust");
   if (run.model) argv.push("-m", run.model);
   if (run.schema && paths.schemaPath && paths.outPath) {
     argv.push("--output-schema", paths.schemaPath, "-o", paths.outPath);
@@ -62,6 +83,128 @@ export function codexArgv(run: RoleRun, paths: CodexPaths): string[] {
   // none is given, which keeps it out of `ps` and stops a prompt beginning with
   // `-` being read as a flag.
   return argv;
+}
+
+// ------------------------------------------------- §21 the per-run project config
+//
+// Codex has no plugin agents and no bundleable hooks, so everything Claude gets
+// from the plugin the daemon writes into the worktree instead — fresh per run,
+// and excluded from the diff so the agent cannot commit the daemon's plumbing.
+
+export const CODEX_DIR = ".codex";
+
+/** The paths written per run. Also the lines added to the checkout's exclude. */
+export const CODEX_FILES = [`${CODEX_DIR}/`] as const;
+
+/**
+ * The project layer.
+ *
+ * THE MCP CREDENTIAL LIVES HERE NOW, NOT ON THE MACHINE (§21 item 5b). A
+ * machine-wide `[mcp_servers.kairoku]` with `bearer_token_env_var` breaks the
+ * operator's OWN interactive Codex: `KAIROKU_PAT` is only ever set inside a run,
+ * Codex prefers the bearer path once the var is configured, and the human's
+ * session gets `401 No authorization provided` while its own OAuth login is
+ * ignored. Per run, the var IS set, and nothing outside the run is touched.
+ *
+ * It names the VARIABLE, never a value — a token in a file in a git worktree is
+ * a token in a commit one `git add -A` later.
+ */
+export function codexConfigToml(run: RoleRun): string {
+  const lines = ["# Written per run by the Kairoku daemon (§21). Not part of the diff.", ""];
+  // The app's own origin, as `link.ts` handed it to this RUN — not this
+  // daemon's config, which no module but app/link/config may read. Never a
+  // literal either: one operator's agents must never dial another operator's
+  // app. This is the agent's MCP endpoint, the same one `plugin/.mcp.json`
+  // gives Claude; the daemon itself still dials out only from `app.ts`.
+  const origin = run.env.KAIROKU_URL;
+  if (origin) {
+    lines.push(
+      "[mcp_servers.kairoku]",
+      `url = ${JSON.stringify(`${origin.replace(/\/+$/, "")}/api/mcp`)}`,
+      'bearer_token_env_var = "KAIROKU_PAT"',
+      // `approval_policy = "never"` auto-DENIES approval requests, and a Kairoku
+      // MCP write raises one unless the server is pre-approved.
+      'default_tools_approval_mode = "approve"',
+      "",
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * The same layer one, at Codex's write. `command` runs the script materialised
+ * beside the rules, which reads the payload on stdin and answers with Codex's
+ * blocking contract for a synchronous hook (exit 2, reason on stderr).
+ */
+export function codexHooksJson(rules: Rules): string {
+  return (
+    JSON.stringify(
+      {
+        description: "Kairoku: the repo's own .kairoku/rules, at the write.",
+        hooks: {
+          PostToolUse: [
+            {
+              matcher: "Write|Edit",
+              hooks: [{ type: "command", command: `sh ${JSON.stringify(rules.scanScript)}`, timeout: 30 }],
+            },
+          ],
+        },
+      },
+      null,
+      2,
+    ) + "\n"
+  );
+}
+
+/**
+ * A linked worktree's `.git` is a FILE pointing at
+ * `<repo>/.git/worktrees/<name>`, and git reads `info/exclude` from the COMMON
+ * dir — verified, not assumed: an exclude written under the per-worktree gitdir
+ * is silently ignored. So this walks back to `<repo>/.git`, which is shared with
+ * the base checkout, and appends idempotently.
+ */
+function gitCommonDir(worktree: string): string | undefined {
+  const dotGit = join(worktree, ".git");
+  try {
+    if (statSync(dotGit).isDirectory()) return dotGit;
+    const pointer = readFileSync(dotGit, "utf8").trim();
+    const target = pointer.startsWith("gitdir:") ? pointer.slice("gitdir:".length).trim() : "";
+    if (!target) return undefined;
+    // <repo>/.git/worktrees/<name> → <repo>/.git
+    return resolve(dirname(resolve(worktree, target)), "..");
+  } catch {
+    return undefined;
+  }
+}
+
+function exclude(worktree: string, lines: readonly string[]): void {
+  const common = gitCommonDir(worktree);
+  if (!common) return;
+  const path = join(common, "info", "exclude");
+  let current = "";
+  try {
+    current = readFileSync(path, "utf8");
+  } catch {
+    mkdirSync(dirname(path), { recursive: true });
+  }
+  const have = new Set(current.split("\n").map((line) => line.trim()));
+  const missing = lines.filter((line) => !have.has(line));
+  if (missing.length === 0) return;
+  appendFileSync(path, `${current.endsWith("\n") || current === "" ? "" : "\n"}${missing.join("\n")}\n`);
+}
+
+/** Both files, fresh, plus the exclusion. Idempotent; never throws a run over. */
+export function writeCodexFiles(run: RoleRun): void {
+  try {
+    const dir = join(run.cwd, CODEX_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "config.toml"), codexConfigToml(run));
+    if (run.rules) writeFileSync(join(dir, "hooks.json"), codexHooksJson(run.rules));
+    exclude(run.cwd, CODEX_FILES);
+  } catch {
+    // A worktree we cannot write is a run that is about to fail anyway, and it
+    // fails on the agent's own error rather than on this.
+  }
 }
 
 // ---------------------------------------------------------------- the stream
@@ -228,6 +371,9 @@ export function codexProvider(deps: CodexDeps = {}): Provider {
     name: "codex",
     models: () => codexModels(deps.exec),
     launch(run: RoleRun): LaunchedRun {
+      // Fresh per run, before the process exists. Idempotent, so the second and
+      // third role turn of the same member rewrite the same two files.
+      writeCodexFiles(run);
       const queue: ProviderEvent[] = [];
       let wake: (() => void) | undefined;
       let closed = false;

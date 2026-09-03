@@ -1,0 +1,232 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  AST_GREP,
+  RULES_PATH,
+  formatMatches,
+  materialiseRules,
+  scanRules,
+  type Rules,
+} from "./rules";
+import { run as git } from "./worktree";
+
+const dirs: string[] = [];
+afterEach(() => {
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function temp(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  dirs.push(dir);
+  return dir;
+}
+
+/** The rule this repo dogfoods, as a target repo would commit it. */
+const RULE = [
+  "id: bun-spawn-resolved-path",
+  "language: TypeScript",
+  "severity: error",
+  "message: Bun.spawn must run the path Bun.which resolved, not the bare command name.",
+  'note: "CLI PR #7 defect 5: a PATH change between which and spawn ran a different binary."',
+  "rule:",
+  "  all:",
+  "    - pattern: Bun.spawn([$CMD, $$$ARGS], $$$OPTS)",
+  "    - inside:",
+  "        stopBy: end",
+  "        has:",
+  "          stopBy: end",
+  "          pattern: Bun.which($CMD)",
+  "",
+].join("\n");
+
+/** A real checkout whose BASE BRANCH carries the rules, like the daemon reads. */
+async function repoWithRules(rules: Record<string, string> = { "bun-spawn.yml": RULE }) {
+  const repo = temp("kairoku-rules-repo-");
+  await git(["git", "init", "-q", "-b", "main"], repo);
+  await git(["git", "config", "user.email", "d@e.f"], repo);
+  await git(["git", "config", "user.name", "d"], repo);
+  writeFileSync(join(repo, "README.md"), "# fixture\n");
+  if (Object.keys(rules).length) {
+    mkdirSync(join(repo, RULES_PATH), { recursive: true });
+    for (const [name, body] of Object.entries(rules)) writeFileSync(join(repo, RULES_PATH, name), body);
+  }
+  await git(["git", "add", "-A"], repo);
+  await git(["git", "commit", "-qm", "the rules"], repo);
+  await git(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], repo);
+  return repo;
+}
+
+const haveAstGrep = Bun.which(AST_GREP, { PATH: process.env.PATH ?? "" });
+const found = () => haveAstGrep;
+
+describe("rules — read from the base branch, never the worktree", () => {
+  test("a repo with no .kairoku/rules materialises nothing and is not an error", async () => {
+    const repo = await repoWithRules({});
+    const result = await materialiseRules(repo, "origin/main", join(temp("kairoku-mat-"), "rules"));
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.rules).toBeUndefined();
+  });
+
+  test("the rules come from the committed branch even when the worktree deleted them", async () => {
+    const repo = await repoWithRules();
+    // The implementer's own PR removes the rule. The base branch still has it.
+    rmSync(join(repo, RULES_PATH), { recursive: true, force: true });
+    const dir = join(temp("kairoku-mat-"), "rules");
+    const result = await materialiseRules(repo, "origin/main", dir, { which: () => "/usr/bin/ast-grep" });
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.rules?.ids).toEqual(["bun-spawn.yml"]);
+    expect(readFileSync(join(dir, "rules", "bun-spawn.yml"), "utf8")).toContain("bun-spawn-resolved-path");
+    expect(readFileSync(join(dir, "sgconfig.yml"), "utf8")).toContain("ruleDirs");
+  });
+
+  test("only .yml/.yaml files are materialised — a README beside the rules is not a rule", async () => {
+    const repo = await repoWithRules({ "bun-spawn.yml": RULE, "README.md": "# how to add a rule\n" });
+    const dir = join(temp("kairoku-mat-"), "rules");
+    const result = await materialiseRules(repo, "origin/main", dir, { which: () => "/usr/bin/ast-grep" });
+    expect(result.ok && result.rules?.ids).toEqual(["bun-spawn.yml"]);
+    expect(existsSync(join(dir, "rules", "README.md"))).toBe(false);
+  });
+
+  test("rules on the base branch and no ast-grep on this machine fails the run CLOSED, naming it", async () => {
+    const repo = await repoWithRules();
+    const result = await materialiseRules(repo, "origin/main", join(temp("kairoku-mat-"), "rules"), {
+      which: () => null,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toContain(AST_GREP);
+    expect(result.ok === false && result.error).toContain(RULES_PATH);
+  });
+
+  test("no rules and no ast-grep is NOT a failure — nothing runs, so nothing is missing", async () => {
+    const repo = await repoWithRules({});
+    const result = await materialiseRules(repo, "origin/main", join(temp("kairoku-mat-"), "rules"), {
+      which: () => null,
+    });
+    expect(result.ok).toBe(true);
+  });
+
+  test("the resolved ast-grep path is what gets recorded, not the bare name", async () => {
+    const repo = await repoWithRules();
+    const result = await materialiseRules(repo, "origin/main", join(temp("kairoku-mat-"), "rules"), {
+      which: () => "/opt/homebrew/bin/ast-grep",
+    });
+    expect(result.ok && result.rules?.bin).toBe("/opt/homebrew/bin/ast-grep");
+  });
+});
+
+describe("rules — the scan", () => {
+  test.if(Boolean(found()))("a violating file matches with the rule id, the file, the line and the note", async () => {
+    const repo = await repoWithRules();
+    const dir = join(temp("kairoku-mat-"), "rules");
+    const materialised = await materialiseRules(repo, "origin/main", dir);
+    expect(materialised.ok).toBe(true);
+    const rules = (materialised as { rules?: Rules }).rules!;
+
+    const worktree = temp("kairoku-scan-");
+    writeFileSync(
+      join(worktree, "bad.ts"),
+      [
+        "export async function findPr(repo: string) {",
+        '  const gh = Bun.which("gh");',
+        "  if (!gh) return;",
+        '  return Bun.spawn(["gh", "pr", "view"], { cwd: repo });',
+        "}",
+        "",
+      ].join("\n"),
+    );
+
+    const scan = await scanRules(rules, worktree, ["."]);
+    expect(scan.ok).toBe(true);
+    const matches = scan.ok ? scan.matches : [];
+    expect(matches).toHaveLength(1);
+    expect(matches[0]!.ruleId).toBe("bun-spawn-resolved-path");
+    expect(matches[0]!.file).toBe("bad.ts");
+    // ast-grep reports 0-based lines; a human reads 1-based, and line 4 is the spawn.
+    expect(matches[0]!.line).toBe(4);
+    expect(matches[0]!.note).toContain("CLI PR #7 defect 5");
+    expect(formatMatches(matches)).toContain("bun-spawn-resolved-path");
+    expect(formatMatches(matches)).toContain("bad.ts:4");
+  });
+
+  test.if(Boolean(found()))("a compliant file matches nothing", async () => {
+    const repo = await repoWithRules();
+    const dir = join(temp("kairoku-mat-"), "rules");
+    const rules = ((await materialiseRules(repo, "origin/main", dir)) as { rules?: Rules }).rules!;
+    const worktree = temp("kairoku-scan-");
+    writeFileSync(
+      join(worktree, "good.ts"),
+      [
+        "export async function findPr(repo: string) {",
+        '  const gh = Bun.which("gh");',
+        "  if (!gh) return;",
+        '  return Bun.spawn([gh, "pr", "view"], { cwd: repo });',
+        "}",
+        "",
+      ].join("\n"),
+    );
+    const scan = await scanRules(rules, worktree, ["."]);
+    expect(scan.ok && scan.matches).toEqual([]);
+  });
+
+  test.if(Boolean(found()))("a file ast-grep cannot parse as one of the rules' languages is ignored", async () => {
+    const repo = await repoWithRules();
+    const dir = join(temp("kairoku-mat-"), "rules");
+    const rules = ((await materialiseRules(repo, "origin/main", dir)) as { rules?: Rules }).rules!;
+    const worktree = temp("kairoku-scan-");
+    writeFileSync(join(worktree, "notes.md"), 'Bun.spawn(["gh"]) and Bun.which("gh") in prose.\n');
+    writeFileSync(join(worktree, "blob.bin"), "\u0000\u0001\u0002 not source at all");
+    const scan = await scanRules(rules, worktree, ["."]);
+    expect(scan.ok && scan.matches).toEqual([]);
+  });
+
+  test("output this daemon cannot read is a FAILURE, never 'no matches'", async () => {
+    const rules: Rules = {
+      dir: "/nope",
+      config: "/nope/sgconfig.yml",
+      bin: "/nope/ast-grep",
+      ids: ["r.yml"],
+      scanScript: "/nope/kairoku-rules-scan.sh",
+    };
+    const scan = await scanRules(rules, "/tmp", ["."], async () => ({
+      code: 2,
+      stdout: "",
+      stderr: "config file not found",
+    }));
+    expect(scan.ok).toBe(false);
+    expect(scan.ok === false && scan.error).toContain(AST_GREP);
+  });
+});
+
+describe("rules — the codex scan script (the same rules, at Codex's write)", () => {
+  test.if(Boolean(found()))("exits 2 with the rule on stderr for a violating file, 0 for a clean one", async () => {
+    const repo = await repoWithRules();
+    const dir = join(temp("kairoku-mat-"), "rules");
+    const rules = ((await materialiseRules(repo, "origin/main", dir)) as { rules?: Rules }).rules!;
+    const worktree = temp("kairoku-codex-");
+    const bad = join(worktree, "bad.ts");
+    writeFileSync(
+      bad,
+      ['const gh = Bun.which("gh");', 'export const p = Bun.spawn(["gh", "pr"], {});', ""].join("\n"),
+    );
+    const good = join(worktree, "good.ts");
+    writeFileSync(good, ['const gh = Bun.which("gh");', 'export const p = Bun.spawn([gh, "pr"], {});', ""].join("\n"));
+
+    const hook = async (filePath: string) => {
+      const proc = Bun.spawn(["sh", rules.scanScript], {
+        cwd: worktree,
+        stdin: new TextEncoder().encode(JSON.stringify({ hook_event_name: "PostToolUse", tool_input: { file_path: filePath } })),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+      return { code, stderr };
+    };
+
+    expect(await hook(good)).toEqual({ code: 0, stderr: "" });
+    const blocked = await hook(bad);
+    expect(blocked.code).toBe(2);
+    expect(blocked.stderr).toContain("bun-spawn-resolved-path");
+  }, 20_000);
+});

@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rolePrompt } from "../roles";
-import { codexArgv, codexEvent, codexModels, codexProvider } from "./codex";
+import type { Rules } from "../rules";
+import { codexArgv, codexConfigToml, codexEvent, codexHooksJson, codexModels, codexProvider, writeCodexFiles } from "./codex";
 import type { RoleRun } from "./types";
 
 let dir: string | undefined;
@@ -226,5 +227,108 @@ describe("codex — the raw stream is still captured on disk", () => {
     provider.launch(run({ logPath }));
     expect(path).toBe(logPath);
     expect(readFileSync(logPath, "utf8")).toBe("captured");
+  });
+});
+
+// ---------------------------------------------------------- §21 codex parity
+
+const RULES: Rules = {
+  dir: "/tmp/runs/d1/rules",
+  config: "/tmp/runs/d1/rules/sgconfig.yml",
+  bin: "/opt/homebrew/bin/ast-grep",
+  ids: ["bun-spawn-resolved-path.yml"],
+  scanScript: "/tmp/runs/d1/rules/kairoku-rules-scan.sh",
+};
+
+/** A real linked worktree, because `.git` being a FILE is the whole difficulty. */
+async function linkedWorktree() {
+  const root = mkdtempSync(join(tmpdir(), "kairoku-codex-git-"));
+  extra.push(root);
+  const repo = join(root, "repo");
+  mkdirSync(repo, { recursive: true });
+  const git = (argv: string[], cwd: string) => Bun.spawnSync(argv, { cwd, stdout: "ignore", stderr: "ignore" });
+  git(["git", "init", "-q", "-b", "main"], repo);
+  git(["git", "config", "user.email", "d@e.f"], repo);
+  git(["git", "config", "user.name", "d"], repo);
+  writeFileSync(join(repo, "a.txt"), "hi\n");
+  git(["git", "add", "-A"], repo);
+  git(["git", "commit", "-qm", "init"], repo);
+  const wt = join(root, "wt");
+  git(["git", "worktree", "add", "-q", wt, "-b", "run/x", "HEAD"], repo);
+  return { repo, wt };
+}
+
+const extra: string[] = [];
+afterEach(() => {
+  for (const d of extra.splice(0)) rmSync(d, { recursive: true, force: true });
+});
+
+describe("codex — §21 the per-run project config", () => {
+  test("the MCP entry names the ENV VAR and never a token, and points at the run's own app", () => {
+    const toml = codexConfigToml(run({ env: { KAIROKU_PAT: "kai_secret_value", KAIROKU_URL: "https://kairoku.io" } }));
+    expect(toml).toContain("[mcp_servers.kairoku]");
+    expect(toml).toContain('url = "https://kairoku.io/api/mcp"');
+    expect(toml).toContain('bearer_token_env_var = "KAIROKU_PAT"');
+    expect(toml).toContain('default_tools_approval_mode = "approve"');
+    expect(toml).not.toContain("kai_secret_value");
+  });
+
+  test("no app origin in the run's environment writes no MCP entry rather than a guessed one", () => {
+    const toml = codexConfigToml(run());
+    expect(toml).not.toContain("[mcp_servers.kairoku]");
+  });
+
+  test("the hooks file runs the materialised scan script on Write|Edit", () => {
+    const hooks = JSON.parse(codexHooksJson(RULES)) as {
+      hooks: { PostToolUse: Array<{ matcher: string; hooks: Array<{ type: string; command: string }> }> };
+    };
+    expect(hooks.hooks.PostToolUse).toHaveLength(1);
+    expect(hooks.hooks.PostToolUse[0]!.matcher).toBe("Write|Edit");
+    expect(hooks.hooks.PostToolUse[0]!.hooks[0]!.type).toBe("command");
+    expect(hooks.hooks.PostToolUse[0]!.hooks[0]!.command).toContain(RULES.scanScript);
+  });
+
+  test("both files are written fresh into the worktree and EXCLUDED from the diff", async () => {
+    const { repo, wt } = await linkedWorktree();
+    writeCodexFiles(run({ cwd: wt, env: { KAIROKU_PAT: "p", KAIROKU_URL: "https://kairoku.io" }, rules: RULES }));
+    expect(readFileSync(join(wt, ".codex", "config.toml"), "utf8")).toContain("[mcp_servers.kairoku]");
+    expect(readFileSync(join(wt, ".codex", "hooks.json"), "utf8")).toContain("PostToolUse");
+    // git resolves a linked worktree's info/exclude to the COMMON dir.
+    expect(readFileSync(join(repo, ".git", "info", "exclude"), "utf8")).toContain(".codex/");
+    const status = Bun.spawnSync(["git", "status", "--porcelain"], { cwd: wt, stdout: "pipe", stderr: "ignore" });
+    expect(new TextDecoder().decode(status.stdout)).toBe("");
+  });
+
+  test("writing twice does not duplicate the exclude line", async () => {
+    const { repo, wt } = await linkedWorktree();
+    const r = run({ cwd: wt, env: { KAIROKU_PAT: "p" }, rules: RULES });
+    writeCodexFiles(r);
+    writeCodexFiles(r);
+    const exclude = readFileSync(join(repo, ".git", "info", "exclude"), "utf8");
+    expect(exclude.split("\n").filter((line) => line === ".codex/")).toHaveLength(1);
+  });
+
+  test("no rules writes no hooks file — nothing to run, nothing to trust", async () => {
+    const { wt } = await linkedWorktree();
+    writeCodexFiles(run({ cwd: wt, env: { KAIROKU_PAT: "p", KAIROKU_URL: "https://kairoku.io" } }));
+    expect(existsSync(join(wt, ".codex", "hooks.json"))).toBe(false);
+    expect(existsSync(join(wt, ".codex", "config.toml"))).toBe(true);
+  });
+});
+
+describe("codex — §21 the trust the project config needs", () => {
+  test("the project is trusted per invocation, so its .codex/config.toml is loaded at all", () => {
+    const argv = codexArgv(run({ cwd: "/tmp/wt" }), {});
+    expect(argv).toContain('projects."/tmp/wt".trust_level="trusted"');
+  });
+
+  test("a path with a quote or a backslash in it is escaped, not injected", () => {
+    const argv = codexArgv(run({ cwd: '/tmp/w"t\\x' }), {});
+    expect(argv).toContain('projects."/tmp/w\\"t\\\\x".trust_level="trusted"');
+  });
+
+  test("hook trust is bypassed ONLY when this daemon wrote a hook to run", () => {
+    expect(codexArgv(run({ rules: RULES }), {})).toContain("--dangerously-bypass-hook-trust");
+    expect(codexArgv(run(), {})).not.toContain("--dangerously-bypass-hook-trust");
   });
 });

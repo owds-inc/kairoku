@@ -13,6 +13,7 @@ import { normaliseAppUrl, parseTokenEnv } from "../daemon/config";
 import { availableResolvers } from "../daemon/env";
 import { ACTIVE_FLUSH_MS } from "../daemon/link";
 import { parseManifest, MANIFEST_FILE } from "../daemon/manifest";
+import { AST_GREP, RULES_PATH } from "../daemon/rules";
 import { version as binVersion, type Io } from "./io";
 import { resolvePluginPath } from "../daemon/providers";
 import { installedPlugin } from "./plugin";
@@ -200,6 +201,35 @@ export async function environment(io: Io, config: DoctorConfig, probe?: PortDeps
     );
   }
 
+  // §21 — the three lines. `ast-grep` and the rule count are read together
+  // because neither means anything alone: the binary is only REQUIRED where the
+  // configured repo's base branch actually declares rules, and a repo that
+  // declares them on a machine without it fails every run closed (§21 Q25).
+  const listed = await io.shell(["git", "-C", repo, "ls-tree", "-r", "--name-only", `origin/${branch}`, "--", RULES_PATH]);
+  const ruleCount =
+    listed.code === 0 ? listed.stdout.split("\n").filter((line) => /\.ya?ml$/i.test(line.trim())).length : 0;
+  const astGrep = await binVersion(io, AST_GREP);
+  out.push(
+    astGrep !== null
+      ? pass(AST_GREP, astGrep)
+      : ruleCount > 0
+        ? fail(
+            AST_GREP,
+            `not on PATH, and origin/${branch} declares ${ruleCount} rule(s) in ${RULES_PATH} — every run of this repo fails closed`,
+          )
+        : warn(AST_GREP, `not installed — a repo that declares ${RULES_PATH} cannot run on this machine`),
+  );
+  out.push(pass("rules on base branch", String(ruleCount)));
+
+  // §21 Q14 — WARN, never FAIL. A machine without a language server still runs
+  // every role; the implementer greps for a symbol instead of resolving it.
+  const lsp = await binVersion(io, "typescript-language-server");
+  out.push(
+    lsp !== null
+      ? pass("typescript-language-server", lsp)
+      : warn("typescript-language-server", "absent — symbols are grepped, not resolved (`kairoku setup --daemon` installs it)"),
+  );
+
   const resolvers = availableResolvers((bin) => io.which(bin));
   out.push(
     resolvers.length
@@ -296,11 +326,24 @@ export async function checks(io: Io, probe?: PortDeps): Promise<Check[]> {
     );
   }
 
+  // §21 item 5b — this check has FLIPPED. It used to demand
+  // `default_tools_approval_mode = "approve"` beside a machine-wide
+  // `bearer_token_env_var = "KAIROKU_PAT"`. Both now belong to the RUN, written
+  // per dispatch into the worktree's own `.codex/config.toml`. What is wrong
+  // here is the bearer still being present: `KAIROKU_PAT` is never set outside a
+  // run, and Codex prefers the bearer path once it is configured, so the
+  // OPERATOR's own Codex gets 401 and its OAuth login is ignored.
   const codexConfig = io.readFile(join(io.home, ".codex", "config.toml")) ?? "";
+  const name = "codex MCP is a human login";
   out.push(
-    codexConfig.includes('default_tools_approval_mode = "approve"')
-      ? pass("codex MCP writes pre-approved")
-      : fail("codex MCP writes pre-approved", 'default_tools_approval_mode = "approve" not set'),
+    /bearer_token_env_var\s*=\s*"KAIROKU_PAT"/.test(codexConfig)
+      ? fail(
+          name,
+          "the global kairoku entry carries bearer_token_env_var — that variable is only set inside a run, so your own Codex gets 401. `codex mcp remove kairoku`, re-add with no bearer flag, then `codex mcp login kairoku`",
+        )
+      : codexConfig.includes("[mcp_servers.kairoku]")
+        ? pass(name, "OAuth; a run brings its own credential")
+        : warn(name, "no kairoku MCP entry — `codex mcp add kairoku --url <app>/api/mcp` then `codex mcp login kairoku`"),
   );
 
   const configPath = join(home, "config.json");

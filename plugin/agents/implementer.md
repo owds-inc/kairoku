@@ -152,3 +152,14 @@ precisely why it is written here.
 
 You build the thing and you report honestly. Everything downstream depends on the honesty more
 than the speed.
+
+## Read the repo's memory before your first write
+
+Before you write anything, read the repo's own conventions: `AGENTS.md` (or `CLAUDE.md`) at the
+root, and `.kairoku/patterns.md` when it exists. `patterns.md` is a short list of exemplar
+snippets with a one-line "why" each — the shape this repo actually wants, as opposed to the shape
+that merely compiles. Match it.
+
+You may CHANGE `.kairoku/patterns.md` only when the item you are building is what changes it. One
+writer per resource: a pattern that ought to be recorded but is outside this item's scope goes in
+your report, not in the file.
