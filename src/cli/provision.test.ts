@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { checkout, codexConfig, daemonConfig, DEFAULT_APP_REPO, remainder, runtimes, shellPath, userns, type Step } from "./provision";
+import { checkout, codexConfig, daemonConfig, DEFAULT_APP_REPO, docker, remainder, runtimes, shellPath, userns, type Step } from "./provision";
 import { fakeIo, type FakeIo } from "./testkit";
 
 const calls = (io: FakeIo) => io.calls.map((c) => c.join(" "));
@@ -168,10 +168,10 @@ describe("daemon config", () => {
     // resolve the plugin at all; corrected on rerun because a plugin update
     // moves the version directory out from under the recorded path.
     const io = vm();
-    await daemonConfig(io, `${home}/work/kairoku`, undefined, "/plugins/kairoku/2.2.0");
+    await daemonConfig(io, `${home}/work/kairoku`, { pluginPath: "/plugins/kairoku/2.2.0" });
     expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).pluginPath).toBe("/plugins/kairoku/2.2.0");
 
-    const again = await daemonConfig(io, `${home}/work/kairoku`, undefined, "/plugins/kairoku/2.3.0");
+    const again = await daemonConfig(io, `${home}/work/kairoku`, { pluginPath: "/plugins/kairoku/2.3.0" });
     expect(again.map((s) => s.outcome)).toEqual(["done"]);
     expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).pluginPath).toBe("/plugins/kairoku/2.3.0");
 
@@ -186,7 +186,7 @@ describe("daemon config", () => {
       listen: { host: "127.0.0.1", port: 7801 },
       maxConcurrent: 4,
     });
-    await daemonConfig(io, `${home}/work/kairoku`, "https://example.com/app.git");
+    await daemonConfig(io, `${home}/work/kairoku`, { repoUrl: "https://example.com/app.git" });
     const config = JSON.parse(io.files[`${home}/.kairoku/config.json`]!);
     expect(config.repoUrl).toBe("https://example.com/app.git");
     expect(config.maxConcurrent).toBe(4);
@@ -207,5 +207,59 @@ describe("what is left is human-only", () => {
     expect(remainder(io, []).some((l) => l.includes("codex login"))).toBe(true);
     delete io.files[`${home}/.claude`];
     expect(remainder(io, []).some((l) => l.includes("claude"))).toBe(true);
+  });
+
+  test("O-4: the port range is recorded, and a rerun with the same one changes nothing", async () => {
+    const io = vm();
+    await daemonConfig(io, `${home}/work/kairoku`, { ports: "31000-31999" });
+    expect(JSON.parse(io.files[`${home}/.kairoku/config.json`]!).ports).toBe("31000-31999");
+
+    const again = await daemonConfig(io, `${home}/work/kairoku`, { ports: "31000-31999" });
+    expect(again.map((s) => s.outcome)).toEqual(["skipped"]);
+  });
+});
+
+describe("O-4: docker", () => {
+  test("already installed is skipped — provisioning never upgrades a live machine's engine", async () => {
+    const io = vm();
+    io.bins.add("docker");
+    io.canned["docker compose version"] = { stdout: "Docker Compose version v5.4.0\n" };
+    expect(await docker(io)).toMatchObject({ outcome: "skipped", detail: expect.stringContaining("v5.4.0") });
+  });
+
+  test("installed but not RUNNING is a manual step — apt cannot fix a stopped daemon", async () => {
+    const io = vm();
+    io.bins.add("docker");
+    io.canned["docker compose version"] = { code: 1, stderr: "Cannot connect to the Docker daemon" };
+    expect(await docker(io)).toMatchObject({ outcome: "manual", detail: expect.stringContaining("not answering") });
+  });
+
+  test("linux with passwordless sudo installs it from apt and says a re-login is needed", async () => {
+    const io = vm();
+    const step = await docker(io);
+    expect(step.outcome).toBe("done");
+    expect(calls(io).some((c) => c.includes("apt-get install -y docker.io docker-compose-plugin"))).toBe(true);
+    // Group membership is what makes the socket usable, and it only takes
+    // effect on a new login session — a step that did not say so would leave
+    // every run failing with "permission denied on /var/run/docker.sock".
+    expect(calls(io).some((c) => c.includes("usermod -aG docker"))).toBe(true);
+    expect(step.detail).toContain("log out");
+  });
+
+  test("linux without passwordless sudo hands back the exact commands", async () => {
+    const io = vm();
+    io.canned["sudo -n true"] = { code: 1 };
+    const step = await docker(io);
+    expect(step.outcome).toBe("manual");
+    expect(step.detail).toContain("apt-get install");
+  });
+
+  test("mac names the install rather than pretending it can do it", async () => {
+    const io = fakeIo({ platform: "darwin", home });
+    const step = await docker(io);
+    expect(step.outcome).toBe("manual");
+    expect(step.detail).toContain("OrbStack");
+    expect(step.detail).toContain("Docker Desktop");
+    expect(calls(io).some((c) => c.startsWith("sudo"))).toBe(false);
   });
 });

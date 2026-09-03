@@ -9,6 +9,7 @@ import { version } from "../../package.json";
 import { io, type Io } from "./io";
 import * as daemon from "./daemon";
 import * as doctor from "./doctor";
+import * as env from "./env";
 import * as plugin from "./plugin";
 import * as setup from "./setup";
 import * as update from "./update";
@@ -23,6 +24,8 @@ export const usage = `kairoku ${version} — the Kairoku CLI
                                    the orchestration daemon: foreground, or as a service
   kairoku plugin install|update|status
                                    the Claude Code plugin, through the claude CLI
+  kairoku env set|import|list|rm [--repo <owner/name>] [--profile <name>]
+                                   the values this machine holds for a repo's runs
   kairoku update                   replace this binary with the latest release
   kairoku version
   kairoku help`;
@@ -32,6 +35,7 @@ const commands: Record<string, { usage: string; run: (args: string[], io: Io) =>
   doctor,
   daemon,
   plugin,
+  env,
   update,
 };
 

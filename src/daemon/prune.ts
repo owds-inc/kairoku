@@ -1,13 +1,18 @@
 /**
- * `kairoku daemon prune` — the ONLY thing that removes stale run worktrees.
+ * `kairoku daemon prune` — the ONLY thing that removes what a dead daemon left
+ * behind: stale run worktrees, and (O-4) the per-run compose projects that came
+ * up with them.
  *
- * A daemon that died leaves its worktrees behind on purpose: the runner never
- * sweeps automatically (SPEC §Worktree module). This CLI enumerates, prints,
- * asks, and only then removes. It is run by a human.
+ * The daemon never sweeps automatically (SPEC §Worktree module). This CLI
+ * enumerates, prints, asks, and only then removes. It is run by a human.
  *
- * Branches are never deleted — the run's commits are the deliverable.
+ * Branches are never deleted — the run's commits are the deliverable. Only
+ * `kairoku-<something>` projects are offered: the bare `kairoku` project is what
+ * `docker compose up` in the app checkout creates, and taking that down would
+ * stop the machine owner's own database.
  */
 
+import { composeDown, composeProjects, type ComposeDeps } from "./compose";
 import { loadConfig } from "./config";
 import {
   gitWorktreeOps,
@@ -24,14 +29,30 @@ export function formatPlan(stale: StaleWorktree[]): string {
   ].join("\n");
 }
 
-export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+export function formatProjects(projects: string[]): string {
+  if (projects.length === 0) return "No per-run compose projects found.";
+  return [
+    `${projects.length} orphaned compose project(s) to remove (with their volumes):`,
+    ...projects.map((name) => `  ${name}`),
+  ].join("\n");
+}
+
+export interface PruneDeps {
+  readonly compose?: ComposeDeps;
+}
+
+export async function main(argv: string[] = process.argv.slice(2), deps: PruneDeps = {}): Promise<number> {
   const config = loadConfig();
   const stale = await listRunWorktrees(config.repoPath);
+  // A machine with no docker answers with an empty list, so the worktree half
+  // still works on a laptop that only ever carried the plugin.
+  const projects = await composeProjects(deps.compose);
   console.log(formatPlan(stale));
-  if (stale.length === 0) return 0;
+  console.log(formatProjects(projects));
+  if (stale.length === 0 && projects.length === 0) return 0;
 
   if (!argv.includes("--yes")) {
-    const answer = prompt("Remove these worktrees? [y/N]") ?? "";
+    const answer = prompt("Remove these? [y/N]") ?? "";
     if (answer.trim().toLowerCase() !== "y") {
       console.log("Aborted. Nothing removed.");
       return 1;
@@ -51,8 +72,23 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       );
     }
   }
-  console.log(`${removed}/${stale.length} removed.`);
-  return removed === stale.length ? 0 : 1;
+
+  let down = 0;
+  for (const project of projects) {
+    // No `-f`: the compose file lived in a worktree that is gone by now, and
+    // Compose finds a project it started from its own container labels.
+    const result = await composeDown({ project, cwd: config.repoPath, env: {} }, deps.compose);
+    if (result.ok) {
+      console.log(`removed ${project}`);
+      down++;
+    } else {
+      console.error(`FAILED ${project}: ${result.summary}`);
+    }
+  }
+
+  if (stale.length) console.log(`${removed}/${stale.length} removed.`);
+  if (projects.length) console.log(`${down}/${projects.length} compose project(s) removed.`);
+  return removed === stale.length && down === projects.length ? 0 : 1;
 }
 
 if (import.meta.main) process.exit(await main());

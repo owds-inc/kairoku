@@ -345,3 +345,124 @@ describe("runs — lifecycle (RF-010)", () => {
     expect(store.capacity()).toEqual({ running: 0, max: 2 });
   });
 });
+
+describe("runs — onTeardown (O-4: the RF-010 teardown gains a step)", () => {
+  /** A run that registers a cleanup, then does whatever the caller asks. */
+  const withCleanup = (
+    id: string,
+    torn: string[],
+    body: (ctx: ExecContext) => Promise<{ ok: boolean; summary: string }>,
+  ) =>
+    spec(id, async (ctx) => {
+      ctx.onTeardown(async () => void torn.push(id));
+      return body(ctx);
+    });
+
+  test("runs on a clean exit, BEFORE the worktree goes — compose needs its file", async () => {
+    const h = (active = harness());
+    const torn: string[] = [];
+    const order: string[] = [];
+    const worktrees = {
+      ...h.worktrees,
+      remove: async (w: { path: string; branch: string }) => {
+        order.push("worktree");
+        await h.worktrees.remove(w);
+      },
+    };
+    await new RunStore({ ...h.config, worktreeOps: worktrees }).start(
+      spec("r-t1", async (ctx) => {
+        ctx.onTeardown(async () => {
+          torn.push("r-t1");
+          order.push("cleanup");
+        });
+        return { ok: true, summary: "done" };
+      }),
+    );
+    expect(torn).toEqual(["r-t1"]);
+    expect(order).toEqual(["cleanup", "worktree"]);
+  });
+
+  test("runs when the body FAILED", async () => {
+    const h = (active = harness());
+    const torn: string[] = [];
+    await new RunStore(h.config).start(
+      withCleanup("r-t2", torn, async () => ({ ok: false, summary: "nope" })),
+    );
+    expect(torn).toEqual(["r-t2"]);
+  });
+
+  test("runs when the body THREW", async () => {
+    const h = (active = harness());
+    const torn: string[] = [];
+    await new RunStore(h.config).start(
+      withCleanup("r-t3", torn, async () => {
+        throw new Error("boom");
+      }),
+    );
+    expect(torn).toEqual(["r-t3"]);
+  });
+
+  test("runs on a CANCEL, and on daemon SHUTDOWN", async () => {
+    const h = (active = harness({ maxConcurrent: 2 }));
+    const torn: string[] = [];
+    const store = new RunStore(h.config);
+    let release!: () => void;
+    const held = new Promise<void>((go) => {
+      release = go;
+    });
+
+    const cancelled = store.start(
+      withCleanup("r-t4", torn, async () => {
+        await held;
+        return { ok: true, summary: "done" };
+      }),
+    );
+    await waitFor(() => store.list().length === 1, "the member to start");
+    store.cancel("r-t4");
+    release();
+    await cancelled;
+    expect(torn).toEqual(["r-t4"]);
+
+    let release2!: () => void;
+    const held2 = new Promise<void>((go) => {
+      release2 = go;
+    });
+    const shutting = store.start(
+      withCleanup("r-t5", torn, async () => {
+        await held2;
+        return { ok: true, summary: "done" };
+      }),
+    );
+    await waitFor(() => store.list().length === 1, "the second member to start");
+    const down = store.shutdown();
+    release2();
+    await Promise.all([shutting, down]);
+    expect(torn).toEqual(["r-t4", "r-t5"]);
+  });
+
+  test("runs even when the worktree is KEPT for the post-mortem", async () => {
+    // A kept worktree is for reading a failure. Containers left running are not
+    // evidence, they are a machine that slowly fills up.
+    const h = (active = harness({ keepWorktreeOnFailure: true }));
+    const torn: string[] = [];
+    await new RunStore(h.config).start(
+      withCleanup("r-t6", torn, async () => ({ ok: false, summary: "nope" })),
+    );
+    expect(torn).toEqual(["r-t6"]);
+    expect(h.worktrees.removed).toHaveLength(0);
+  });
+
+  test("a cleanup that throws does not take the run's own exit path with it", async () => {
+    const h = (active = harness());
+    const result = await new RunStore(h.config).start(
+      spec("r-t7", async (ctx) => {
+        ctx.onTeardown(async () => {
+          throw new Error("docker daemon is not running");
+        });
+        return { ok: true, summary: "done" };
+      }),
+    );
+    expect(result.status).toBe("idle");
+    expect(eventTypes(h, "r-t7")).toContain("teardown");
+  });
+});

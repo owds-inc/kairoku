@@ -7,7 +7,16 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ComposeDeps } from "./compose";
 import { formatPlan, main } from "./prune";
+
+/**
+ * The default for every case that is not ABOUT docker. Without it these tests
+ * would ask the real docker on the machine running them what compose projects
+ * exist, and `--yes` would then take down anything called `kairoku-…` that
+ * happened to be up. A suite must not be able to stop somebody's containers.
+ */
+const noDocker: ComposeDeps = { exec: async () => ({ code: 127, stdout: "", stderr: "no docker here" }) };
 import { gitWorktreeOps, listRunWorktrees, run } from "./worktree";
 
 let root: string;
@@ -105,7 +114,7 @@ describe("prune", () => {
     await git(["add", "-A"], a.path);
     await git(["commit", "-m", "agent work"], a.path);
 
-    expect(await main(["--yes"])).toBe(0);
+    expect(await main(["--yes"], { compose: noDocker })).toBe(0);
 
     expect(existsSync(a.path)).toBe(false);
     expect(existsSync(b.path)).toBe(false);
@@ -122,7 +131,7 @@ describe("prune", () => {
     const a = await ops.create("aaa");
     stubPrompt("n");
 
-    expect(await main([])).toBe(1);
+    expect(await main([], { compose: noDocker })).toBe(1);
     expect(existsSync(a.path)).toBe(true);
     expect(logged.join("\n")).toContain("Aborted");
   });
@@ -132,13 +141,13 @@ describe("prune", () => {
     const a = await ops.create("aaa");
     stubPrompt("y");
 
-    expect(await main([])).toBe(0);
+    expect(await main([], { compose: noDocker })).toBe(0);
     expect(existsSync(a.path)).toBe(false);
   });
 
   test("nothing to prune exits 0 without asking anything", async () => {
     stubPrompt("this must never be read");
-    expect(await main([])).toBe(0);
+    expect(await main([], { compose: noDocker })).toBe(0);
     expect(logged.join("\n")).toContain("Nothing to prune");
   });
 
@@ -148,7 +157,60 @@ describe("prune", () => {
     const manual = join(root, "manual");
     await git(["worktree", "add", "-b", "feature/x", manual, "origin/main"], repoPath);
 
-    expect(await main(["--yes"])).toBe(0);
+    expect(await main(["--yes"], { compose: noDocker })).toBe(0);
     expect(existsSync(manual)).toBe(true);
+  });
+
+  // ------------------------------------------------------- O-4: the containers
+
+  /** A docker that lists the given projects and records what it is asked to do. */
+  function fakeDocker(projects: string[]) {
+    const argv: string[][] = [];
+    const deps: ComposeDeps = {
+      exec: async (command) => {
+        argv.push(command);
+        return command.includes("ls")
+          ? { code: 0, stdout: `${projects.join("\n")}\n`, stderr: "" }
+          : { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    return { argv, deps };
+  }
+
+  test("O-4: orphaned per-run compose projects are listed and taken down with their volumes", async () => {
+    const { argv, deps } = fakeDocker(["kairoku-r1", "kairoku-r2"]);
+    expect(await main(["--yes"], { compose: deps })).toBe(0);
+    expect(logged.join("\n")).toContain("kairoku-r1");
+    const downs = argv.filter((a) => a.includes("down"));
+    expect(downs.map((a) => a[3]).sort()).toEqual(["kairoku-r1", "kairoku-r2"]);
+    for (const down of downs) expect(down).toContain("-v");
+    expect(logged.join("\n")).toContain("2/2 compose project(s) removed");
+  });
+
+  test("O-4: a developer's own `kairoku` project is never offered — prune must not stop their database", async () => {
+    const { argv, deps } = fakeDocker(["kairoku", "accelerator-local"]);
+    expect(await main(["--yes"], { compose: deps })).toBe(0);
+    expect(argv.filter((a) => a.includes("down"))).toHaveLength(0);
+    expect(logged.join("\n")).toContain("No per-run compose projects");
+  });
+
+  test("O-4: a refusal removes no containers either", async () => {
+    const ops = gitWorktreeOps(repoPath, worktreesDir);
+    const a = await ops.create("aaa");
+    const { argv, deps } = fakeDocker(["kairoku-r1"]);
+    stubPrompt("n");
+
+    expect(await main([], { compose: deps })).toBe(1);
+    expect(existsSync(a.path)).toBe(true);
+    expect(argv.filter((c) => c.includes("down"))).toHaveLength(0);
+  });
+
+  test("O-4: no docker on this machine still prunes worktrees", async () => {
+    const ops = gitWorktreeOps(repoPath, worktreesDir);
+    const a = await ops.create("aaa");
+    const deps: ComposeDeps = { exec: async () => ({ code: 127, stdout: "", stderr: "not found" }) };
+
+    expect(await main(["--yes"], { compose: deps })).toBe(0);
+    expect(existsSync(a.path)).toBe(false);
   });
 });

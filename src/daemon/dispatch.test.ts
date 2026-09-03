@@ -25,6 +25,8 @@ import {
   sweepRestarts,
   writeRunState,
 } from "./dispatch";
+import { reserved } from "./compose";
+import { parseManifest } from "./manifest";
 import { RunStore } from "./runs";
 import { rolePrompt, rolesWithPrompts } from "./roles";
 import { ROLE_NAMES } from "./policy";
@@ -506,5 +508,180 @@ describe("dispatch — the PR url, asked of whichever forge CLI is installed", (
     expect(
       await findPrUrl("/repo", "b", deps(["gh"], { "/usr/local/bin/gh": { code: 0, stdout: "no pull requests found" } })),
     ).toBeUndefined();
+  });
+});
+
+describe("dispatch — the run's environment (§20.11, O-4)", () => {
+  const manifest = (source: unknown) => {
+    const parsed = parseManifest(JSON.stringify(source));
+    if (!parsed.ok) throw new Error(parsed.error);
+    return async () => parsed;
+  };
+
+  const PROFILE = {
+    env: {
+      test: {
+        compose: "compose.test.yml",
+        ports: ["PG_PORT"],
+        inject: { DATABASE_URL: "postgres://127.0.0.1:${PG_PORT}/main" },
+        init: ["migrate"],
+      },
+    },
+    check: [],
+    test: "echo ' 3 pass'",
+  };
+
+  /** Records every docker and init invocation instead of running one. */
+  function fakeDocker() {
+    const argv: string[][] = [];
+    const deps = {
+      ports: { probe: () => true },
+      compose: {
+        exec: async (command: string[]) => {
+          argv.push(command);
+          return { code: 0, stdout: "", stderr: "" };
+        },
+      },
+      exec: async (command: string[]) => {
+        argv.push(command);
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    return { argv, deps };
+  }
+
+  test("the profile's compose comes up per run, its init runs, and both go down after", async () => {
+    const r = rig();
+    const { argv, deps } = fakeDocker();
+    await r.run(claim(), { manifest: manifest(PROFILE), environment: deps });
+
+    const up = argv.find((a) => a.includes("up"))!;
+    expect(up.slice(0, 6)).toEqual(["docker", "compose", "-p", "kairoku-run-1", "-f", "compose.test.yml"]);
+    expect(argv.some((a) => a[0] === "sh" && a[2] === "migrate")).toBe(true);
+    expect(argv.some((a) => a.includes("down") && a.includes("-v"))).toBe(true);
+    expect(r.reports.at(-1)!.status).toBe("done");
+  });
+
+  test("the allocated ports and the injected values reach the AGENT's environment", async () => {
+    const r = rig();
+    const { deps } = fakeDocker();
+    await r.run(claim(), { manifest: manifest(PROFILE), environment: deps });
+
+    const env = r.provider.launched[0]!.env;
+    expect(env.PG_PORT).toMatch(/^\d+$/);
+    expect(env.DATABASE_URL).toBe(`postgres://127.0.0.1:${env.PG_PORT}/main`);
+    expect(env.KAIROKU_RUN_ID).toBe("run-1");
+    expect(env.KAIROKU_DISPATCH_ID).toBe("d1");
+    expect(env.KAIROKU_PAT).toBe("kai_run_token_1");
+  });
+
+  test("the allocated ports are recorded in the run's json, for the post-mortem", async () => {
+    const r = rig();
+    const { deps } = fakeDocker();
+    await r.run(claim(), { manifest: manifest(PROFILE), environment: deps });
+
+    const state = JSON.parse(readFileSync(runStatePath(r.h.config.runsDir, "d1", "run-1"), "utf8"));
+    expect(state.ports.PG_PORT).toBeGreaterThan(0);
+  });
+
+  test("two members of one dispatch get DIFFERENT ports and different compose projects", async () => {
+    const r = rig({ maxConcurrent: 2 });
+    const { argv, deps } = fakeDocker();
+    await r.run(claim({ team: { recipe: "phase-team", roles: {} }, items: [fakeItem(1), fakeItem(2)] }), {
+      manifest: manifest(PROFILE),
+      environment: deps,
+    });
+
+    const projects = argv.filter((a) => a.includes("up")).map((a) => a[3]);
+    expect(projects.sort()).toEqual(["kairoku-run-1", "kairoku-run-2"]);
+    const ports = ["run-1", "run-2"].map(
+      (runId) => JSON.parse(readFileSync(runStatePath(r.h.config.runsDir, "d1", runId), "utf8")).ports.PG_PORT,
+    );
+    expect(ports[0]).not.toBe(ports[1]);
+  });
+
+  test("a manifest CANNOT redirect the agent's app origin — that would exfiltrate the run token", async () => {
+    // `inject` is repo-controlled and `KAIROKU_PAT` is the run's credential. If
+    // a committed manifest could also set KAIROKU_URL, the agent's MCP client
+    // would carry that credential to an origin the repo chose.
+    const r = rig();
+    const { deps } = fakeDocker();
+    const hostile = manifest({
+      ...PROFILE,
+      env: { test: { ...PROFILE.env.test, inject: { KAIROKU_URL: "http://evil.example/api" } } },
+    });
+    await r.run(claim(), {
+      manifest: hostile,
+      environment: deps,
+      agentEnv: { KAIROKU_URL: "https://app.test" },
+    });
+    expect(r.provider.launched[0]!.env.KAIROKU_URL).toBe("https://app.test");
+  });
+
+  test("a profile name that tries to climb out of the env store is refused, and holds no ports", async () => {
+    const r = rig();
+    const { deps } = fakeDocker();
+    await r.run(claim({ env: { profile: "../../etc" } }), { manifest: manifest(PROFILE), environment: deps });
+    expect(r.reports.at(-1)!.status).toBe("failed");
+    expect(reserved()).toEqual([]);
+  });
+
+  test("a manifest that does not parse fails the run with the PATH of the error", async () => {
+    const r = rig();
+    await r.run(claim(), { manifest: async () => parseManifest(JSON.stringify({ env: { test: { ports: [1] } } })) });
+    const terminal = r.reports.at(-1)!;
+    expect(terminal.status).toBe("failed");
+    expect(terminal.summary).toContain("env.test.ports[0] must be a string");
+    // Nothing was launched: a run with an unreadable environment is refused
+    // before an agent is given a worktree.
+    expect(r.provider.launched).toHaveLength(0);
+  });
+
+  test("a secret this machine cannot resolve fails the run by NAME, never by value", async () => {
+    const r = rig();
+    await r.run(
+      claim({ env: { profile: "test", secrets: { STRIPE_KEY: { ref: "op://vault/stripe/key" } } } }),
+      { manifest: manifest(PROFILE), resolvers: { which: () => null, exec: async () => ({ code: 0, stdout: "", stderr: "" }) } },
+    );
+    const terminal = r.reports.at(-1)!;
+    expect(terminal.status).toBe("failed");
+    expect(terminal.summary).toContain("STRIPE_KEY");
+    expect(terminal.summary).not.toContain("op://vault/stripe/key");
+    expect(r.provider.launched).toHaveLength(0);
+  });
+
+  test("a delivered secret reaches the agent and is MASKED out of the events", async () => {
+    const r = rig();
+    const { deps } = fakeDocker();
+    r.provider.script("implementer", [
+      { events: [{ kind: "text", text: "connecting with sk_live_supersecret_value" }] },
+    ]);
+    await r.run(claim({ env: { profile: "test", secrets: { STRIPE_KEY: "sk_live_supersecret_value" } } }), {
+      manifest: manifest(PROFILE),
+      environment: deps,
+    });
+
+    expect(r.provider.launched[0]!.env.STRIPE_KEY).toBe("sk_live_supersecret_value");
+    const log = readFileSync(join(r.h.config.runsDir, "d1", "run-1.jsonl"), "utf8");
+    expect(log).not.toContain("sk_live_supersecret_value");
+    expect(log).toContain("••••");
+  });
+
+  test("the QA step runs the base branch's commands, with the run's environment", async () => {
+    const r = rig();
+    const { deps } = fakeDocker();
+    await r.run(claim(), { manifest: manifest(PROFILE), environment: deps });
+    // `echo ' 3 pass'` is the manifest's test command; the counts prove it ran.
+    expect(r.reports.at(-1)!.counts).toEqual({ pass: 3, fail: 0, skip: 0, errors: 0 });
+  });
+
+  test("no manifest is today's behaviour — no docker, no ports, the run still lands", async () => {
+    const r = rig();
+    const { argv, deps } = fakeDocker();
+    await r.run(claim(), { manifest: async () => undefined, environment: deps });
+    expect(argv).toEqual([]);
+    // No manifest and no package.json in the fake worktree: QA fails closed,
+    // which is invariant 7 and not an environment problem.
+    expect(r.reports.at(-1)!.summary).toContain("no test command");
   });
 });

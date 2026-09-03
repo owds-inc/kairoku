@@ -34,6 +34,15 @@ export interface ExecContext {
   setState(state: RunState, role?: RoleName): void;
   /** True once the app, a timeout or a shutdown has asked this run to stop. */
   cancelled(): boolean;
+  /**
+   * O-4 — register the run's environment teardown (its compose project and its
+   * ports). It is run on EVERY exit path RF-010 already covers, BEFORE the
+   * worktree goes, because `docker compose down` needs the compose file that
+   * lives in it. Registering it is the caller's first act, before it knows
+   * whether preparation even succeeded: a project that came up before the init
+   * step failed must not outlive the run either.
+   */
+  onTeardown(cleanup: () => Promise<void>): void;
 }
 
 export interface StartSpec {
@@ -88,6 +97,8 @@ interface RunRecord {
   branch: string;
   worktree?: Worktree;
   handle?: { interrupt(): void };
+  /** The run environment's teardown, once its body has registered one. */
+  cleanup?: () => Promise<void>;
   stopping?: "cancelled" | "timeout" | "shutdown";
   /** Registered, but waiting for a slot. Not running, and not counted as such. */
   queued?: boolean;
@@ -310,6 +321,9 @@ export class RunStore {
           if (role) record.role = role;
         },
         cancelled: () => record.stopping !== undefined || this.#shuttingDown,
+        onTeardown: (cleanup) => {
+          record.cleanup = cleanup;
+        },
       });
     } catch (err) {
       appendEvent(runsDir, record.dispatchId, record.runId, "error", { message: message(err) });
@@ -324,9 +338,31 @@ export class RunStore {
     return this.#finish(record, status, summary);
   }
 
-  /** RF-010 — worktree teardown on every exit path, with the post-mortem opt-out. */
+  /**
+   * RF-010 — teardown on every exit path, with the post-mortem opt-out.
+   *
+   * The run ENVIRONMENT comes down first and unconditionally (O-4): before the
+   * worktree, because the compose file lives in it, and even when
+   * `keepWorktreeOnFailure` keeps the directory — a kept worktree is for
+   * reading a failure, and containers left running are not evidence, they are a
+   * machine that slowly fills up.
+   */
   async #teardown(record: RunRecord, status?: RunStatus): Promise<void> {
     const runsDir = this.#config.runsDir;
+    const cleanup = record.cleanup;
+    record.cleanup = undefined;
+    if (cleanup) {
+      try {
+        await cleanup();
+      } catch (err) {
+        // A teardown that throws into the exit path is a run that never
+        // reports. Whatever is left is `kairoku daemon prune`'s.
+        appendEvent(runsDir, record.dispatchId, record.runId, "teardown", {
+          removed: false,
+          reason: `environment teardown failed: ${message(err)}`,
+        });
+      }
+    }
     if (!record.worktree) return;
     const failed = status !== undefined && status !== "idle";
     if (failed && this.#config.keepWorktreeOnFailure) {

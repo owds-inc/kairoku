@@ -8,6 +8,7 @@
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { appClient, PROTOCOL_VERSION } from "../daemon/app";
+import { parsePortRange } from "../daemon/compose";
 import { kairokuHome, migrateHome, normaliseAppUrl, parseTokenEnv } from "../daemon/config";
 import { version as cliVersion } from "../../package.json";
 import * as daemonCmd from "./daemon";
@@ -22,6 +23,8 @@ import {
   daemonConfig,
   DEFAULT_APP_REPO,
   DEFAULT_APP_URL,
+  DEFAULT_PORT_RANGE,
+  docker,
   remainder,
   runtimes,
   shellPath,
@@ -129,6 +132,34 @@ async function appLink(
   return { step: { name, outcome: "done", detail: `app link proved — ${appUrl} says ${result.body.liveness}` } };
 }
 
+/**
+ * O-4 — the range per-run service ports are allocated from.
+ *
+ * Asked once and remembered, like the app repo. A RANGE THAT DOES NOT PARSE IS
+ * ASKED AGAIN rather than written: recorded, it would sit in config.json doing
+ * nothing visible until the first run with a compose profile could not get a
+ * port, which is a long way from the typo that caused it.
+ */
+async function portRange(io: Io, yes: boolean): Promise<string> {
+  const configured = (() => {
+    try {
+      const file = JSON.parse(io.readFile(join(kairokuHome(io.home), "config.json")) ?? "{}") as { ports?: unknown };
+      return typeof file.ports === "string" ? file.ports : undefined;
+    } catch {
+      return undefined;
+    }
+  })();
+  if (configured && parsePortRange(configured)) return configured;
+  if (yes) return DEFAULT_PORT_RANGE;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const answer = (await io.ask(`Port range for per-run services [${DEFAULT_PORT_RANGE}]: `)) || DEFAULT_PORT_RANGE;
+    if (parsePortRange(answer)) return answer;
+    io.out(`   ! ${JSON.stringify(answer)} is not a range like ${DEFAULT_PORT_RANGE} — try again`);
+  }
+  return DEFAULT_PORT_RANGE;
+}
+
 export async function daemon(
   io: Io,
   opts: { yes: boolean; repo?: string; appUrl?: string; appToken?: string },
@@ -155,7 +186,19 @@ export async function daemon(
   show(await checkout(io, repoUrl));
   show(await userns(io));
   show(await codexConfig(io));
-  for (const s of await daemonConfig(io, appCheckoutDir(io), repoUrl, await pluginPathFor(io))) show(s);
+  show(await docker(io));
+  const ports = await portRange(io, opts.yes);
+  // Resolved ONCE: `pluginPathFor` spawns `claude plugin list --json`, which is
+  // a ~210 ms process, and asking twice to build one object is how a setup run
+  // gets slower for nothing.
+  const pluginPath = await pluginPathFor(io);
+  for (const s of await daemonConfig(io, appCheckoutDir(io), {
+    repoUrl,
+    ports,
+    ...(pluginPath === undefined ? {} : { pluginPath }),
+  })) {
+    show(s);
+  }
 
   const link = await appLink(io, { yes: opts.yes, appUrl: opts.appUrl, appToken: opts.appToken });
   show(link.step);

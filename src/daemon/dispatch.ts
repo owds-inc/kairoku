@@ -20,7 +20,11 @@ import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ClaimItem, ClaimedDispatch, RunReport, RunState, SuiteCounts } from "./app";
 import type { Config } from "./config";
+import { parsePortRange, DEFAULT_PORT_RANGE } from "./compose";
+import { resolveSecrets, type DeliveredSecret, type ResolverDeps } from "./env";
+import { prepareEnvironment, type EnvironmentDeps } from "./environment";
 import { ensureRunDir, runDir, stdoutPath } from "./events";
+import { readManifest, type ManifestResult } from "./manifest";
 import type { RoleName } from "./policy";
 import { productionProviders, type Provider, type ProviderName } from "./providers";
 import { qaPlan, runQa } from "./qa";
@@ -41,6 +45,8 @@ export interface RunStateFile {
   readonly branch: string;
   readonly worktree?: string;
   readonly sessionId?: string;
+  /** O-4 — the service ports this run was allocated, for the post-mortem. */
+  readonly ports?: Record<string, number>;
   /** A terminal report the app has not accepted yet. Retried until it does. */
   readonly report?: RunReport;
 }
@@ -56,6 +62,12 @@ export interface DispatchDeps {
   readonly report?: (report: RunReport) => void;
   readonly providers?: Record<ProviderName, Provider>;
   readonly findPrUrl?: (repoPath: string, branch: string) => Promise<string | undefined>;
+  /** Test seam: the base branch's manifest, instead of asking git for it. */
+  readonly manifest?: () => Promise<ManifestResult | undefined>;
+  /** Test seam: docker and the init step. */
+  readonly environment?: EnvironmentDeps;
+  /** Test seam: the vault CLIs a `{ref}` is resolved through. */
+  readonly resolvers?: ResolverDeps;
 }
 
 export interface StartedDispatch {
@@ -328,6 +340,11 @@ export function startDispatch(
   const registry = deps.providers ?? productionProviders(config);
   const findPr = deps.findPrUrl ?? ((repoPath, branch) => findPrUrl(repoPath, branch));
   const base = `origin/${dispatch.repo?.defaultBranch ?? config.defaultBranch}`;
+  // ONE read of `kairoku.json`, from the branch the worktrees are cut from, for
+  // the whole dispatch (§20.11). Every member of a team runs the same contract,
+  // and asking git once rather than per member keeps that true even if someone
+  // pushes to the base branch mid-fan-out.
+  const manifest = (deps.manifest ?? (() => readManifest(config.repoPath, base)))();
   const timeoutSec = dispatch.limits?.runSeconds ?? config.defaultTimeoutSec;
   const lead = leadRole(name);
 
@@ -349,8 +366,12 @@ export function startDispatch(
       registry,
       findPr,
       report,
+      manifest,
       ...(deps.agentToken === undefined ? {} : { agentToken: deps.agentToken }),
       ...(deps.agentEnv === undefined ? {} : { agentEnv: deps.agentEnv }),
+      ...(deps.repoFullName === undefined ? {} : { repoFullName: deps.repoFullName }),
+      ...(deps.environment === undefined ? {} : { environment: deps.environment }),
+      ...(deps.resolvers === undefined ? {} : { resolvers: deps.resolvers }),
     }),
   );
 
@@ -387,8 +408,12 @@ interface MemberArgs {
   registry: Record<ProviderName, Provider>;
   findPr: (repoPath: string, branch: string) => Promise<string | undefined>;
   report: (report: RunReport) => void;
+  manifest: Promise<ManifestResult | undefined>;
   agentToken?: string;
   agentEnv?: Record<string, string>;
+  repoFullName?: string;
+  environment?: EnvironmentDeps;
+  resolvers?: ResolverDeps;
 }
 
 async function runMember(args: MemberArgs): Promise<void> {
@@ -399,20 +424,38 @@ async function runMember(args: MemberArgs): Promise<void> {
   const startedAt = new Date().toISOString();
   const branch = `run/${args.name}`;
 
-  const pat = item.runToken || args.agentToken;
-  if (!pat) {
-    const failed: RunReport = {
-      dispatchId,
-      runId,
-      status: "failed",
-      summary: "no run token in the claim and no KAIROKU_AGENT_TOKEN configured — the agent would have no credential",
-    };
+  /** Refuse before a worktree is cut. Nothing about this run can be fixed by trying. */
+  const refuse = (summary: string): void => {
+    const failed: RunReport = { dispatchId, runId, status: "failed", summary: summary.slice(0, 500) };
     writeRunState(runsDir, { dispatchId, runId, state: "failed", startedAt, branch, report: failed });
     report(failed);
-    return;
+  };
+
+  const pat = item.runToken || args.agentToken;
+  if (!pat) {
+    return refuse(
+      "no run token in the claim and no KAIROKU_AGENT_TOKEN configured — the agent would have no credential",
+    );
   }
 
-  const env = childEnv({ ...(args.agentEnv ?? {}), KAIROKU_PAT: pat });
+  // §20.11 — the environment, in the order the ruling names. The manifest and
+  // the secrets are settled BEFORE a worktree exists, because both can only
+  // fail one way and a run that cannot be given its environment should not be
+  // given a checkout either.
+  const manifest = await args.manifest;
+  if (manifest && !manifest.ok) return refuse(`the repo's environment cannot be read: ${manifest.error}`);
+
+  // Resolved here, on this machine, and held in memory only. The values join
+  // the run's masking set before the first event can be written, which is why
+  // this happens before `store.start` rather than inside the worktree.
+  const delivered = (dispatch.env?.secrets ?? {}) as Record<string, DeliveredSecret>;
+  const resolved = await resolveSecrets(delivered, args.resolvers);
+  if (!resolved.ok) return refuse(`the run's environment could not be prepared: ${resolved.error}`);
+  const secrets = resolved.values;
+
+  const profileName = dispatch.env?.profile ?? "test";
+  const portRange = parsePortRange(args.config.ports ?? DEFAULT_PORT_RANGE) ?? parsePortRange(DEFAULT_PORT_RANGE)!;
+  let ports: Record<string, number> = {};
   let sessionId: string | undefined;
   let outcome: MemberOutcome = { ok: false, summary: "the member produced no outcome" };
 
@@ -425,6 +468,7 @@ async function runMember(args: MemberArgs): Promise<void> {
       startedAt,
       branch,
       ...(sessionId === undefined ? {} : { sessionId }),
+      ...(Object.keys(ports).length === 0 ? {} : { ports }),
       ...extra,
     });
 
@@ -437,8 +481,9 @@ async function runMember(args: MemberArgs): Promise<void> {
     role: args.lead,
     base: args.base,
     timeoutSec: args.timeoutSec,
-    // The run's own credential is masked out of every event and every log.
-    secrets: [pat],
+    // The run's own credential AND every delivered value are masked out of both
+    // logs (§20.11): a provider that echoes one back cannot leak it.
+    secrets: [pat, ...Object.values(secrets)],
     onStarted: ({ worktree }) => {
       save("running", { worktree });
       // §20 addendum 6 — EVERY run says `running` once at launch. A dispatch
@@ -448,13 +493,47 @@ async function runMember(args: MemberArgs): Promise<void> {
     },
     execute: async (ctx) => {
       const cwd = ctx.worktree.path;
-      const plan = qaPlan(cwd);
+
+      const environment = await prepareEnvironment(
+        {
+          dispatchId,
+          runId,
+          worktree: cwd,
+          profileName,
+          secrets,
+          perRun: { KAIROKU_PAT: pat },
+          portRange,
+          ...(args.config.envDir === undefined ? {} : { envDir: args.config.envDir }),
+          ...(args.repoFullName === undefined ? {} : { repoFullName: args.repoFullName }),
+          ...(manifest?.ok ? { manifest: manifest.manifest } : {}),
+        },
+        args.environment,
+      );
+      // Registered FIRST, before `ok` is read: a compose project that came up
+      // before the init step failed must not outlive the run either.
+      ctx.onTeardown(environment.teardown);
+      // Recorded even on the failure path: a run that held ports and could not
+      // start is exactly the one somebody has to read the json of afterwards.
+      ports = environment.ports;
+      save("running", { worktree: cwd });
+      if (!environment.ok) return { ok: false, summary: environment.summary ?? "the run environment failed" };
+
+      // `agentEnv` goes ON TOP of the profile's values, not under them. It
+      // carries the app's own origin, and `inject` is repo-controlled: a
+      // committed manifest that could set KAIROKU_URL would send the agent —
+      // carrying KAIROKU_PAT, this run's credential — to an origin the repo
+      // chose. The daemon's own facts about the app are not the repo's to set.
+      const env = childEnv({ ...environment.values, ...(args.agentEnv ?? {}) });
+      const plan = qaPlan(cwd, {
+        ...(manifest?.ok ? { manifest: manifest.manifest } : {}),
+        ...(args.repoFullName === undefined ? {} : { key: args.repoFullName }),
+      });
       const memberCtx: MemberContext = {
         item: { id: item.id, key: item.key, title: item.title, body: item.body },
         brief: dispatch.brief ?? "",
         worktree: cwd,
         cancelled: ctx.cancelled,
-        qa: () => runQa(cwd, { plan }),
+        qa: () => runQa(cwd, { plan, env }),
         runRole: async (role, prompt) => {
           ctx.setState("running", role);
           const choice = roleChoice(dispatch, role);
