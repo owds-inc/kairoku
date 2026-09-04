@@ -19,6 +19,8 @@
  * The token is sent and never stored in a result, a message or an event.
  */
 
+import type { EventKind } from "./events";
+
 export const PROTOCOL_VERSION = "1";
 
 /** The whole outbound surface. Kept as literals so the constraint can read it. */
@@ -53,10 +55,18 @@ export interface RunArtifacts {
 /** The word the Floor prints while a run is still happening. Not its status. */
 export type RunState = "starting" | "running" | "needs_input" | "finishing";
 
+/**
+ * One curated line on the wire.
+ *
+ * `kind` is the DAEMON'S OWN vocabulary (`events.ts`), not a second hand-copy of
+ * the app's enum. A `type` import erases, so this module still pulls nothing at
+ * runtime — and §23.4's three new kinds could not reach the app through a union
+ * that was widened in one file and forgotten in the other.
+ */
 export interface RunEvent {
   readonly seq: number;
   readonly ts: string;
-  readonly kind: "text" | "tool" | "ok" | "deny" | "error";
+  readonly kind: EventKind;
   readonly text: string;
 }
 

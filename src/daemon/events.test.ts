@@ -11,6 +11,8 @@ import {
   eventsPath,
   runDir,
   stdoutPath,
+  resultText,
+  type EventKind,
 } from "./events";
 
 const dirs: string[] = [];
@@ -199,5 +201,55 @@ describe("events — curation, masking and the bounded buffer", () => {
     const buffer = new EventBuffer({ runsDir: "/nowhere/at/all", dispatchId: "d8", runId: "r8" });
     expect(() => buffer.push("text", "one")).not.toThrow();
     expect(buffer.drain()).toHaveLength(1);
+  });
+});
+
+/**
+ * §23.4 — the transcript's three kinds. The vocabulary is the APP's, vendored,
+ * and the ORDER is part of the contract: the app's `dispatch_events.kind` is a
+ * pg enum, whose values are positional in every dump, so the three are appended
+ * after the v1 five and never inserted among them.
+ */
+describe("events — §23.4's result, phase and index kinds", () => {
+  test("the vocabulary is the app's eight words, appended in the app's order", () => {
+    const kinds: EventKind[] = ["text", "tool", "ok", "deny", "error", "result", "phase", "index"];
+    const dir = tmp();
+    const buffer = new EventBuffer({ runsDir: dir, dispatchId: "d1", runId: "r1" });
+    for (const kind of kinds) buffer.push(kind, kind);
+    expect(buffer.drain().map((e) => e.kind)).toEqual(kinds);
+  });
+
+  test("a result line is `ok|error <ms>ms <first non-empty output line>` — the shape the app folds", () => {
+    expect(resultText(true, 1832, "hello\nworld")).toBe("ok 1832ms hello");
+    expect(resultText(false, 12, "\n\n  boom: exit 1\nstack…")).toBe("error 12ms boom: exit 1");
+  });
+
+  test("a result with no output is still a whole line, and a duration is never fractional", () => {
+    expect(resultText(true, 4.7, "   \n  ")).toBe("ok 5ms");
+    expect(resultText(true, -1, "")).toBe("ok 0ms");
+  });
+
+  test("an unknown duration is left out rather than guessed at as zero", () => {
+    expect(resultText(true, null, "done")).toBe("ok done");
+  });
+
+  test("a result and a phase are masked and truncated like every other kind", () => {
+    const dir = tmp();
+    const buffer = new EventBuffer({ runsDir: dir, dispatchId: "d1", runId: "r1", secrets: ["kai_run_token_1"] });
+    buffer.push("result", resultText(false, 3, "curl failed with kai_run_token_1"));
+    buffer.push("phase", "reviewing");
+    const drained = buffer.drain();
+    expect(drained[0]!.text).toBe("error 3ms curl failed with ••••");
+    expect(drained[1]).toMatchObject({ kind: "phase", text: "reviewing" });
+  });
+
+  test("EVENTS_PER_REPORT_MAX still bounds a flush that is all results", () => {
+    const dir = tmp();
+    const buffer = new EventBuffer({ runsDir: dir, dispatchId: "d1", runId: "r1" });
+    for (let i = 0; i < EVENTS_PER_REPORT_MAX + 10; i++) buffer.push("result", resultText(true, i, `line ${i}`));
+    const drained = buffer.drain();
+    expect(drained.length).toBe(EVENTS_PER_REPORT_MAX);
+    expect(drained[0]!.kind).toBe("error");
+    expect(drained[0]!.text).toContain("10 earlier event lines were dropped");
   });
 });
