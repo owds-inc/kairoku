@@ -95,7 +95,7 @@ All keys optional:
   "listen": { "host": "127.0.0.1", "port": 7801 },
   "maxConcurrent": 2,
   "repoPath": "/home/neil/work/kairoku",
-  "repoUrl": "https://github.com/bikerwhocodes/kairoku.git",
+  "repoUrl": "https://gitlab.com/owds-inc/kairoku/kairoku.git",
   "worktreesDir": "/home/neil/.kairoku/worktrees",
   "runsDir": "/home/neil/.kairoku/runs",
   "envDir": "/home/neil/.kairoku/env",
