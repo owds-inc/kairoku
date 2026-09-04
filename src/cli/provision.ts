@@ -27,13 +27,12 @@ export { AST_GREP };
 export const LSP_PACKAGES = ["typescript-language-server", "typescript"] as const;
 
 /**
- * The app checkout the daemon cuts worktrees from. DECISIONS §18: the app is
- * moving to a GitLab project under https://gitlab.com/owds-inc/kairoku/ — that
- * project does not exist yet, so v0.1 defaults to where the app lives today.
- * Switching this constant is the recorded follow-up. The operator's choice is
+ * The app checkout the daemon cuts worktrees from. DECISIONS §18/§28: the app
+ * lives on GitLab at https://gitlab.com/owds-inc/kairoku/kairoku — clones use
+ * plain git over HTTPS, same as any other repo. The operator's choice is
  * persisted as `repoUrl` in config.json, so a rerun never asks again.
  */
-export const DEFAULT_APP_REPO = "https://github.com/bikerwhocodes/kairoku.git";
+export const DEFAULT_APP_REPO = "https://gitlab.com/owds-inc/kairoku/kairoku.git";
 
 /**
  * Where Settings → Daemons lives for the hosted app. The snippet it prints is

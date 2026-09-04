@@ -82,6 +82,10 @@ describe("the app checkout", () => {
     const step = await checkout(io, DEFAULT_APP_REPO);
     expect(step).toMatchObject({ outcome: "manual", detail: expect.stringContaining("repository not found") });
   });
+
+  test("DEFAULT_APP_REPO points at the app's GitLab home (DECISIONS §18/§28)", () => {
+    expect(DEFAULT_APP_REPO).toBe("https://gitlab.com/owds-inc/kairoku/kairoku.git");
+  });
 });
 
 describe("user namespaces (codex sandbox)", () => {
