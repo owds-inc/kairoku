@@ -284,6 +284,104 @@ describe("claude — a launched run", () => {
   });
 });
 
+/**
+ * §23.4 — the tool cards' status line. The SDK answers an assistant's `tool_use`
+ * blocks with a USER-turn message of `tool_result` blocks, so this is where the
+ * transcript learns whether a call worked and how long it took.
+ */
+describe("claude — tool results (§23.4)", () => {
+  const toolResult = (over: Record<string, unknown>) => ({
+    type: "user",
+    message: { role: "user", content: [{ type: "tool_result", ...over }] },
+    parent_tool_use_id: null,
+    session_id: "sess-1",
+  });
+
+  test("a tool_use answered by a tool_result yields tool then result, with the elapsed ms", async () => {
+    const messages = [
+      assistant([{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "bun test" } }]),
+      toolResult({ tool_use_id: "toolu_1", content: [{ type: "text", text: "\n615 pass\n0 fail\n" }] }),
+      result(),
+    ];
+    // A real gap between the call and its answer, so the duration is an elapsed
+    // measurement rather than a constant that happens to parse.
+    const query = () =>
+      Object.assign(
+        (async function* () {
+          yield messages[0];
+          await Bun.sleep(15);
+          yield messages[1];
+          yield messages[2];
+        })(),
+        { interrupt: async () => {}, supportedModels: async () => [] },
+      );
+    const launched = claudeProvider({ query }).launch(run());
+    const seen = [];
+    for await (const event of launched.events) seen.push(event);
+    expect(seen.map((e) => e.kind)).toEqual(["tool", "result"]);
+    expect(seen[1]!.text).toMatch(/^ok \d+ms 615 pass$/);
+    expect(Number(/^ok (\d+)ms/.exec(seen[1]!.text)![1])).toBeGreaterThanOrEqual(10);
+  });
+
+  test("is_error reads error, and the word carries it — never the colour alone", async () => {
+    const { query } = fakeQuery([
+      assistant([{ type: "tool_use", id: "toolu_9", name: "Bash", input: { command: "bun test" } }]),
+      toolResult({ tool_use_id: "toolu_9", is_error: true, content: "  \nexit 1: 2 fail\nat a.test.ts:12" }),
+      result(),
+    ]);
+    const launched = claudeProvider({ query }).launch(run());
+    const seen = [];
+    for await (const event of launched.events) seen.push(event);
+    expect(seen[1]).toEqual({ kind: "result", text: expect.stringMatching(/^error \d+ms exit 1: 2 fail$/) });
+  });
+
+  test("results come back in the order the calls were made, which is how the app pairs them", async () => {
+    const { query } = fakeQuery([
+      assistant([
+        { type: "tool_use", id: "toolu_a", name: "Read", input: { file_path: "/a.ts" } },
+        { type: "tool_use", id: "toolu_b", name: "Read", input: { file_path: "/b.ts" } },
+      ]),
+      toolResult({ tool_use_id: "toolu_a", content: "a" }),
+      toolResult({ tool_use_id: "toolu_b", content: "b" }),
+      result(),
+    ]);
+    const launched = claudeProvider({ query }).launch(run());
+    const seen = [];
+    for await (const event of launched.events) seen.push(event);
+    expect(seen.map((e) => e.kind)).toEqual(["tool", "tool", "result", "result"]);
+    expect(seen[2]!.text).toContain("a");
+    expect(seen[3]!.text).toContain("b");
+  });
+
+  test("a result for a call this run never emitted is dropped, so a replay cannot mis-pair", async () => {
+    // The app pairs a result with the OLDEST call still waiting (FIFO). A
+    // second copy of an answer — a replayed user turn, a resumed session — would
+    // therefore attach itself to some LATER call and describe the wrong one.
+    const { query } = fakeQuery([
+      assistant([{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ls" } }]),
+      toolResult({ tool_use_id: "toolu_1", content: "one" }),
+      toolResult({ tool_use_id: "toolu_1", content: "one" }),
+      toolResult({ tool_use_id: "toolu_unknown", content: "not ours" }),
+      result(),
+    ]);
+    const launched = claudeProvider({ query }).launch(run());
+    const seen = [];
+    for await (const event of launched.events) seen.push(event);
+    expect(seen.map((e) => e.kind)).toEqual(["tool", "result"]);
+  });
+
+  test("the user turn that carries the prompt is not a result", async () => {
+    const { query } = fakeQuery([
+      { type: "user", message: { role: "user", content: "build the thing" }, parent_tool_use_id: null },
+      result(),
+    ]);
+    const launched = claudeProvider({ query }).launch(run());
+    const seen = [];
+    for await (const event of launched.events) seen.push(event);
+    expect(seen).toEqual([]);
+  });
+});
+
 describe("claude — the model list", () => {
   test("supportedModels is projected to values", async () => {
     const { query } = fakeQuery([]);
