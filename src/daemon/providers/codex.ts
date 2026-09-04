@@ -24,6 +24,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CODEGRAPH_NOTE, codegraphTomlTable } from "../codegraph";
+import { resultText } from "../events";
 import { launch as procLaunch } from "../proc";
 import { withRoleContract } from "../roles";
 import type { RoleName } from "../policy";
@@ -184,7 +185,27 @@ export function writeCodexFiles(run: RoleRun): void {
 
 const NOISE = /reasoning|token_count|delta|task_started|turn_/;
 
-export function codexEvent(line: string): ProviderEvent | undefined {
+/**
+ * One JSONL line → one curated event, and (§23.4) the OUTCOME of a command as a
+ * `result` rather than a second `tool` line.
+ *
+ * `started` is the caller's map of call id → the ms the command began, which is
+ * the only way a duration exists at all: the envelope the installed codex-cli
+ * 0.153.0 emits carries no elapsed time, only a `status` and an `exit_code`.
+ * A pair whose begin was never seen — a resumed session, a line the buffer
+ * dropped — still reports its outcome and simply claims no duration.
+ *
+ * BOTH ENVELOPES ARE ACCEPTED. 0.153.0 wraps everything as
+ * `{type:"item.started"|"item.completed", item:{type:"command_execution", …}}`;
+ * older builds emit `{msg:{type:"exec_command_begin"|"exec_command_end", …}}`.
+ * The daemon does not choose which codex an operator installed, and dropping
+ * one of the two would silently empty a run's log.
+ */
+export function codexEvent(
+  line: string,
+  started: Map<string, number> = new Map(),
+  now: () => number = Date.now,
+): ProviderEvent | undefined {
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(line) as Record<string, unknown>;
@@ -199,6 +220,16 @@ export function codexEvent(line: string): ProviderEvent | undefined {
     return { kind: "error", text: text(msg.message ?? msg.text ?? line) };
   }
   if (type.includes("command") || type.includes("exec") || type.includes("patch")) {
+    const id = typeof msg.call_id === "string" ? msg.call_id : typeof msg.id === "string" ? msg.id : "";
+    if (finished(type, msg)) {
+      const began = started.get(id);
+      started.delete(id);
+      return {
+        kind: "result",
+        text: resultText(succeeded(msg), began === undefined ? null : now() - began, output(msg)),
+      };
+    }
+    if (id !== "") started.set(id, now());
     const command = Array.isArray(msg.command) ? msg.command.join(" ") : text(msg.command ?? msg.text ?? "");
     return { kind: "tool", text: `${type}: ${command}`.slice(0, 240) };
   }
@@ -207,6 +238,31 @@ export function codexEvent(line: string): ProviderEvent | undefined {
     return body === "" ? undefined : { kind: "text", text: body };
   }
   return undefined;
+}
+
+/** Has this command stopped? An exit code or a settled status says so; so does the old `_end`. */
+function finished(type: string, msg: Record<string, unknown>): boolean {
+  return (
+    type.endsWith("_end") ||
+    typeof msg.exit_code === "number" ||
+    msg.status === "completed" ||
+    msg.status === "failed"
+  );
+}
+
+/** The exit code is the fact; the status word is the fallback for a step that has none. */
+function succeeded(msg: Record<string, unknown>): boolean {
+  if (typeof msg.exit_code === "number") return msg.exit_code === 0;
+  if (typeof msg.status === "string") return msg.status !== "failed";
+  return msg.success !== false;
+}
+
+/** Whatever the command printed, in the order the two envelopes offer it. */
+function output(msg: Record<string, unknown>): string {
+  for (const value of [msg.aggregated_output, msg.stdout, msg.stderr, msg.formatted_output]) {
+    if (typeof value === "string" && value.trim() !== "") return value;
+  }
+  return "";
 }
 
 function text(value: unknown): string {
@@ -343,6 +399,8 @@ export function codexProvider(deps: CodexDeps = {}): Provider {
       // third role turn of the same member rewrite the same two files.
       writeCodexFiles(run);
       const queue: ProviderEvent[] = [];
+      /** §23.4 — call id → when it began, so a completion can carry a duration. */
+      const started = new Map<string, number>();
       let wake: (() => void) | undefined;
       let closed = false;
       const emit = (event: ProviderEvent | undefined) => {
@@ -368,7 +426,7 @@ export function codexProvider(deps: CodexDeps = {}): Provider {
         stdin: `${withRoleContract(run.role, run.prompt, run.codegraph && CODEGRAPH_NOTE)}\n`,
         stdoutPath: run.logPath,
         timeoutMs: run.timeoutMs,
-        onLine: (line) => emit(codexEvent(line)),
+        onLine: (line) => emit(codexEvent(line, started)),
         ...(reportPath === undefined ? {} : { reportPath }),
       });
 
