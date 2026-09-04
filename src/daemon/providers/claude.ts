@@ -32,6 +32,7 @@
 
 import { isAbsolute, resolve } from "node:path";
 import { CODEGRAPH_NOTE, codegraphMcpServers } from "../codegraph";
+import { resultText } from "../events";
 import { POLICY, decide, insideWorktree, toolSummary } from "../policy";
 import { withRoleContract } from "../roles";
 import { formatMatches, scanRules, type Rules, type ScanResult } from "../rules";
@@ -200,6 +201,7 @@ export function claudeProvider(deps: ClaudeDeps = {}): Provider {
     },
 
     launch(run: RoleRun): LaunchedRun {
+      const clock: ToolClock = new Map();
       const queue: ProviderEvent[] = [];
       let wake: (() => void) | undefined;
       let closed = false;
@@ -225,7 +227,9 @@ export function claudeProvider(deps: ClaudeDeps = {}): Provider {
             const parsed = message as Record<string, unknown>;
             if (typeof parsed.session_id === "string" && parsed.session_id !== "") sessionId = parsed.session_id;
             if (parsed.type === "assistant") {
-              for (const event of assistantEvents(parsed)) emit(event);
+              for (const event of assistantEvents(parsed, clock)) emit(event);
+            } else if (parsed.type === "user") {
+              for (const event of resultEvents(parsed, clock)) emit(event);
             } else if (parsed.type === "result") {
               report = parsed.structured_output;
               outcome = resultOutcome(parsed);
@@ -281,8 +285,15 @@ export function claudeProvider(deps: ClaudeDeps = {}): Provider {
   };
 }
 
+/**
+ * The calls this run has made and not yet seen answered: `tool_use_id` → the ms
+ * it was emitted at. §23.4's duration is the difference, and the map is also
+ * what keeps `tool` and `result` one-to-one.
+ */
+type ToolClock = Map<string, number>;
+
 /** Text blocks and tool calls; everything else in an assistant message is not a log line. */
-function assistantEvents(message: Record<string, unknown>): ProviderEvent[] {
+function assistantEvents(message: Record<string, unknown>, clock: ToolClock): ProviderEvent[] {
   const content = (message.message as { content?: unknown } | undefined)?.content;
   if (!Array.isArray(content)) return [];
   const events: ProviderEvent[] = [];
@@ -291,10 +302,55 @@ function assistantEvents(message: Record<string, unknown>): ProviderEvent[] {
     if (block.type === "text" && typeof block.text === "string" && block.text.trim() !== "") {
       events.push({ kind: "text", text: block.text });
     } else if (block.type === "tool_use" && typeof block.name === "string") {
+      if (typeof block.id === "string" && block.id !== "") clock.set(block.id, Date.now());
       events.push({ kind: "tool", text: toolSummary(block.name, block.input) });
     }
   }
   return events;
+}
+
+/**
+ * §23.4 — the outcome of each call, from the USER turn the SDK writes back.
+ *
+ * ONLY A CALL THIS RUN ANNOUNCED IS ANSWERED, and the entry is spent on use.
+ * The app pairs a result with the OLDEST tool still waiting (FIFO — the only
+ * ordering a stream of lines carries), so a second copy of an answer, from a
+ * replayed or resumed user turn, would not be ignored there: it would attach
+ * itself to a LATER call and describe the wrong one. Refusing the duplicate
+ * here is what keeps the two sides one-to-one.
+ */
+function resultEvents(message: Record<string, unknown>, clock: ToolClock): ProviderEvent[] {
+  const content = (message.message as { content?: unknown } | undefined)?.content;
+  if (!Array.isArray(content)) return [];
+  const events: ProviderEvent[] = [];
+  for (const raw of content) {
+    const block = raw as Record<string, unknown>;
+    if (block.type !== "tool_result" || typeof block.tool_use_id !== "string") continue;
+    const started = clock.get(block.tool_use_id);
+    if (started === undefined) continue;
+    clock.delete(block.tool_use_id);
+    events.push({
+      kind: "result",
+      text: resultText(block.is_error !== true, Date.now() - started, blockText(block.content)),
+    });
+  }
+  return events;
+}
+
+/**
+ * What the tool actually said. `content` is a string or a list of blocks
+ * (`ToolResultBlockParam`, verified against the bundled `sdk.d.ts`); an image or
+ * a document in that list has no line for a log, so only text blocks are read.
+ */
+function blockText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((raw) => {
+      const block = raw as Record<string, unknown>;
+      return block.type === "text" && typeof block.text === "string" ? block.text : "";
+    })
+    .join("\n");
 }
 
 function resultOutcome(message: Record<string, unknown>): { ok: boolean; summary: string } {

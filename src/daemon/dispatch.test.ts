@@ -859,3 +859,112 @@ describe("§21 Q6/Q7 — the patterns.md convention reaches every role, on both 
     }
   });
 });
+
+/**
+ * §23.4 — the phase dividers. The app draws one between turn groups, so the
+ * contract is "one event per TRANSITION, before the status update", not one per
+ * role turn: a fix loop that re-enters a stage it just left is a transition, and
+ * a second reviewer turn in the same stage is not.
+ */
+function curated(r: Rig, runId = "run-1"): Array<{ seq: number; kind: string; text: string }> {
+  return readFileSync(join(r.h.config.runsDir, "d1", `${runId}.jsonl`), "utf8")
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => JSON.parse(line) as { seq?: number; kind?: string; text?: string })
+    .filter((line): line is { seq: number; kind: string; text: string } => typeof line.seq === "number")
+    .map((line) => ({ seq: line.seq, kind: line.kind, text: line.text }));
+}
+
+const phases = (r: Rig, runId = "run-1") =>
+  curated(r, runId)
+    .filter((e) => e.kind === "phase")
+    .map((e) => e.text);
+
+describe("dispatch — §23.4 phase markers", () => {
+  /** A manifest whose suite passes, so a run reaches `done` rather than the QA loop. */
+  const greenQa = { manifest: withIntelligence([]) };
+
+  test("build-verify walks implementing → reviewing → qa → done, one event per transition", async () => {
+    const r = rig();
+    await r.run(claim(), greenQa);
+    expect(phases(r)).toEqual(["implementing", "reviewing", "qa", "done"]);
+  });
+
+  test("a reviewer fix loop is a transition BACK, and says so", async () => {
+    const r = rig();
+    r.provider.script("reviewer", [
+      { report: { verdict: "NOT_CLEAN", defects: ["a.ts:1 — the guard is wrong"] } },
+      { report: CLEAN },
+    ]);
+    await r.run(claim(), greenQa);
+    expect(phases(r)).toEqual(["implementing", "reviewing", "implementing", "reviewing", "qa", "done"]);
+  });
+
+  test("the QA fix loop draws its own dividers, and the run that gives up ends on failed", async () => {
+    // The default rig has no test command, so QA fails closed and the loop runs
+    // its two rounds — which is exactly the shape a reader needs a divider for.
+    const r = rig();
+    await r.run(claim());
+    expect(phases(r)).toEqual([
+      "implementing",
+      "reviewing",
+      "qa",
+      "implementing",
+      "qa",
+      "implementing",
+      "qa",
+      "failed",
+    ]);
+  });
+
+  test("a turn that never finished ends on `failed`, so the transcript closes on the truth", async () => {
+    const r = rig();
+    r.provider.script("implementer", [{ ok: false, summary: "the model gave up" }]);
+    await r.run(claim(), greenQa);
+    expect(phases(r)).toEqual(["implementing", "failed"]);
+    expect(r.reports.at(-1)!.status).toBe("failed");
+  });
+
+  test("the phase leads the work it names — the divider is above the turn, never below it", async () => {
+    const r = rig();
+    r.provider.script("implementer", [{ events: [{ kind: "tool", text: 'Bash {"command":"bun test"}' }] }]);
+    await r.run(claim(), greenQa);
+    const lines = curated(r);
+    const phase = lines.findIndex((e) => e.kind === "phase" && e.text === "implementing");
+    const tool = lines.findIndex((e) => e.kind === "tool");
+    expect(phase).toBeGreaterThanOrEqual(0);
+    expect(phase).toBeLessThan(tool);
+  });
+
+  test("the closing divider travels WITH the terminal report, which is the only thing that can carry it", async () => {
+    // The link drains `store.list()`, which holds only RUNNING runs, so a line
+    // pushed in a run's last moments — the divider, and §21's `run: n tool
+    // calls` measure line — reaches the local log and nothing else unless the
+    // report it belongs to carries it.
+    const r = rig();
+    await r.run(claim(), greenQa);
+    const last = r.reports.at(-1)!;
+    expect(last.status).toBe("done");
+    expect((last.events ?? []).map((e) => e.text)).toContain("done");
+    expect((last.events ?? []).some((e) => e.text.startsWith("run: "))).toBe(true);
+  });
+
+  test("the whole log stays seq-ordered with the new kinds in it", async () => {
+    const r = rig();
+    r.provider.script("implementer", [{ events: [{ kind: "text", text: "on it" }] }]);
+    await r.run(claim(), greenQa);
+    const seqs = curated(r).map((e) => e.seq);
+    expect(seqs).toEqual([...seqs].sort((a, b) => a - b));
+  });
+});
+
+describe("dispatch — the CI-2 rider: the index line is its own kind", () => {
+  test("the index event is `index`, not `ok` — the app's enum accepts it now", async () => {
+    const r = rig();
+    await r.run(claim(), { manifest: withIntelligence(["codegraph"]), codegraph: fakeIndex().index });
+    expect(curated(r).find((e) => e.text.startsWith("codegraph: "))).toMatchObject({
+      kind: "index",
+      text: "codegraph: 573 files in 4.1s",
+    });
+  });
+});

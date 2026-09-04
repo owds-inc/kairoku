@@ -64,8 +64,21 @@ function writeLine(path: string, value: unknown): void {
 
 // ------------------------------------------------------------ the curated wire
 
-/** The app's vocabulary, vendored from `src/lib/comms/protocol/index.ts`. */
-export type EventKind = "text" | "tool" | "ok" | "deny" | "error";
+/**
+ * The app's vocabulary, vendored from `src/lib/comms/protocol/index.ts`.
+ *
+ * THE LAST THREE ARE §23.4's TRANSCRIPT, AND THE ORDER IS THE CONTRACT.
+ * `dispatch_events.kind` is a pg enum on the app's side, whose values are
+ * positional in every snapshot and dump, so these three were APPENDED there and
+ * are appended here. A daemon that knew only the first five kept parsing
+ * everything it ever sent, which is why this is additive rather than v2.
+ *
+ * `result` is a tool call's outcome (`resultText` below), `phase` is the stage
+ * the run just moved into, and `index` is the repository index built before the
+ * first turn — which the daemon sent as `ok` only until the app's enum
+ * widened (CLI PR #12).
+ */
+export type EventKind = "text" | "tool" | "ok" | "deny" | "error" | "result" | "phase" | "index";
 
 export const EVENT_TEXT_MAX = 2048;
 export const EVENTS_PER_REPORT_MAX = 50;
@@ -73,6 +86,34 @@ export const EVENTS_PER_REPORT_MAX = 50;
 /** Shorter than this and a "secret" is a word, not a credential. */
 const MASKABLE_MIN = 8;
 export const MASK = "••••";
+
+/**
+ * §23.4's result line: `ok|error <ms>ms <first non-empty output line>`.
+ *
+ * ONE WRITER FOR BOTH PROVIDERS. The app parses this shape to paint a tool
+ * card's status (`transcript-view.ts`'s `readResult`), so Claude's
+ * `tool_result` blocks and Codex's finished commands have to spell it the same
+ * way or one of them renders as an unparsed line.
+ *
+ * A `null` duration is LEFT OUT rather than written as `0ms`: the app's own
+ * reader treats the milliseconds as optional, and "the call took no time" is a
+ * different claim from "nobody timed it".
+ */
+export function resultText(ok: boolean, ms: number | null, output: string): string {
+  const word = ok ? "ok" : "error";
+  const took = ms === null ? "" : ` ${Math.max(0, Math.round(ms))}ms`;
+  const first = firstLine(output);
+  return `${word}${took}${first === "" ? "" : ` ${first}`}`;
+}
+
+/** The first line with something on it — a leading blank line is not the output. */
+function firstLine(output: string): string {
+  for (const line of output.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed !== "") return trimmed;
+  }
+  return "";
+}
 
 export interface CuratedEvent {
   readonly seq: number;

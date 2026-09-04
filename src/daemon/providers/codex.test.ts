@@ -91,6 +91,131 @@ describe("codex — the event stream (--json JSONL, best effort)", () => {
   });
 });
 
+/**
+ * §23.4 — a finished command is a RESULT, not a second tool line.
+ *
+ * THE EVENT NAMES ARE READ, NEVER REMEMBERED. Every line below is copied from a
+ * real `codex exec --json` run on the installed codex-cli 0.153.0 (a two-line
+ * prompt in a scratch git repo): the current envelope is
+ * `{"type":"item.started"|"item.completed","item":{...,"type":"command_execution",
+ * "command":…,"aggregated_output":…,"exit_code":…,"status":…}}`, and the
+ * `msg.exec_command_begin`/`exec_command_end` pair is the older one this mapper
+ * has always accepted. Both are kept: the daemon does not choose which codex an
+ * operator has installed.
+ */
+describe("codex — command results (§23.4)", () => {
+  /** The clock the duration is measured against, so the ms are pinned, not timed. */
+  const clock = () => {
+    let at = 1_000;
+    return { now: () => at, tick: (ms: number) => (at += ms) };
+  };
+
+  const STARTED = JSON.stringify({
+    type: "item.started",
+    item: {
+      id: "item_2",
+      type: "command_execution",
+      command: "/bin/zsh -lc 'echo hello-kairoku'",
+      aggregated_output: "",
+      exit_code: null,
+      status: "in_progress",
+    },
+  });
+  const COMPLETED = JSON.stringify({
+    type: "item.completed",
+    item: {
+      id: "item_2",
+      type: "command_execution",
+      command: "/bin/zsh -lc 'echo hello-kairoku'",
+      aggregated_output: "hello-kairoku\n",
+      exit_code: 0,
+      status: "completed",
+    },
+  });
+
+  test("the started item is the tool line and the completed item is its result, with the elapsed ms", () => {
+    const started = new Map<string, number>();
+    const c = clock();
+    const begin = codexEvent(STARTED, started, c.now);
+    expect(begin!.kind).toBe("tool");
+    expect(begin!.text).toContain("echo hello-kairoku");
+    c.tick(1832);
+    expect(codexEvent(COMPLETED, started, c.now)).toEqual({ kind: "result", text: "ok 1832ms hello-kairoku" });
+  });
+
+  test("a finished command is no longer reported twice — the completion is a result, never a second tool line", () => {
+    // Before §23.4 both halves of the pair matched the same branch, so every
+    // command a codex run made appeared in the Floor's log twice.
+    const started = new Map<string, number>();
+    const kinds = [STARTED, COMPLETED].map((line) => codexEvent(line, started, () => 0)!.kind);
+    expect(kinds).toEqual(["tool", "result"]);
+  });
+
+  test("a non-zero exit reads error and carries the first line of what it printed", () => {
+    const started = new Map<string, number>();
+    const failed = JSON.stringify({
+      type: "item.completed",
+      item: {
+        id: "item_7",
+        type: "command_execution",
+        command: "bun test",
+        aggregated_output: "\n 8 pass\n 2 fail\nexpected true to be false\n",
+        exit_code: 1,
+        status: "failed",
+      },
+    });
+    expect(codexEvent(failed, started, () => 0)).toEqual({ kind: "result", text: "error 8 pass" });
+  });
+
+  test("the older msg envelope pairs the same way, on its own call_id", () => {
+    const started = new Map<string, number>();
+    const c = clock();
+    const begin = codexEvent(
+      JSON.stringify({ msg: { type: "exec_command_begin", call_id: "c1", command: ["bun", "test"] } }),
+      started,
+      c.now,
+    );
+    expect(begin!.kind).toBe("tool");
+    c.tick(40);
+    expect(
+      codexEvent(
+        JSON.stringify({ msg: { type: "exec_command_end", call_id: "c1", exit_code: 0, stdout: "615 pass\n" } }),
+        started,
+        c.now,
+      ),
+    ).toEqual({ kind: "result", text: "ok 40ms 615 pass" });
+  });
+
+  test("an end with no begin still reports the outcome, and claims no duration it did not measure", () => {
+    // A run resumed, a line lost to the buffer's cap: the outcome is still the
+    // fact worth having, and the app's own reader treats the ms as optional.
+    expect(
+      codexEvent(
+        JSON.stringify({ msg: { type: "exec_command_end", call_id: "gone", exit_code: 2, stderr: "boom" } }),
+        new Map<string, number>(),
+        () => 0,
+      ),
+    ).toEqual({ kind: "result", text: "error boom" });
+  });
+
+  test("a launched run pairs across lines, so the app sees tool then result", async () => {
+    const provider = codexProvider({
+      launch: (options) => {
+        options.onLine?.(STARTED);
+        options.onLine?.(COMPLETED);
+        return { pid: 1, interrupt: () => {}, exited: Promise.resolve({ code: 0, summary: "exit 0" }) };
+      },
+    });
+    dir = mkdtempSync(join(tmpdir(), "kairoku-codex-"));
+    const launched = provider.launch(run({ cwd: dir }));
+    const seen = [];
+    for await (const event of launched.events) seen.push(event);
+    await launched.exit;
+    expect(seen.map((e) => e.kind)).toEqual(["tool", "result"]);
+    expect(seen[1]!.text).toMatch(/^ok \d+ms hello-kairoku$/);
+  });
+});
+
 describe("codex — a launched run", () => {
   test("streams events, exits ok, and reads the report out of the -o file", async () => {
     const provider = codexProvider({

@@ -8,7 +8,7 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { appClient, DAEMON_ROUTES, PROTOCOL_VERSION } from "./app";
+import { appClient, DAEMON_ROUTES, PROTOCOL_VERSION, type RunEvent } from "./app";
 import { fakeApp, fakeItem, type FakeApp } from "./testkit";
 
 let app: FakeApp | undefined;
@@ -119,6 +119,27 @@ describe("app client — claim", () => {
 });
 
 describe("app client — update", () => {
+  /**
+   * §23.4's rider — the wire union is the daemon's own vocabulary, not a second
+   * hand-copy of it. This case is a TYPE assertion first (a `result`, `phase` or
+   * `index` line would not compile against the v1 five) and a round-trip second.
+   */
+  test("the three transcript kinds go up the wire beside the v1 five", async () => {
+    app = fakeApp();
+    app.queue({ id: "d-transcript", taskType: "implement", items: [fakeItem(1)] });
+    const c = client();
+    await c.claim();
+
+    const events: RunEvent[] = [
+      { seq: 0, ts: new Date().toISOString(), kind: "tool", text: 'Bash {"command":"bun test"}' },
+      { seq: 1, ts: new Date().toISOString(), kind: "result", text: "ok 1832ms 615 pass" },
+      { seq: 2, ts: new Date().toISOString(), kind: "phase", text: "reviewing" },
+      { seq: 3, ts: new Date().toISOString(), kind: "index", text: "codegraph: 402 files in 6.1s" },
+    ];
+    expect((await c.update({ dispatchId: "d-transcript", runId: "run-1", status: "running", events })).ok).toBe(true);
+    expect(app.runs.get("run-1")?.events.map((e) => e.kind)).toEqual(["tool", "result", "phase", "index"]);
+  });
+
   test("a report the app accepts comes back ok", async () => {
     app = fakeApp();
     app.queue({ id: "d3", taskType: "implement", items: [fakeItem(1)] });

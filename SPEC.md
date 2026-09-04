@@ -7,6 +7,13 @@ Build lanes: `planned/kairoku-cli-phase5-daemon-client.md` (the link) and
 `docs/plans/2026-09-02-kairoku-cli-phase6-teams.md`. This file is the build contract; changes
 to it are explicit amendments, never silent divergence. No dates, no estimates.*
 
+**Amended again for the run transcript (DECISIONS.md §23.4), same v1.** The wire did not change a
+seventh time — `events[]` already carried `{seq, ts, kind, text}`. What changed is the VOCABULARY of
+`kind`, additively: `result`, `phase` and `index` are appended after the v1 five, in the order the
+app appended them to its own pg enum, so a daemon that knows only the first five keeps parsing
+everything it ever sent. The app accepts and stores the three first (app PR #405); this side emits
+them. The amendments are marked inline: RF-003 and RF-022, plus RF-023 which is new.
+
 **Amended for the plugin's own Codex manifest (`plugin/codex-manifest`), same v1 — no RF changed
 and the wire did not move.** The fix lives entirely in the plugin repo's own marketplace manifest,
 not in anything below. Claude Code's `${user_config.kairoku_url}` interpolation has no Codex
@@ -192,7 +199,9 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   appended in full to `~/.kairoku/runs/<dispatchId>/<runId>.jsonl`, alongside `<runId>.log` (the
   raw provider stream) and the structured lifecycle lines (created, started, finished, teardown,
   error). What travels to the app is a CURATION of it: `{seq, ts, kind, text}` with `kind` one of
-  `text|tool|ok|deny|error`, text ≤ 2 KB, tool calls summarised to a name plus 200 characters,
+  `text|tool|ok|deny|error|result|phase|index` (**AMENDED §23.4** — the last three are appended,
+  never inserted, because the app's `dispatch_events.kind` is a pg enum whose values are positional
+  in every dump; see RF-023), text ≤ 2 KB, tool calls summarised to a name plus 200 characters,
   every delivered value masked, at most 50 lines a beat, oldest dropped first with one line saying
   how many. **Every delivered batch is monotonic by `seq`, the one after a drop included**: the
   overflow notice is numbered at DROP time, so it carries the seq of the first line it stands in for
@@ -507,13 +516,53 @@ state). `tsc --noEmit` clean and `bun test` green (with counts) are the merge ga
   time — the daemon pushes one curated event, `run: <n> tool calls in <s>s`, and records the same
   two numbers as `measure` on the run's own state file, so a post-mortem with no app still has them.
 
-  **Two disclosed substitutions.** The event above carries `kind: "ok"`, not a distinct `"index"`
-  kind: the app's own wire vocabulary (`"text" | "tool" | "ok" | "deny" | "error"`) is untouched by
-  this lane's Boundary ("no app change"), so a sixth kind is a follow-up, not this entry. And
+  **Two disclosed substitutions, one of them since paid.** The index event carried `kind: "ok"`
+  rather than a distinct `"index"` because the app's own wire vocabulary was five words and widening
+  it was another lane's to do. **AMENDED §23.4:** the app's enum has `index` now, so the line is
+  `kind: "index"` and its text is unchanged — the follow-up that entry named, done. The second
+  substitution stands:
   `kairoku setup --daemon` does **not** provision `codegraph` the way it provisions `ast-grep`
   (RF-021) and `typescript-language-server`: CodeGraph is still on probation, and installing it by
   default would commit the machine to a thing that has not passed its trial — `doctor` names it
   instead.
+
+- **RF-023 — the run transcript's events (§23.4, new).** The Floor renders a run as a thread of
+  turns, so the curated channel carries two facts it never carried before, and the CodeGraph index
+  line stops borrowing a word that is not its own.
+
+  **`result` — what a tool call DID.** Text is `ok|error <ms>ms <first non-empty output line>`,
+  written by one helper (`resultText` in `events.ts`) so both providers spell it the same way; the
+  app parses exactly that shape to draw a tool card's status. The milliseconds are OPTIONAL and are
+  left out rather than written as `0ms` when nothing timed the call — "it took no time" and "nobody
+  measured" are different claims. **Claude:** the SDK answers an assistant's `tool_use` blocks with
+  a user-turn message of `tool_result` blocks (`tool_use_id`, `content`, `is_error`, verified
+  against the bundled `sdk.d.ts`); the provider times each call from the `tool_use` it emitted and
+  answers ONLY calls it announced, spending the entry on use, so a replayed or resumed user turn
+  cannot mis-pair — the app pairs a result with the OLDEST call still waiting, and a duplicate
+  answer there would describe some later call. **Codex:** the installed codex-cli 0.153.0 wraps
+  everything as `{type:"item.started"|"item.completed", item:{type:"command_execution", command,
+  aggregated_output, exit_code, status}}`, and older builds emit
+  `{msg:{type:"exec_command_begin"|"exec_command_end", …}}`; both are accepted, the begin is the
+  `tool` line and the completion is the `result`, paired on `call_id`/item id. Neither envelope
+  carries an elapsed time, so the daemon measures it. **This also ends a duplicate:** before §23.4
+  both halves of a Codex command pair matched the same branch, so every command a codex run made
+  appeared in the log twice.
+
+  **`phase` — the stage the run just moved INTO.** Text is one of `implementing`, `reviewing`, `qa`,
+  `done`, `failed`, which are the app's own stage words (`floor-view.ts`), drawn as a divider between
+  turn groups. **One event per TRANSITION, before the status update it explains**: a stage re-entered
+  after a fix round is a transition and says so; a second turn in the stage the run is already in is
+  not, and a divider there would cut one piece of work in half. `pr_ready` and `merged` are the APP's
+  readings of a run it has already been told about, and `queued` describes a run this daemon has not
+  started — the daemon emits none of the three.
+
+  **`index`** is RF-022's line, now under its own word.
+
+  **The closing divider travels with the terminal report.** The link drains `store.list()`, which
+  holds only RUNNING runs, so a line pushed in a run's last moments — the `done`/`failed` divider,
+  and RF-022's `run: <n> tool calls in <s>s` measure line — reached the local log and nothing else.
+  The terminal `update` now carries whatever is left in the buffer (`store.drainEvents(runId)`; the
+  run record outlives the run, and `events` on a terminal report is a shape v1 already accepts).
 
 ## A dispatch becomes a team
 

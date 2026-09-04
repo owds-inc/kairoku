@@ -37,6 +37,23 @@ import { run as execArgv } from "./worktree";
 /** The four states a run's json can be in; the last two are terminal. */
 export type RunPhase = "starting" | "running" | "done" | "failed";
 
+/**
+ * §23.4 — the stage a `phase` event names, drawn by the app as a divider
+ * between turn groups. The words are the app's own (`floor-view.ts`'s
+ * `RunStage`), so a divider reads as the same stage the card is painted in.
+ *
+ * `pr_ready`, `merged` and `queued` are NOT here and could not be: the first
+ * two are the app's readings of a run it has already been told about, and the
+ * last one describes a run this daemon has not started. The daemon emits only
+ * what it is doing.
+ */
+type Stage = "implementing" | "reviewing" | "qa" | "done" | "failed";
+
+/** Which stage a role turn is. An unknown role is work, so it implements. */
+function stageForRole(role: RoleName): Stage {
+  return role === "reviewer" ? "reviewing" : "implementing";
+}
+
 export interface RunStateFile {
   readonly dispatchId: string;
   readonly runId: string;
@@ -567,7 +584,21 @@ async function runMember(args: MemberArgs): Promise<void> {
       // so this is paid per member, which is exactly what Q4 is measuring.
       const indexed =
         manifest?.ok && manifest.manifest.intelligence.includes("codegraph") ? await args.index(cwd) : {};
-      if (indexed.event) ctx.events.push("ok", indexed.event);
+      // §23.4's rider — its OWN kind now that the app's enum accepts one. It was
+      // `ok` only because a sixth kind would have been refused at the wire
+      // (CLI PR #12); the text is unchanged.
+      if (indexed.event) ctx.events.push("index", indexed.event);
+
+      // §23.4 — one event per TRANSITION, before the status update it explains.
+      // A stage re-entered after a fix round IS a transition; a second turn in
+      // the stage the run is already in is not, and would draw a divider through
+      // the middle of one piece of work.
+      let stage: Stage | undefined;
+      const enter = (next: Stage): void => {
+        if (stage === next) return;
+        stage = next;
+        ctx.events.push("phase", next);
+      };
 
       const env = childEnv({ ...environment.values, ...(args.agentEnv ?? {}) });
       const plan = qaPlan(cwd, {
@@ -579,15 +610,18 @@ async function runMember(args: MemberArgs): Promise<void> {
         brief: dispatch.brief ?? "",
         worktree: cwd,
         cancelled: ctx.cancelled,
-        qa: () =>
-          runQa(cwd, {
+        qa: () => {
+          enter("qa");
+          return runQa(cwd, {
             plan,
             env,
             // Layer two. Bound only when the base branch declared rules, which
             // is what makes the gate automatic without a manifest entry.
             ...(rules.rules === undefined ? {} : { scan: () => scanRules(rules.rules as Rules, cwd, ["."]) }),
-          }),
+          });
+        },
         runRole: async (role, prompt) => {
+          enter(stageForRole(role));
           ctx.setState("running", role);
           const choice = roleChoice(dispatch, role);
           const provider = args.registry[choice.provider];
@@ -627,6 +661,10 @@ async function runMember(args: MemberArgs): Promise<void> {
       // after this body returns would reach the local log and never the app.
       measure = { toolCalls: ctx.events.tools(), wallClockMs: Date.now() - launchedAt };
       ctx.events.push("ok", `run: ${measure.toolCalls} tool calls in ${(measure.wallClockMs / 1000).toFixed(1)}s`);
+      // The terminal divider, pushed HERE for the reason the measure line above
+      // is: the link drains `store.list()`, which holds only RUNNING runs, so a
+      // phase pushed after this body returns would never leave the machine.
+      enter(outcome.ok ? "done" : "failed");
       return { ok: outcome.ok, summary: outcome.summary };
     },
   });
@@ -637,6 +675,14 @@ async function runMember(args: MemberArgs): Promise<void> {
   const prUrl = await args.findPr(config.repoPath, result.branch).catch(() => undefined);
   const counts = outcome.counts;
   const documentIds = readDocumentIds(outcome.report);
+
+  // §23.4 — whatever the member said after the last drain: the closing divider
+  // and §21's `run: n tool calls` measure line, both pushed in the run's final
+  // moments. NOTHING ELSE CAN CARRY THEM. The link drains `store.list()`, which
+  // holds only RUNNING runs, so a line pushed that late reaches the local log
+  // and never the app unless the report it belongs to takes it. The record
+  // outlives the run, so the drain still answers here.
+  const trailing = store.drainEvents(runId);
 
   const terminal: RunReport = {
     dispatchId,
@@ -653,6 +699,7 @@ async function runMember(args: MemberArgs): Promise<void> {
     // A `failed` report needs no counts; a `done` implement run does, and a run
     // that never measured a suite has already failed for exactly that reason.
     ...(counts === undefined ? {} : { counts: counts as SuiteCounts }),
+    ...(trailing.length === 0 ? {} : { events: trailing }),
   };
 
   save(ok ? "done" : "failed", { worktree: result.worktree, report: terminal });
