@@ -659,3 +659,94 @@ describe("the two layers of §21, against a base branch that declares a rule", (
     90_000,
   );
 });
+
+/**
+ * §23.4's done-condition, end to end: a scripted provider's tool call, its
+ * RESULT and the run's PHASE markers reach the fake app, in seq order, over the
+ * real link and the real recipe. Nothing here talks to the real app.
+ */
+describe("the run transcript reaches the app (§23.4)", () => {
+  test(
+    "tool → result → phase arrive in order, and the whole log is one seq-ordered stream",
+    async () => {
+      fakeGhOnPath();
+      const { h, app: fake } = await machine();
+      const provider: Provider = {
+        name: "claude",
+        models: async () => ["claude-opus-5"],
+        launch(run: RoleRun): LaunchedRun {
+          return {
+            events: {
+              async *[Symbol.asyncIterator]() {
+                yield { kind: "text" as const, text: `${run.role} is on it` };
+                yield { kind: "tool" as const, text: 'Bash {"command":"bun test"}' };
+                yield { kind: "result" as const, text: "ok 1832ms 615 pass" };
+              },
+            },
+            interrupt() {},
+            exit: Promise.resolve({
+              ok: true,
+              summary: `${run.role} finished`,
+              ...(run.role === "reviewer" ? { report: { verdict: "CLEAN", defects: [] } } : {}),
+            }),
+          };
+        },
+      };
+      const config = { ...h.config, worktreeOps: seedingWorktrees(h.config.worktreesDir, () => false) };
+      const l = (link = startLink(new RunStore(config), config, {
+        client: appClient({ appUrl: fake.url, token: fake.token }),
+        autostart: false,
+        log: () => {},
+        providers: { claude: provider, codex: provider },
+      }));
+      await l.beat();
+      fake.queue({
+        id: "d-transcript",
+        taskType: "implement",
+        target: { kind: "plan_item", id: "t1", title: "one" },
+        repo: { provider: "github", fullName: "owds-inc/kairoku", defaultBranch: "main" },
+        team: { recipe: "build-verify", roles: {} },
+        items: [fakeItem(1)],
+      });
+      expect(await l.poll()).toBe(true);
+      // Curated lines travel only while a run is LIVE (RF-020's flush, or a
+      // beat) — a terminal report carries none. So the beat is driven here the
+      // way the 2 s flush drives it in production, serially so the batches
+      // cannot interleave.
+      let settled = false;
+      const beating = (async () => {
+        while (!settled) {
+          await l.beat();
+          await Bun.sleep(5);
+        }
+      })();
+      await waitFor(
+        () => [...fake.runs.values()].every((r) => r.status === "done" || r.status === "failed"),
+        "the member to settle",
+        60_000,
+      );
+      settled = true;
+      await beating;
+
+      const events = fake.runs.get("run-1")!.events;
+      expect(fake.runs.get("run-1")!.status).toBe("done");
+      expect(events.map((e) => e.seq)).toEqual([...events.map((e) => e.seq)].sort((a, b) => a - b));
+
+      // The pair the app folds into one tool card, in the order it folds them.
+      const tool = events.findIndex((e) => e.kind === "tool");
+      expect(tool).toBeGreaterThanOrEqual(0);
+      expect(events[tool + 1]).toMatchObject({ kind: "result", text: "ok 1832ms 615 pass" });
+
+      // The dividers, and the one that closes the run.
+      expect(events.filter((e) => e.kind === "phase").map((e) => e.text)).toEqual([
+        "implementing",
+        "reviewing",
+        "qa",
+        "done",
+      ]);
+      // A phase always precedes the turn it names.
+      expect(events.findIndex((e) => e.kind === "phase")).toBeLessThan(events.findIndex((e) => e.kind === "text"));
+    },
+    90_000,
+  );
+});
