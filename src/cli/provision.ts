@@ -11,6 +11,7 @@ import { DEFAULT_PORT_RANGE } from "../daemon/compose";
 import { kairokuHome } from "../daemon/config";
 import { AST_GREP } from "../daemon/rules";
 import { version, type Io } from "./io";
+import { setTokenEnv } from "./link-callback";
 
 export type Step = { name: string; outcome: "done" | "skipped" | "manual"; detail: string };
 const done = (name: string, detail: string): Step => ({ name, outcome: "done", detail });
@@ -381,7 +382,9 @@ export async function daemonConfig(
 /** Write the app URL and the credential. The token is written, never printed. */
 export function writeAppLink(io: Io, appUrl: string, token: string): void {
   const dir = kairokuHome(io.home);
-  io.writeFile(join(dir, "token.env"), `KAIROKU_DAEMON_TOKEN=${token}\n`, 0o600);
+  // Through the one token.env writer: a whole-file overwrite here would delete
+  // the KAIROKUD_LINK_TOKEN a `--link` run put beside it (§43.9).
+  setTokenEnv(io, "KAIROKU_DAEMON_TOKEN", token);
   const configPath = join(dir, "config.json");
   let config: Record<string, unknown> = {};
   try {
