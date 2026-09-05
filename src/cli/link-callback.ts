@@ -45,6 +45,18 @@ export const LINK_WINDOW_MS = 600_000;
 /** Short on purpose: the preflight is answered once, by a listener that dies. */
 export const CORS_MAX_AGE_SECONDS = 600;
 
+/**
+ * What a token value may be: ONE line of printable, non-space ASCII.
+ *
+ * The token is a field of an HTTP body from a page this process does not
+ * control, and its destination is a file of `KEY=value` lines. A value holding
+ * a newline is therefore a second line, and the second line it would choose is
+ * `KAIROKU_DAEMON_TOKEN=…` — the app credential §43.9 says this lane leaves
+ * alone. So the shape is checked where the value crosses the trust boundary,
+ * before it can reach a writer, and again in the writer itself.
+ */
+const ONE_LINE = /^[\x21-\x7e]+$/;
+
 export type LinkOutcome = { ok: true; daemonName?: string } | { ok: false; reason: string };
 
 export type LinkListener = {
@@ -108,7 +120,9 @@ export function listenForLink(opts: {
       }
       const token = body?.token;
       const given = body?.nonce;
-      if (typeof token !== "string" || token === "" || typeof given !== "string") return bad();
+      // An empty, multi-line or space-padded token is one of the empty 400s
+      // above: never written, never logged, never echoed.
+      if (typeof token !== "string" || !ONE_LINE.test(token) || typeof given !== "string") return bad();
       if (!equal(given, nonce)) return bad();
 
       state = "writing";
@@ -176,6 +190,11 @@ export function setTokenEnv(io: Io, key: string, value: string): void {
   const existing = io.exists(path) ? io.readFile(path) : "";
   if (existing === null) {
     throw new Error(`refusing to write ${path}: it exists and cannot be read — left as it is`);
+  }
+  // Defence in depth behind the boundary check: whatever a caller hands over,
+  // one key can never become two lines here.
+  if (!ONE_LINE.test(value)) {
+    throw new Error(`refusing to write ${path}: the value for ${key} is not one line — left as it is`);
   }
   const lines = existing.split("\n");
   for (const [index, line] of lines.entries()) {

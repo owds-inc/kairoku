@@ -10,8 +10,9 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseTokenEnv } from "../daemon/config";
 import { io as realIo } from "./io";
 import {
   CALLBACK_PATH,
@@ -48,6 +49,11 @@ function listener(over: { appUrl?: string; persist?: (t: string) => void | Promi
 
 const nonceOf = (l: LinkListener) => new URL(l.linkUrl).searchParams.get("nonce")!;
 
+/** A non-loopback IPv4 of THIS machine — the address a 0.0.0.0 bind would also answer on. */
+const lanAddress = Object.values(networkInterfaces())
+  .flat()
+  .find((n) => n?.family === "IPv4" && !n.internal)?.address;
+
 function post(l: LinkListener, body: unknown, path = CALLBACK_PATH): Promise<Response> {
   return fetch(`http://127.0.0.1:${l.port}${path}`, {
     method: "POST",
@@ -67,9 +73,6 @@ describe("the loopback listener — where it binds and what it advertises", () =
   test("an OS-chosen port on 127.0.0.1 only, and a link URL carrying that port and the nonce", async () => {
     const { l } = listener();
     expect(l.port).toBeGreaterThan(0);
-    expect(l.callbackUrl).toBe(`http://127.0.0.1:${l.port}${CALLBACK_PATH}`);
-    // A listener on 0.0.0.0 is a token-acceptor on the LAN (item 1).
-    expect(l.callbackUrl).not.toContain("0.0.0.0");
 
     const url = new URL(l.linkUrl);
     expect(url.origin).toBe(APP);
@@ -81,6 +84,22 @@ describe("the loopback listener — where it binds and what it advertises", () =
 
     // Bound, not merely constructed: the socket answers before anyone browses.
     expect((await fetch(l.callbackUrl, { method: "OPTIONS", headers: { origin: APP } })).status).toBe(204);
+  });
+
+  // Item 1 asserted over sockets, not over a string this module composed: the
+  // callback URL reaches the bound listener and this machine's own LAN address
+  // does not. A bind on 0.0.0.0 answers both, so this test fails when it moves.
+  test("bound to loopback ONLY — the callback URL answers, this machine's LAN address refuses", async () => {
+    const { l } = listener();
+    expect((await fetch(l.callbackUrl, { method: "OPTIONS", headers: { origin: APP } })).status).toBe(204);
+
+    // No LAN address means nothing could have been exposed — and nothing proved.
+    expect(typeof lanAddress).toBe("string");
+    const lan = new URL(l.callbackUrl);
+    lan.hostname = lanAddress!;
+    await expect(
+      fetch(lan, { method: "OPTIONS", headers: { origin: APP }, signal: AbortSignal.timeout(2_000) }),
+    ).rejects.toThrow();
   });
 
   test("two listeners get two nonces — the nonce is this run's, not a constant", () => {
@@ -160,6 +179,42 @@ describe("everything that is not the happy path is a 400, and none of them leak"
     expect((await post(l, { token: "", nonce })).status).toBe(400);
     expect(written).toEqual([]);
     // Every refusal above left the one use unspent.
+    expect((await post(l, good(l))).status).toBe(204);
+  });
+
+  // The token is an HTTP body field from a page we do not control, and the file
+  // it lands in is `KEY=value` lines: a value carrying a newline is an extra
+  // line, and the extra line it chooses is the app's own credential (§43.9).
+  test("a token carrying a newline is refused at the boundary — token.env is untouched and KAIROKU_DAEMON_TOKEN survives", async () => {
+    const fake = fakeIo({ home });
+    const before = "KAIROKU_DAEMON_TOKEN=kai_the_app_one\n";
+    fake.files[tokenEnv] = before;
+    const { l } = listener({ persist: (t: string) => setTokenEnv(fake, LINK_TOKEN_KEY, t) });
+
+    const injected = `kai_evil\nKAIROKU_DAEMON_TOKEN=kai_attacker_owned`;
+    const res = await post(l, good(l, { token: injected }));
+    expect(res.status).toBe(400);
+    expect(await res.text()).toBe("");
+    // Byte for byte: not rewritten, not appended to, not renamed over.
+    expect(fake.files[tokenEnv]).toBe(before);
+    expect(fake.files[`${tokenEnv}.tmp`]).toBeUndefined();
+    // The app credential still resolves to what it was.
+    expect(parseTokenEnv(fake.files[tokenEnv]!)).toBe("kai_the_app_one");
+
+    // The refusal spent nothing: a real token still lands, beside the app's key.
+    expect((await post(l, good(l))).status).toBe(204);
+    expect(fake.files[tokenEnv]).toBe(`${before}${LINK_TOKEN_KEY}=${TOKEN}\n`);
+  });
+
+  test("a carriage return, a leading space and a trailing space are each 400, and nothing is written", async () => {
+    const fake = fakeIo({ home });
+    const { l } = listener({ persist: (t: string) => setTokenEnv(fake, LINK_TOKEN_KEY, t) });
+    for (const token of [`kai_a\rKAIROKU_DAEMON_TOKEN=kai_b`, " kai_a", "kai_a ", "kai_a\n"]) {
+      const res = await post(l, good(l, { token }));
+      expect(res.status).toBe(400);
+      expect(await res.text()).toBe("");
+    }
+    expect(fake.files[tokenEnv]).toBeUndefined();
     expect((await post(l, good(l))).status).toBe(204);
   });
 
@@ -292,6 +347,25 @@ describe("setTokenEnv — atomic, 0600, and refusing a file it cannot read (item
     expect(fake.files[tokenEnv]).toContain(LINK_TOKEN_KEY);
   });
 
+  // Defence in depth for the boundary check above: one key can never become two
+  // lines, whatever a future caller hands this writer.
+  test("a value that is not one line is REFUSED — one key can never become two", () => {
+    const fake = io();
+    const before = "KAIROKU_DAEMON_TOKEN=kai_the_old_one\n";
+    fake.files[tokenEnv] = before;
+    const injected = "kai_evil\nKAIROKU_DAEMON_TOKEN=kai_attacker_owned";
+    expect(() => setTokenEnv(fake, LINK_TOKEN_KEY, injected)).toThrow(/refus/i);
+    expect(fake.files[tokenEnv]).toBe(before);
+    expect(fake.files[`${tokenEnv}.tmp`]).toBeUndefined();
+    try {
+      setTokenEnv(fake, LINK_TOKEN_KEY, injected);
+    } catch (e) {
+      // The refusal names the key, never the value it refused.
+      expect((e as Error).message).not.toContain(injected);
+      expect((e as Error).message).toContain(LINK_TOKEN_KEY);
+    }
+  });
+
   test("a file that does not parse is REFUSED, and its bytes survive (card 24)", () => {
     const fake = io();
     const corrupt = "  this was never an env file\n";
@@ -335,7 +409,7 @@ describe("setTokenEnv — atomic, 0600, and refusing a file it cannot read (item
       setTokenEnv({ ...realIo, home: dir }, LINK_TOKEN_KEY, TOKEN);
       const path = join(dir, ".kairoku", "token.env");
       expect(statSync(path).mode & 0o777).toBe(0o600);
-      expect(Bun.file(path).text()).resolves.toContain(LINK_TOKEN_KEY);
+      expect(realIo.readFile(path)).toContain(LINK_TOKEN_KEY);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
