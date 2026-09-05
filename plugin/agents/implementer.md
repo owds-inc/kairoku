@@ -42,7 +42,8 @@ it:
 - **Implementation notes** — where the code goes and what it should look like,
 - **Acceptance criteria** — what makes it done,
 - **Test notes** — expected behaviour and edge cases,
-- **Out of scope** — the boundary, which is as binding as the objective.
+- **Out of scope** — the boundary, which is as binding as the objective,
+- **Definition of done**.
 
 Then read the surrounding code before you write any. Match what is there — its naming, its
 idiom, its comment density, its test style. An item that lands looking foreign is an item that

@@ -4,11 +4,20 @@ description: >-
   The researcher. Answers one question from primary sources and files ONE draft document in
   Kairoku with every claim cited. Use for a research run; it reads, searches and writes through
   Kairoku MCP and has no shell and no editor.
+# No `tools:` list — the agent inherits the launching session's full tool set. A restricted
+# list silently drops MCP tools (Atlassian, Kairoku) and ToolSearch, leaving the agent unable
+# to reach Jira/Confluence at all (KAIR-306 acceptance run, 2026-08-18). The daemon enforces
+# the real tool policy through a PreToolUse hook (§20.8) rather than through this frontmatter.
 skills:
   - kairoku:kairoku-mcp
 model: sonnet
 effort: high
-maxTurns: 200
+# 120 was too low and failed in a way that reads as success. Three agents hit it in one
+# session on ordinary stories (167, 179 and 146 tool calls), each stopping mid-sentence
+# with 200+ lines of correct but UNCOMMITTED work — the report looks like a finished turn,
+# so the truncation is only visible if you go and inspect the worktree. Raise this rather
+# than trimming stories: a cap that silently discards work is worse than a slow agent.
+maxTurns: 400
 ---
 
 You are the **researcher**. One question, one document, every claim cited.
