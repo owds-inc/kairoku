@@ -92,7 +92,7 @@ one commit — forty micro-steps are as unexecutable as three boulders.
 
 **No placeholders, anywhere.** Forbidden: "TBD", "add appropriate error handling", "similar
 to item N", or any step that says *what* without *how*. If you can't write it concretely, the
-spec has a hole — go resolve it, don't paper over it. This applies doubly to `testNotes`:
+spec has a hole — go resolve it, don't paper over it. This applies doubly to `test_notes`:
 they are written **now**, at planning time, for every item — expected behaviour and edge
 cases before any implementation exists. That is the TDD contract the implementer builds from,
 and per `jira-ops` a placeholder there blocks the story outright.
@@ -123,7 +123,7 @@ the mirror line — `Verifies: FR-003, FR-004` — naming what that phase's flow
 Nothing gates on `Verifies:`; it exists so a phase's purpose can be read without opening every
 item beneath it.
 
-**Test notes never go in the body.** They go in the item's own `testNotes` field, every time,
+**Test notes never go in the body.** They go in the item's own `test_notes` field, every time,
 because that field is what becomes the body of the item's `Automated tests` subtask in Jira.
 Notes written into the description instead leave that subtask holding a placeholder that tells
 the implementer to go define tests which already exist a few lines above it — and per
@@ -145,7 +145,7 @@ its side-by-side criterion to its Acceptance criteria. That template is an adden
 shape, not a competing one.
 
 Write it with `upsert_plan(project, release, phases[], base_updated_at)` — a phase is
-`{name, description?, items?}`, an item `{title, description?, testNotes?}`. Both are matched by
+`{name, description?, items?}`, an item `{title, description?, test_notes?, needs_manual_check?, testNotes?, needsManualCheck?}`. Both are matched by
 name, and neither write overwrites an item's status or its Jira key, so re-running after an edit
 is safe.
 
@@ -159,7 +159,7 @@ NOT advance it, so a matching marker is not proof nobody has edited the plan —
 against a competing plan write, not against a person working in the app. **And send the whole plan, not just the phases you changed**: order
 comes from the position in your payload, so a call carrying a subset renumbers it over the rows
 you left out. Send every phase, and every item of every phase you touch, in the order you want
-them — omitting `description` or `testNotes` preserves what is stored, so an untouched item
+them — omitting `description` or `test_notes` preserves what is stored, so an untouched item
 costs only its title. `kairoku-mcp` carries the rest, including why inserting into the middle
 of a plan takes two writes.
 
@@ -171,7 +171,7 @@ push from the app's Sync tab, and what it will create. **Check before you say it
 recorded — and look at two things. Existing Jira keys: an item that already
 has one is duplicated by a second push, not linked. And empty descriptions: one item with no body
 refuses the entire release before the push reaches Jira at all, and the app names the items to
-fix. A missing `Satisfies:` line or absent `testNotes` only warns and still pushes, which is
+fix. A missing `Satisfies:` line or absent `test_notes` only warns and still pushes, which is
 the worse outcome — nothing is stopped, and the story arrives short of the brief it was meant
 to be.
 
