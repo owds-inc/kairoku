@@ -13,6 +13,7 @@ import { kairokuHome, migrateHome, normaliseAppUrl, parseTokenEnv } from "../dae
 import { version as cliVersion } from "../../package.json";
 import * as daemonCmd from "./daemon";
 import { daemonStatus, pluginPathFor, reachable } from "./doctor";
+import { linkDaemon } from "./link-callback";
 import type { Io } from "./io";
 import * as plugin from "./plugin";
 import {
@@ -35,7 +36,7 @@ import {
 } from "./provision";
 
 export const usage = `usage: kairoku setup [--plugin] [--daemon] [--all] [--yes] [--repo <url>]
-                     [--app-url <url>] [--app-token <token>]
+                     [--app-url <url>] [--app-token <token>] [--link]
 
   Without flags, a wizard asks what to set up.
   --plugin       install the Claude Code plugin (= kairoku plugin install)
@@ -47,7 +48,10 @@ export const usage = `usage: kairoku setup [--plugin] [--daemon] [--all] [--yes]
                  then remembered as repoUrl in ~/.kairoku/config.json)
   --app-url      the Kairoku app this daemon reports to
   --app-token    its daemon credential — both are printed once by
-                 Settings → Daemons in the app`;
+                 Settings → Daemons in the app
+  --link         bind a loopback listener and open the app's /link page in a
+                 browser to mint this machine's daemon token — ten minutes,
+                 then it gives up. A rerun replaces the token.`;
 
 function parse(args: string[]) {
   return parseArgs({
@@ -60,6 +64,7 @@ function parse(args: string[]) {
       repo: { type: "string" },
       "app-url": { type: "string" },
       "app-token": { type: "string" },
+      link: { type: "boolean" },
       help: { type: "boolean", short: "h" },
     },
   }).values;
@@ -71,6 +76,18 @@ async function confirm(io: Io, question: string, fallback: boolean): Promise<boo
 }
 
 const mark = { done: "✔", skipped: "–", manual: "!" } as const;
+
+/** The `appUrl` a previous run recorded, if config.json still parses. */
+function configuredAppUrl(io: Io): string | undefined {
+  try {
+    const { appUrl } = JSON.parse(io.readFile(join(kairokuHome(io.home), "config.json")) ?? "{}") as {
+      appUrl?: unknown;
+    };
+    return typeof appUrl === "string" ? appUrl : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * RF-011 — the app link, written and then PROVED with one heartbeat before the
@@ -87,16 +104,9 @@ async function appLink(
 ): Promise<{ step: Step; stop?: string }> {
   const name = "app link";
   const home = kairokuHome(io.home);
-  const configured = (() => {
-    try {
-      return (JSON.parse(io.readFile(join(home, "config.json")) ?? "{}") as { appUrl?: unknown }).appUrl;
-    } catch {
-      return undefined;
-    }
-  })();
 
   const existingToken = parseTokenEnv(io.readFile(join(home, "token.env")) ?? "");
-  let appUrl = opts.appUrl ?? (typeof configured === "string" ? configured : undefined);
+  let appUrl = opts.appUrl ?? configuredAppUrl(io);
   let token = opts.appToken ?? existingToken;
 
   if (!opts.yes && (!appUrl || !token)) {
@@ -118,8 +128,15 @@ async function appLink(
 
   appUrl = normaliseAppUrl(appUrl);
   // Written first so a failed proof still leaves the operator's own values in
-  // place to correct, rather than making them retype both.
-  writeAppLink(io, appUrl, token);
+  // place to correct, rather than making them retype both. A token.env the
+  // writer refuses (card 24) stops setup with that reason: overwriting it
+  // would destroy whichever credential is already in there.
+  try {
+    writeAppLink(io, appUrl, token);
+  } catch (e) {
+    const detail = (e as Error).message;
+    return { step: { name, outcome: "manual", detail }, stop: detail };
+  }
 
   const result = await appClient({ appUrl, token, fetch: io.fetch }).heartbeat({
     meta: {
@@ -163,7 +180,7 @@ async function portRange(io: Io, yes: boolean): Promise<string> {
 
 export async function daemon(
   io: Io,
-  opts: { yes: boolean; repo?: string; appUrl?: string; appToken?: string },
+  opts: { yes: boolean; repo?: string; appUrl?: string; appToken?: string; link?: boolean },
 ): Promise<number> {
   io.out("== daemon");
   const steps: Step[] = [];
@@ -202,6 +219,18 @@ export async function daemon(
     ...(pluginPath === undefined ? {} : { pluginPath }),
   })) {
     show(s);
+  }
+
+  // Q12 — the browser half, before the heartbeat proof and before anything is
+  // installed: the operator is at the machine now, and a service started
+  // behind a link that never arrived is a daemon that does nothing.
+  if (opts.link) {
+    const linked = await linkDaemon(io, normaliseAppUrl(opts.appUrl ?? configuredAppUrl(io) ?? DEFAULT_APP_URL));
+    show(linked);
+    if (linked.outcome === "manual") {
+      io.out(`\n== stopped: ${linked.detail}`);
+      return 1;
+    }
   }
 
   const link = await appLink(io, { yes: opts.yes, appUrl: opts.appUrl, appToken: opts.appToken });
@@ -274,6 +303,7 @@ export async function run(args: string[], io: Io): Promise<number> {
       repo: values.repo,
       appUrl: values["app-url"],
       appToken: values["app-token"],
+      link: Boolean(values.link),
     });
   }
   return 0;

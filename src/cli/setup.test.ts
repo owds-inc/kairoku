@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { io as realIo } from "./io";
 import { run } from "./setup";
 import { DEFAULT_APP_REPO, DEFAULT_APP_URL } from "./provision";
+import { LINK_TOKEN_KEY } from "./link-callback";
 import { fakeIo, type FakeIo } from "./testkit";
 
 const calls = (io: FakeIo) => io.calls.map((c) => c.join(" "));
@@ -385,5 +386,82 @@ describe("kairoku setup — daemon: environments (O-4)", () => {
     expect(await run(["--daemon", "--yes"], io)).toBe(0);
     expect(calls(io).some((c) => c.includes("docker.io docker-compose-plugin"))).toBe(true);
     expect(io.lines.join("\n")).toContain("log out and back in");
+  });
+});
+
+/**
+ * p2-07 / Q12 — `--link` binds the loopback listener, opens the browser at it,
+ * and receives the token the `/link` page POSTs back. The Bun daemon's own
+ * `KAIROKU_DAEMON_TOKEN` is untouched: §43.9 keeps both keys until phase 7.
+ */
+describe("kairoku setup — daemon --link (the loopback callback)", () => {
+  const LINK_TOKEN = "kai_a_linked_daemon_token";
+
+  /** A browser that preflights the callback and POSTs what `/link` would POST. */
+  function withBrowser(io: FakeIo, body?: (link: URL) => unknown): FakeIo {
+    io.bins.add("xdg-open");
+    const inner = io.shell;
+    io.shell = async (argv, opts) => {
+      if (argv[0] !== "xdg-open") return inner(argv, opts);
+      io.calls.push(argv);
+      const link = new URL(argv[1]!);
+      const callback = link.searchParams.get("callback")!;
+      const origin = "https://app.test";
+      await fetch(callback, { method: "OPTIONS", headers: { origin } });
+      await fetch(callback, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin },
+        body: JSON.stringify(
+          body?.(link) ?? { token: LINK_TOKEN, nonce: link.searchParams.get("nonce"), daemonName: "vm" },
+        ),
+      });
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    return io;
+  }
+
+  test("the link is received before the service is installed, and the token lands 0600 under the new key", async () => {
+    const io = withBrowser(provisionedVm());
+    expect(await run(["--daemon", "--yes", "--link"], io)).toBe(0);
+
+    expect(io.files[`${home}/.kairoku/token.env`]).toBe(
+      `KAIROKU_DAEMON_TOKEN=kai_secret_token\n${LINK_TOKEN_KEY}=${LINK_TOKEN}\n`,
+    );
+    expect(io.modes[`${home}/.kairoku/token.env`]).toBe(0o600);
+
+    const order = io.lines.join("\n");
+    expect(order).toContain("daemon link");
+    expect(order.indexOf("daemon link")).toBeLessThan(order.indexOf("== daemon service"));
+    expect(order + io.errors.join("\n")).not.toContain(LINK_TOKEN);
+  });
+
+  test("a link that cannot be established stops setup non-zero, and no service is installed", async () => {
+    const io = withBrowser(provisionedVm());
+    expect(await run(["--daemon", "--yes", "--link", "--app-url", "not a url"], io)).toBe(1);
+    expect(calls(io).some((c) => c.includes("systemctl enable"))).toBe(false);
+    expect(io.files[`${home}/.kairoku/token.env`]).toBe("KAIROKU_DAEMON_TOKEN=kai_secret_token\n");
+  });
+
+  test("without --link nothing binds and nothing opens a browser", async () => {
+    const io = withBrowser(provisionedVm());
+    expect(await run(["--daemon", "--yes"], io)).toBe(0);
+    expect(calls(io).some((c) => c.startsWith("xdg-open"))).toBe(false);
+    expect(io.files[`${home}/.kairoku/token.env`]).toBe("KAIROKU_DAEMON_TOKEN=kai_secret_token\n");
+  });
+
+  test("a token.env the writer refuses stops setup, and its bytes survive (card 24)", async () => {
+    const io = provisionedVm();
+    const corrupt = "this file is not KEY=value any more\n";
+    io.files[`${home}/.kairoku/token.env`] = corrupt;
+    expect(await run(["--daemon", "--yes", "--app-url", "https://app.test", "--app-token", "kai_fresh_token"], io)).toBe(1);
+    expect(io.files[`${home}/.kairoku/token.env`]).toBe(corrupt);
+    expect(io.lines.join("\n")).toContain("refusing to write");
+    expect(calls(io).some((c) => c.includes("systemctl enable"))).toBe(false);
+  });
+
+  test("--link is in the usage", async () => {
+    const io = fakeIo();
+    expect(await run(["--help"], io)).toBe(0);
+    expect(io.lines.join("\n")).toContain("--link");
   });
 });
