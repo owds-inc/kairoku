@@ -1,0 +1,216 @@
+{
+  "tools": {
+    "add_progress_note": [
+      {
+        "name": "human_todo",
+        "optional": true
+      },
+      {
+        "name": "note",
+        "optional": false
+      },
+      {
+        "name": "project",
+        "optional": false
+      }
+    ],
+    "create_document": [
+      {
+        "name": "content",
+        "optional": false
+      },
+      {
+        "name": "folder",
+        "optional": true
+      },
+      {
+        "name": "format",
+        "optional": true
+      },
+      {
+        "name": "project",
+        "optional": false
+      },
+      {
+        "name": "title",
+        "optional": false
+      },
+      {
+        "name": "type",
+        "optional": false
+      }
+    ],
+    "get_document": [
+      {
+        "name": "document_id",
+        "optional": false
+      }
+    ],
+    "get_plan": [
+      {
+        "name": "include_context_pack",
+        "optional": true
+      },
+      {
+        "name": "include_ledger",
+        "optional": true
+      },
+      {
+        "name": "project",
+        "optional": false
+      },
+      {
+        "name": "release",
+        "optional": true
+      }
+    ],
+    "get_project": [
+      {
+        "name": "brief",
+        "optional": true
+      },
+      {
+        "name": "project",
+        "optional": false
+      }
+    ],
+    "list_documents": [
+      {
+        "name": "project",
+        "optional": false
+      },
+      {
+        "name": "type",
+        "optional": true
+      }
+    ],
+    "list_projects": [
+      {
+        "name": "stage",
+        "optional": true
+      }
+    ],
+    "search_documents": [
+      {
+        "name": "doc_class",
+        "optional": true
+      },
+      {
+        "name": "folder",
+        "optional": true
+      },
+      {
+        "name": "include",
+        "optional": true
+      },
+      {
+        "name": "project",
+        "optional": true
+      },
+      {
+        "name": "query",
+        "optional": true
+      },
+      {
+        "name": "release",
+        "optional": true
+      },
+      {
+        "name": "type",
+        "optional": true
+      },
+      {
+        "name": "updated_since",
+        "optional": true
+      }
+    ],
+    "update_document": [
+      {
+        "name": "append",
+        "optional": true
+      },
+      {
+        "name": "content",
+        "optional": true
+      },
+      {
+        "name": "document_id",
+        "optional": false
+      },
+      {
+        "name": "project",
+        "optional": true
+      },
+      {
+        "name": "title",
+        "optional": true
+      }
+    ],
+    "update_item_status": [
+      {
+        "name": "expected_status",
+        "optional": true
+      },
+      {
+        "name": "expected_title",
+        "optional": true
+      },
+      {
+        "name": "item_id",
+        "optional": false
+      },
+      {
+        "name": "note",
+        "optional": true
+      },
+      {
+        "name": "status",
+        "optional": false
+      }
+    ],
+    "upsert_plan": [
+      {
+        "name": "base_updated_at",
+        "optional": true
+      },
+      {
+        "name": "phases",
+        "optional": false
+      },
+      {
+        "name": "project",
+        "optional": false
+      },
+      {
+        "name": "release",
+        "optional": true
+      }
+    ]
+  },
+  "upsertPlanItem": [
+    {
+      "name": "description",
+      "optional": true
+    },
+    {
+      "name": "needsManualCheck",
+      "optional": true
+    },
+    {
+      "name": "needs_manual_check",
+      "optional": true
+    },
+    {
+      "name": "testNotes",
+      "optional": true
+    },
+    {
+      "name": "test_notes",
+      "optional": true
+    },
+    {
+      "name": "title",
+      "optional": false
+    }
+  ]
+}

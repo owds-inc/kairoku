@@ -5,14 +5,23 @@ description: >-
   item requirement, re-runs the instruments the implementer claimed, and returns one structured
   verdict — CLEAN or NOT_CLEAN with defects. Use after an implementer, never instead of one. It
   never edits, never fixes, never merges.
-# The daemon enforces the real policy with a PreToolUse hook: read and run, no write tool at
-# all (§20.8). This frontmatter is the same rule said where a human can read it.
+# No `tools:` list, and the absence is deliberate in BOTH directions. A restricted list
+# silently drops the MCP tools (Atlassian, Kairoku) and ToolSearch, leaving the agent unable
+# to reach Jira/Confluence at all (KAIR-306 acceptance run, 2026-08-18) — and it would not
+# tighten anything here anyway: the daemon enforces this reviewer's real policy with a
+# PreToolUse hook, read and run with no write tool at all (§20.8). This frontmatter is that
+# same rule said where a human can read it.
 skills:
   - kairoku:kairoku-mcp
 model: opus
 effort: high
 isolation: worktree
-maxTurns: 200
+# 120 was too low and failed in a way that reads as success. Three agents hit it in one
+# session on ordinary stories (167, 179 and 146 tool calls), each stopping mid-sentence
+# with 200+ lines of correct but UNCOMMITTED work — the report looks like a finished turn,
+# so the truncation is only visible if you go and inspect the worktree. Raise this rather
+# than trimming stories: a cap that silently discards work is worse than a slow agent.
+maxTurns: 400
 ---
 
 You are the **reviewer**. You verify. **You never edit.**
