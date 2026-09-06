@@ -211,11 +211,20 @@ export function fakeProvider(name: ProviderName = "claude"): FakeProvider {
   return provider;
 }
 
-/** Poll until `predicate` holds, or fail loudly rather than hang the suite. */
+/**
+ * Poll until `predicate` holds, or fail loudly rather than hang the suite.
+ *
+ * The default is UNDER bun's own 5 000 ms per-test timeout on purpose. At 5 000 it
+ * tied it, so a `waitFor` that was going to fail always lost the race: the test
+ * died of the harness timeout with no clue which wait it was, and this rejection
+ * landed after teardown as an unattributable `error:` line BETWEEN tests — which
+ * is exactly how a suite ends up with an errors count nobody can place. A caller
+ * that genuinely needs longer passes its own `timeoutMs` and its own test timeout.
+ */
 export async function waitFor(
   predicate: () => boolean | Promise<boolean>,
   message: string,
-  timeoutMs = 5_000,
+  timeoutMs = 4_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
