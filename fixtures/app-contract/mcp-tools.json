@@ -1,4 +1,56 @@
 {
+  "boxSlots": [
+    {
+      "name": "Agent Briefs/",
+      "docClass": "working"
+    },
+    {
+      "name": "Amendments/",
+      "docClass": "working"
+    },
+    {
+      "name": "Design/",
+      "docClass": "working"
+    },
+    {
+      "name": "Implementation Plan",
+      "docClass": "working"
+    },
+    {
+      "name": "PRD",
+      "docClass": "working"
+    },
+    {
+      "name": "Release Brief",
+      "docClass": "working"
+    },
+    {
+      "name": "Release Checklist",
+      "docClass": "working"
+    },
+    {
+      "name": "Release Notes",
+      "docClass": "working"
+    },
+    {
+      "name": "Research/",
+      "docClass": "reference"
+    },
+    {
+      "name": "Retrospective",
+      "docClass": "working"
+    },
+    {
+      "name": "Specs/",
+      "docClass": "working"
+    }
+  ],
+  "docClasses": [
+    "ledger",
+    "living",
+    "reference",
+    "working"
+  ],
   "tools": {
     "add_progress_note": [
       {
