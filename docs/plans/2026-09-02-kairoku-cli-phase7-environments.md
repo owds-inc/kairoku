@@ -10,7 +10,7 @@ resolves the app's secrets on this machine, allocates free ports per run, brings
 Docker Compose project, runs the profile's `init`, hands the merged environment to every role and
 to the QA step, and tears the compose project down on every exit path.
 
-**Spec:** `/Users/nihal/Work/OWDS/planning/kairoku/planned/kairoku-cli-phase7-environments.md`
+**Spec:** `planned/kairoku-cli-phase7-environments.md` in the private planning workspace
 (READ-ONLY), ruling `DECISIONS.md` §20.11; wire spec `planned/orchestration-v1.md`. The app half is
 live at `bikerwhocodes/kairoku` `8142b4d3` — `src/lib/comms/protocol/index.ts` is the contract the
 claim's `env: { profile, secrets }` shape is vendored from, and the root `kairoku.json` +

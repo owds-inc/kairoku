@@ -10,7 +10,7 @@ worktree, drives each role through a provider (Claude Agent SDK or `codex exec`)
 on a reviewer verdict and a deterministic QA step, streams curated events up the heartbeat, and
 obeys the beat's `cancel[]`.
 
-**Spec:** `/Users/nihal/Work/OWDS/planning/kairoku/planned/kairoku-cli-phase6-teams.md`
+**Spec:** `planned/kairoku-cli-phase6-teams.md` in the private planning workspace
 (READ-ONLY), ruling `DECISIONS.md` §20.2, §20.4–8 and the grill (Q2, Q4, Q5, Q6, Q9, Q14, Q21,
 Q22); wire spec `planned/orchestration-v1.md`; SDK/Codex facts `planning/orchestration-facts.md`.
 The app half is live at `bikerwhocodes/kairoku` `eab363ea` — `src/lib/comms/protocol/index.ts` is

@@ -8,7 +8,7 @@
 heartbeats, claims dispatches, runs them, and reports — outbound only. `POST /runs` and its inbound
 bearer are deleted; the loopback listener survives for `doctor`.
 
-**Spec:** `/Users/nihal/Work/OWDS/planning/kairoku/planned/kairoku-cli-phase5-daemon-client.md`
+**Spec:** `planned/kairoku-cli-phase5-daemon-client.md` in the private planning workspace
 (READ-ONLY), ruling `DECISIONS.md` §20.1–3 and §20.9, wire spec `planned/orchestration-v1.md`.
 The app half is live at `bikerwhocodes/kairoku` `a986e23b` and pinned there by
 `src/lib/orchestration/dispatch-lifecycle.test.ts`; the shapes below are vendored from it.

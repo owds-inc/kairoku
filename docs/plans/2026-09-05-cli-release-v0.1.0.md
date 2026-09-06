@@ -28,7 +28,7 @@
 
 **Files:** src/cli/doctor.ts, src/cli/doctor.test.ts. Existing checks(io) returns Check[]; no new exported interface.
 
-- [x] Measure `claude plugin marketplace list --help` and `--json`: array of {name, source, repo?, path?, installLocation}; local registration is a directory at /Users/nihal/Work/OWDS/hikyaku.
+- [x] Measure `claude plugin marketplace list --help` and `--json`: array of {name, source, repo?, path?, installLocation}; local registration is a local directory.
 - [ ] Add Io tests for wrong GitHub/directory sources, canonical GitHub source, absent registration, unavailable/malformed output, and unavailable source fields. Assert the repair commands are only printed and files remain unchanged.
 - [ ] Run doctor.test.ts and events.test.ts through rq.sh; record the missing doctor check failures before implementation.
 - [ ] Beside plugin checks, shell only marketplace list --json, parse defensively; PASS canonical GitHub repo, FAIL known wrong/absent registration with manual fix, WARN when source cannot be established. Never echo arbitrary source data.

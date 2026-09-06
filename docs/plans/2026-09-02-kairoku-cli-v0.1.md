@@ -8,7 +8,7 @@
 
 **Tech Stack:** Bun 1.3 + TypeScript, `bun test`, `tsc --noEmit`, `node:util` parseArgs, `node:readline/promises`, GitHub Actions, Homebrew tap formula, launchd (mac) / systemd (linux).
 
-**Spec:** `/Users/nihal/Work/OWDS/planning/kairoku/planned/kairoku-cli-v1.md` (READ-ONLY) — ruling in that repo's `DECISIONS.md` §19. Daemon protocol: `SPEC.md` in this repo.
+**Spec:** `planned/kairoku-cli-v1.md` in the private planning workspace (READ-ONLY) — ruling in that repo's `DECISIONS.md` §19. Daemon protocol: `SPEC.md` in this repo.
 
 **Phasing of this document:** Phase 1 is fully expanded (every step, every code block). Phases 2–4 carry the decided files, interfaces, tests and done-conditions; their code blocks are expanded at the start of each phase, after the context7 lookups the spec mandates (bun `--compile` targets, Homebrew formula DSL, launchd plist keys, `claude plugin` CLI). Each phase's PR amends this file with that expansion. Writing library-facing code four phases ahead of the lookup is the failure the spec warns about.
 
@@ -20,7 +20,7 @@
 - Zero runtime dependencies; devDependencies exactly `@types/bun` + `typescript` (asserted by `constraints.test.ts`).
 - RF-007: nothing under `src/daemon/` talks to a forge, Jira or Kairoku, and opens no outbound HTTP client (asserted mechanically). The CLI (`src/cli/`) may — `update` downloads releases.
 - No CLI framework: `node:util` `parseArgs`; prompts via `node:readline/promises`.
-- Never write to the app repo (`/Users/nihal/Work/OWDS/kairoku`), the planning repo, or shadcn-lib; the docs repo only in Phase 4. Read the app's plugin only via `git archive origin/main`.
+- Never write to the app repo (`<app-repo>`), the planning repo, or shadcn-lib; the docs repo only in Phase 4. Read the app's plugin only via `git archive origin/main`.
 - PR bodies: each numbered spec item → files; every instrument with counts (`bun test` pass/fail/skip/errors + files, `tsc --noEmit`, release build); anything only Neil can do.
 - Human gates (Neil): repo public, first `v0.1.0` tag, the `kairoku--v2.2.0` plugin tag, docs going live.
 
@@ -290,9 +290,9 @@ Expected: FAIL — ENOENT on `.claude-plugin/marketplace.json`.
 - [ ] **Step 3: Copy the plugin from the app's `origin/main` (never its working tree)**
 
 ```bash
-git -C /Users/nihal/Work/OWDS/kairoku fetch -q origin main
-git -C /Users/nihal/Work/OWDS/kairoku archive origin/main plugin .claude-plugin | tar -x -C /Users/nihal/Work/OWDS/hikyaku
-git -C /Users/nihal/Work/OWDS/kairoku rev-parse origin/main   # cite this SHA in the PR body
+git -C <app-repo> fetch -q origin main
+git -C <app-repo> archive origin/main plugin .claude-plugin | tar -x -C <cli-repo>
+git -C <app-repo> rev-parse origin/main   # cite this SHA in the PR body
 ```
 
 `tar` keeps the `100755` mode on `plugin/bin/kairoku-context` and `plugin/bin/kairoku-jira`; confirm with `ls -l plugin/bin`.
@@ -345,7 +345,7 @@ This machine already has `kairoku-marketplace` registered from the app's working
 
 ```bash
 claude plugin marketplace remove kairoku-marketplace
-claude plugin marketplace add /Users/nihal/Work/OWDS/hikyaku
+claude plugin marketplace add <cli-repo>
 claude plugin install kairoku@kairoku-marketplace
 claude plugin list | grep -A3 'kairoku@'
 ```

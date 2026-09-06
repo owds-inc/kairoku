@@ -126,7 +126,7 @@ Board frame and 14 on the Projects table frame.)*
 
 ### What KAIR-184 actually carried
 
-- Visual target: `/Users/nihal/Work/OWDS/kairoku-plan/mvp/KAIROKU_UI.dc.html` — a path that
+- Visual target: `/Users/<someone>/Work/kairoku-plan/mvp/KAIROKU_UI.dc.html` — a path that
   does not resolve on the build machine — anchored by **line numbers** ("Board card = lines
   2049–2062").
 - ACs of the form `grep -rn "stageChipClasses" … returns zero hits` and
