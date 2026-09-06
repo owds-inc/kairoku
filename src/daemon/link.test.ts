@@ -262,7 +262,15 @@ describe("claiming", () => {
     const h = (active = harness({ appUrl: app.url, token: app.token, maxConcurrent: 4 }));
     await checkoutOf(h.config.repoPath, "owds-inc/kairoku");
     const logs: string[] = [];
-    const l = linkTo(h, app!, logs);
+    // The dedupe is over the dispatches this daemon is HOLDING (`active`, link.ts),
+    // and a scripted provider finishes a run in about a millisecond — so the first
+    // run is held open here rather than raced: without the hold the second claim
+    // arrives after `run()` has already dropped the id and is accepted, which is
+    // the daemon behaving correctly on a question this test is not asking.
+    const store = new RunStore(h.config);
+    const provider = scripted();
+    provider.script("implementer", [{ hold: true }]);
+    const l = linkTo(h, app!, logs, store, provider);
     await l.beat();
 
     const dispatch = {
@@ -277,6 +285,8 @@ describe("claiming", () => {
     expect(await l.poll()).toBe(true);
     expect(await l.poll()).toBe(false);
     expect(logs.join("\n")).toContain("ignoring a second claim of d-twice");
+
+    await store.shutdown();
   });
 });
 
@@ -837,7 +847,15 @@ describe("§20.9 — the checkout guard, wired the way production wires it", () 
       team: { recipe: "research" },
     });
     expect(await l.poll()).toBe(true);
-    await waitFor(() => app!.runs.get("run-1")?.status === "running", "the run to start");
+    // "running" is a state this row passes THROUGH: over a scripted provider the
+    // whole research run settles in about a millisecond, so a poll of the row's
+    // CURRENT status reads "done" and never sees it — the wait could only ever be
+    // won by a machine slow enough. The durable witness is the report the daemon
+    // sent, and `app.calls` is append-only.
+    await waitFor(
+      () => updates(app!).some((u) => u.runId === "run-1" && u.status === "running"),
+      "the run to be reported running",
+    );
     expect(h.worktrees.created.length).toBeGreaterThan(0);
   });
 
