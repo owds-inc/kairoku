@@ -3,6 +3,9 @@ import { checks, run, type Check } from "./doctor";
 import { fakeIo, type FakeIo } from "./testkit";
 
 const PLUGIN_PATH = "/home/tester/.claude/plugins/cache/kairoku-marketplace/kairoku/2.2.0";
+const marketplaceRegistered = JSON.stringify([
+  { name: "kairoku-marketplace", source: "github", repo: "owds-inc/kairoku", installLocation: "/home/tester/.claude/plugins/marketplaces/kairoku-marketplace" },
+]);
 const pluginInstalled = JSON.stringify([
   { id: "kairoku@kairoku-marketplace", version: "2.2.0", scope: "user", enabled: true, installPath: PLUGIN_PATH },
 ]);
@@ -15,6 +18,7 @@ function laptop(): FakeIo {
   io.bins.add("claude");
   io.canned["claude --version"] = { stdout: "2.1.258 (Claude Code)\n" };
   io.canned["claude plugin list --json"] = { stdout: pluginInstalled };
+  io.canned["claude plugin marketplace list --json"] = { stdout: marketplaceRegistered };
   return io;
 }
 
@@ -48,6 +52,7 @@ function linuxDaemon(): FakeIo {
     "codex --version": { stdout: "codex-cli 0.40.0\n" },
     "paseo --version": { stdout: "0.6.2\n" },
     "claude plugin list --json": { stdout: pluginInstalled },
+    "claude plugin marketplace list --json": { stdout: marketplaceRegistered },
     "systemctl is-active kairoku-daemon": { stdout: "active\n" },
     "systemctl is-enabled kairoku-daemon": { stdout: "enabled\n" },
     "systemctl is-active paseo": { stdout: "active\n" },
@@ -102,11 +107,67 @@ describe("kairoku doctor", () => {
     expect(statuses(list)).toEqual({
       "claude installed": "PASS",
       "kairoku plugin installed": "PASS",
+      "kairoku marketplace source": "PASS",
       "kairoku plugin path": "PASS",
       "daemon configured": "WARN",
     });
     expect(byName(list, "daemon configured")?.detail).toContain("kairoku setup --daemon");
     expect(await run([], io)).toBe(0);
+  });
+
+  test("a stale marketplace source FAILs with a manual re-point and changes nothing", async () => {
+    for (const source of [
+      { source: "github", repo: "bikerwhocodes/kairoku" },
+      { source: "directory", path: "/Users/nihal/Work/OWDS/hikyaku" },
+    ]) {
+      const io = laptop();
+      io.canned["claude plugin marketplace list --json"] = {
+        stdout: JSON.stringify([{ name: "kairoku-marketplace", ...source, installLocation: "/old/marketplace" }]),
+      };
+      const before = JSON.stringify(io.files);
+      const check = byName(await checks(io), "kairoku marketplace source");
+      expect(check?.status).toBe("FAIL");
+      expect(check?.detail).toContain("claude plugin marketplace remove kairoku-marketplace");
+      expect(check?.detail).toContain("kairoku plugin install");
+      expect(await run([], io)).toBe(1);
+      expect(io.calls.filter((args) => args.slice(0, 3).join(" ") === "claude plugin marketplace"))
+        .toEqual(Array(2).fill(["claude", "plugin", "marketplace", "list", "--json"]));
+      expect(JSON.stringify(io.files)).toBe(before);
+    }
+  });
+
+  test("the canonical GitHub marketplace source passes", async () => {
+    const check = byName(await checks(laptop()), "kairoku marketplace source");
+    expect(check?.status).toBe("PASS");
+    expect(check?.detail).toContain("owds-inc/kairoku");
+  });
+
+  test("an absent marketplace FAILs with the install command", async () => {
+    const io = laptop();
+    io.canned["claude plugin marketplace list --json"] = { stdout: "[]" };
+    const check = byName(await checks(io), "kairoku marketplace source");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain("kairoku plugin install");
+  });
+
+  test("unavailable or malformed marketplace output WARNs without guessing", async () => {
+    for (const reply of [{ code: 1, stdout: marketplaceRegistered }, { stdout: "not json" }, { stdout: "{}" }, { stdout: "[null]" }]) {
+      const io = laptop();
+      io.canned["claude plugin marketplace list --json"] = reply;
+      const check = byName(await checks(io), "kairoku marketplace source");
+      expect(check?.status).toBe("WARN");
+      expect(check?.detail).toContain("claude plugin marketplace list --json");
+    }
+  });
+
+  test("missing marketplace source fields WARN instead of claiming a wrong source", async () => {
+    for (const source of [{}, { source: "github" }]) {
+      const io = laptop();
+      io.canned["claude plugin marketplace list --json"] = {
+        stdout: JSON.stringify([{ name: "kairoku-marketplace", ...source }]),
+      };
+      expect(byName(await checks(io), "kairoku marketplace source")?.status).toBe("WARN");
+    }
   });
 
   test("doctor names the plugin directory the daemon will hand the SDK, and FAILs closed without one", async () => {
@@ -152,6 +213,7 @@ describe("kairoku doctor", () => {
     expect(statuses(list)).toEqual({
       "claude installed": "PASS",
       "kairoku plugin installed": "PASS",
+      "kairoku marketplace source": "PASS",
       "kairoku plugin path": "PASS",
       "node ≥ 24": "PASS",
       "bun installed": "PASS",
