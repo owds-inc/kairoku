@@ -6,7 +6,7 @@ pointed at that index, on both hosts, and the two numbers §21's measurement com
 every run whether the index was built or not. It degrades silently rather than failing — a
 probation, not a dependency.
 
-**Spec:** `/Users/nihal/Work/OWDS/planning/kairoku/planned/code-intelligence-2.md` (READ-ONLY),
+**Spec:** `planned/code-intelligence-2.md` in the private planning workspace (READ-ONLY),
 ruling `DECISIONS.md` §21 (Q2, Q4, Q15, Q19). Facts:
 `planning/code-intelligence/sources/local-baseline.md` (CodeGraph's CLI, MCP and library surface)
 and `sources/gap-3-per-worktree-index-cost-and-linux-footprint.md` (no index sharing across

@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { checks, run, type Check } from "./doctor";
 import { fakeIo, type FakeIo } from "./testkit";
 
+/** A directory registration left behind by a repo move — the shape cli-4 measured on a real machine. */
+const STALE_MARKETPLACE_DIR = "/old/kairoku-marketplace";
+
 const PLUGIN_PATH = "/home/tester/.claude/plugins/cache/kairoku-marketplace/kairoku/2.2.0";
 const marketplaceRegistered = JSON.stringify([
   { name: "kairoku-marketplace", source: "github", repo: "owds-inc/kairoku", installLocation: "/home/tester/.claude/plugins/marketplaces/kairoku-marketplace" },
@@ -118,7 +121,7 @@ describe("kairoku doctor", () => {
   test("a stale marketplace source FAILs with a manual re-point and changes nothing", async () => {
     for (const source of [
       { source: "github", repo: "bikerwhocodes/kairoku" },
-      { source: "directory", path: "/Users/nihal/Work/OWDS/hikyaku" },
+      { source: "directory", path: STALE_MARKETPLACE_DIR },
     ]) {
       const io = laptop();
       io.canned["claude plugin marketplace list --json"] = {

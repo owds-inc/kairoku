@@ -10,7 +10,7 @@ gate of record. Plus the two smaller pieces of the same ruling: Codex reaches pa
 the hook and stops inheriting a machine-wide MCP credential, and a TypeScript repo gets a language
 server so an implementer can resolve a symbol instead of grepping for it.
 
-**Spec:** `/Users/nihal/Work/OWDS/planning/kairoku/planned/code-intelligence-1.md` (READ-ONLY),
+**Spec:** `planned/code-intelligence-1.md` in the private planning workspace (READ-ONLY),
 ruling `DECISIONS.md` §21 (Q1–Q29). Facts: `planning/orchestration-facts.md` (the SDK hook shape),
 `planning/code-intelligence/sources/codex-surfaces.md` (Codex config/hooks/MCP),
 `planning/code-intelligence/sources/defect-classes.md` (the three rules and the defects behind them).
