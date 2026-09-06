@@ -157,12 +157,43 @@ describe("everything that is not the happy path is a 400, and none of them leak"
     expect(written).toEqual([TOKEN]);
   });
 
-  test("a replay of the accepted body is 400 — the token is persisted exactly once", async () => {
-    const { l, written } = listener();
-    expect((await post(l, good(l))).status).toBe(204);
+  // The listener STOPS the instant the link succeeds — `outcome.then(… server.stop())`
+  // in `link-callback.ts`, item 6's "closed on every path". So a replay sent AFTER
+  // the 204 reaches no listening socket: what comes back is a connection error, not
+  // a 400, and whether it comes back at all is up to the HTTP client's keep-alive.
+  // The replay this guard exists for is the one that arrives while the first is
+  // still being written — "a request in flight and a spent nonce both refuse, so a
+  // replay cannot race the write it replays" — and that one is held open here
+  // rather than raced.
+  test("a replay racing the write it replays is 400 — the token is persisted exactly once", async () => {
+    let writing!: () => void;
+    const inWrite = new Promise<void>((resolve) => (writing = resolve));
+    let finish!: () => void;
+    const held = new Promise<void>((resolve) => (finish = resolve));
+    const written: string[] = [];
+    // Only the FIRST write is held: a replay that got through would then answer
+    // 204 outright, so this reads as "expected 400, received 204" rather than as
+    // a deadlock.
+    let firstWrite = true;
+    const { l } = listener({
+      persist: async (t: string) => {
+        if (firstWrite) {
+          firstWrite = false;
+          writing();
+          await held;
+        }
+        written.push(t);
+      },
+    });
+
+    const first = post(l, good(l));
+    await inWrite;
     const replay = await post(l, good(l));
     expect(replay.status).toBe(400);
     expect(await replay.text()).toBe("");
+
+    finish();
+    expect((await first).status).toBe(204);
     expect(written).toEqual([TOKEN]);
   });
 
@@ -220,10 +251,12 @@ describe("everything that is not the happy path is a 400, and none of them leak"
 
   test("no response body — success or refusal — carries the token", async () => {
     const { l } = listener();
+    // The 204 goes LAST: it settles the outcome and the listener closes behind it,
+    // so anything sent after it is testing the socket, not the response body.
     const bodies = [
       await (await post(l, good(l, { nonce: "a".repeat(32) }))).text(),
       await (await post(l, "{not json")).text(),
-      await (await post(l, good(l))).text(),
+      await (await post(l, { nonce: nonceOf(l) })).text(),
       await (await post(l, good(l))).text(),
     ];
     for (const body of bodies) expect(body).not.toContain(TOKEN);
@@ -237,8 +270,8 @@ describe("everything that is not the happy path is a 400, and none of them leak"
     try {
       const { l } = listener();
       await post(l, good(l, { nonce: "b".repeat(32) }));
-      await post(l, good(l));
-      await post(l, good(l));
+      await post(l, "{not json");
+      await post(l, good(l)); // last, for the reason above: the 204 closes the socket
     } finally {
       Object.assign(console, console_);
     }
