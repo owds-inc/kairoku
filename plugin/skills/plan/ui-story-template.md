@@ -140,7 +140,7 @@ Board frame and 14 on the Projects table frame.)*
 - Artifact (source of truth): `docs/design/kairoku-ui-mockup.html` (committed)
 - Published copy: https://kairoku-ui-mockups-owds-colors-1.owds.io/
 - Screen label(s): `data-screen-label="Board"`, `data-screen-label="Projects table"`,
-  `data-screen-label="Sidebar"` (the story touches ProjectStatusBlock)
+  `data-screen-label="Sidebar"` (the story touches ReleaseCard)
 
 ## Acceptance criteria (visual — in addition to the story's functional ACs)
 

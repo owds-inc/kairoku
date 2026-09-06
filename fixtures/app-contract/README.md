@@ -1,7 +1,7 @@
 # The app's half of the MCP contract
 
 `mcp-tools.json` is a **copy, byte for byte**, of `contracts/mcp-tools.json` in the Kairoku app
-repository (`gitlab.com/owds-inc/kairoku/kairoku`) taken at **dev `6d23ee1b6d5bb702a7e3bd53552a0261857672a6`**.
+repository (`gitlab.com/owds-inc/kairoku/kairoku`) taken at **dev `a4562fe552c1c6e082987b1f34dbbb75656773c0`**.
 The app generates it with `bun run export:mcp-contract` from the same parsers and modules its own
 scans use, so it is what those scans compute rather than a second reading of the same source. Four
 top-level keys:

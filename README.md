@@ -6,7 +6,7 @@ plugin, and the orchestration daemon that runs agents in fresh git worktrees.
 
 ## Install
 
-From the first tagged release (`v0.1.0`, pending):
+From the first tagged release (`v0.1.0`):
 
 ```sh
 brew install owds-inc/tap/kairoku                                                    # mac
@@ -308,6 +308,13 @@ formula with those checksums. Pushing a `v<version>` tag that matches
 publishes a GitHub release with the six files; `install.sh`, `kairoku update`
 and the formula in `owds-inc/homebrew-tap` all read from it (copy the released
 `kairoku.rb` into the tap's `Formula/` for each version).
+
+Build artifacts do not survive the next remote build sync; released binaries come
+from the tagged GitHub Actions run, never a remote build directory.
+A developer who needs a Darwin binary in hand must arrange a local build or obtain
+the release artifact: the remote build host is Linux, where Bun cross-compiles
+Darwin targets without executing them, and `./dist/kairoku-<host> version` proves
+only the host target.
 
 | Path | Holds |
 |---|---|
