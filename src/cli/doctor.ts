@@ -17,7 +17,7 @@ import { parseManifest, MANIFEST_FILE } from "../daemon/manifest";
 import { AST_GREP, RULES_PATH } from "../daemon/rules";
 import { version as binVersion, type Io } from "./io";
 import { resolvePluginPath } from "../daemon/providers";
-import { installedPlugin } from "./plugin";
+import { installedPlugin, MARKETPLACE, MARKETPLACE_SOURCE } from "./plugin";
 import { version as cliVersion } from "../../package.json";
 
 export const usage = `usage: kairoku doctor
@@ -289,6 +289,31 @@ export async function checks(io: Io, probe?: PortDeps): Promise<Check[]> {
         ? pass("kairoku plugin installed", `${have.version ?? "?"} ${have.enabled === false ? "disabled" : "enabled"}`)
         : fail("kairoku plugin installed", "run `kairoku plugin install`"),
     );
+    const sourceCheck = "kairoku marketplace source";
+    const inspectSource = "could not determine source — check `claude plugin marketplace list --json`";
+    try {
+      const result = await io.shell(["claude", "plugin", "marketplace", "list", "--json"]);
+      const markets = result.code === 0 ? JSON.parse(result.stdout) : null;
+      if (!Array.isArray(markets) || markets.some((m) => !m || typeof m.name !== "string")) {
+        out.push(warn(sourceCheck, inspectSource));
+      } else {
+        const market = markets.find((m) => m.name === MARKETPLACE);
+        if (!market) {
+          out.push(fail(sourceCheck, "not registered — run `kairoku plugin install`"));
+        } else if (typeof market.source !== "string" || !market.source ||
+          (market.source === "github" && (typeof market.repo !== "string" || !market.repo))) {
+          out.push(warn(sourceCheck, inspectSource));
+        } else if (market.source === "github" && market.repo === MARKETPLACE_SOURCE) {
+          out.push(pass(sourceCheck, MARKETPLACE_SOURCE));
+        } else {
+          // install() deliberately preserves registrations; doctor only reports the manual repair.
+          out.push(fail(sourceCheck, `source is not ${MARKETPLACE_SOURCE} — run ` +
+            `\`claude plugin marketplace remove ${MARKETPLACE}\` then \`kairoku plugin install\``));
+        }
+      }
+    } catch {
+      out.push(warn(sourceCheck, inspectSource));
+    }
     // Installed and FINDABLE are two facts, and they came apart: a machine
     // reported the plugin installed and enabled while every Claude run on it
     // refused, because the daemon looked in directories no install ever writes.

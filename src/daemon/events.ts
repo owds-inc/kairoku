@@ -233,5 +233,10 @@ export class EventBuffer {
 }
 
 function truncate(text: string): string {
-  return text.length <= EVENT_TEXT_MAX ? text : `${text.slice(0, EVENT_TEXT_MAX - 1)}…`;
+  if (text.length <= EVENT_TEXT_MAX) return text;
+  let end = EVENT_TEXT_MAX - 1;
+  // Keep the UTF-16 limit, but never leave half of an astral character before the ellipsis.
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end--;
+  return `${text.slice(0, end)}…`;
 }

@@ -97,8 +97,26 @@ describe("events — curation, masking and the bounded buffer", () => {
     const buffer = new EventBuffer({ runsDir: runs, dispatchId: "d1", runId: "r1" });
     buffer.push("text", "x".repeat(5_000));
     const [event] = buffer.drain();
-    expect(event!.text.length).toBeLessThanOrEqual(EVENT_TEXT_MAX);
+    expect(event!.text.length).toBe(EVENT_TEXT_MAX);
     expect(event!.text.endsWith("…")).toBe(true);
+  });
+
+  test("truncation never splits an astral character at the UTF-16 cut", () => {
+    const buffer = new EventBuffer({ runsDir: tmp(), dispatchId: "unicode", runId: "r1" });
+    const cases = [
+      { input: "x".repeat(2046) + "😀tail", expected: "x".repeat(2046) + "…", length: 2047 },
+      { input: "x".repeat(2045) + "😀tail", expected: "x".repeat(2045) + "😀…", length: 2048 },
+      { input: "x".repeat(2046) + "😀", expected: "x".repeat(2046) + "😀", length: 2048 },
+    ];
+    for (const { input, expected, length } of cases) {
+      buffer.push("text", input);
+      const text = buffer.drain()[0]!.text;
+      // With /u, a complete surrogate pair is one code point and cannot match.
+      expect(text).not.toMatch(/[\uD800-\uDFFF]/u);
+      expect(text).toBe(expected);
+      expect(text.length).toBe(length);
+      expect(JSON.parse(JSON.stringify(text))).toBe(text);
+    }
   });
 
   test("every delivered value is masked, in the buffer AND on disk", () => {
