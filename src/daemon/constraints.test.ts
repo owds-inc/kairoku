@@ -74,6 +74,28 @@ function productionSources(): Array<[string, string]> {
 }
 
 describe("SPEC constraints", () => {
+  test("src contains no absolute paths under the owner's home directory", () => {
+    // Forbid the owner's home prefix (Users/ + nihal), including in tests and
+    // comments. /Users/you and /Users/neil are deliberate synthetic fixtures.
+    // docs/plans/*.md and plugin/** are outside src/ and deliberately unguarded.
+    const ownerHome = ["/Users", "nihal"].join("/");
+    const scanned: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(path);
+        } else {
+          scanned.push(relative(repoDir, path));
+        }
+      }
+    };
+    walk(join(repoDir, "src"));
+    expect(scanned.length).toBeGreaterThan(0);
+    expect(scanned).toContain(join("src", "cli", "doctor.test.ts"));
+    expect(scanned.filter((name) => readFileSync(join(repoDir, name), "utf8").includes(ownerHome))).toEqual([]);
+  });
+
   test("the scan reaches every subdirectory, so no folder is a place the rules do not apply", () => {
     const names = productionSources().map(([name]) => name);
     expect(names).toContain("app.ts");
