@@ -119,10 +119,11 @@ describe("the plan skill's slot table", () => {
     // gone empty also reads as [], which `toEqual` would call agreement — the
     // `length > 0` assertion above is what refuses it, and this is the proof it has
     // something to refuse.
-    const emptied = JSON.parse(read(CONTRACT_DOC)) as { boxSlots?: Array<unknown> };
-    emptied.boxSlots = [];
-    expect(emptied.boxSlots.length > 0).toBe(false);
-    delete emptied.boxSlots;
-    expect(emptied.boxSlots ?? []).toEqual(slotRows("no table here"));
+    const dead = JSON.parse(read(CONTRACT_DOC)) as { boxSlots?: Array<{ name: string; docClass: string }> };
+    dead.boxSlots = [];
+    expect(dead.boxSlots.length > 0).toBe(false);
+    expect(dead.boxSlots).toEqual(slotRows("no table here"));
+    delete dead.boxSlots;
+    expect(dead.boxSlots).toBeUndefined();
   });
 });
