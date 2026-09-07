@@ -89,6 +89,46 @@ Preview: <URL once the deploy lands>
 The manual-test checkboxes go in **unticked, always**. They are the human's gate; an agent that
 pre-ticks them has removed the only check on its own work.
 
+### Which forge — read the remote, never a flag
+
+The `gh pr create` above is the GitHub path. Some Kairoku repos live on GitLab, where the same thing is
+a **merge request**. Decide from the origin remote's host, never from a flag and never by asking:
+
+```sh
+remote=$(git remote get-url origin)
+hostpath=${remote#*://}      # https:// and ssh:// lose their scheme; git@host:path is untouched
+authority=${hostpath%%/*}    # everything before the first path separator
+host=${authority##*@}        # drop any user@ prefix
+host=${host%%:*}             # drop a port, or the scp-form's :path
+```
+
+Both spellings git writes must land on the same answer — `https://gitlab.com/owds-inc/kairoku/kairokud.git`
+and `git@gitlab.com:owds-inc/kairoku/kairokud.git` — and a nested GitLab group is part of the path, not
+the host. Match the host exactly: a GitHub repo named `gitlab.com-mirror` is not GitLab.
+
+When the host is `gitlab.com`:
+
+```sh
+cat > /tmp/mr-body.md <<'EOF'
+<the same body as above, unchanged>
+EOF
+glab mr create --target-branch "$(git symbolic-ref --short refs/remotes/origin/HEAD | sed 's|^origin/||')" \
+  --title "<title>" --description "$(cat /tmp/mr-body.md)"
+```
+
+Three things that are not optional:
+
+- **Never a Draft.** No `--draft`, and no `Draft:` or `WIP:` prefix on the title — GitLab reads either as
+  draft state, and a draft MR is not the handoff this skill describes.
+- **The body is the same one**, from the epic and its stories: the heading, the stories table, Verification,
+  the **unticked** manual-test checkboxes, the Preview line. One template serves both forges.
+- **The body goes through a file written by a quoted heredoc**, never inline. In a shell a backtick inside a
+  double-quoted argument is command substitution, so an inline description silently eats every backticked
+  identifier in the body — and has spliced a command's output into a message here before.
+
+`glab mr create` and `glab mr update` take `--description` (short `-d`). There is no `--description-file`;
+reach for it and the command fails.
+
 After the PR is open: comment the URL on the epic and on each story, and transition the stories
 to *In Review* (see `jira-ops`).
 

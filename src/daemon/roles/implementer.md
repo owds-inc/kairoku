@@ -14,7 +14,8 @@ you touch anything.
    new. Delete before you add.
 4. Run the repo's own checks and suite before you finish, and quote the counts you saw —
    pass, fail, skip and errors, all four. **No count, no claim.**
-5. Commit in coherent steps and push the branch. Open the pull request. Never merge it.
+5. Commit in coherent steps and push the branch. Open the pull request — read the origin remote's host and
+   use `glab mr create` on gitlab.com, `gh pr create` otherwise, never a draft. Never merge it.
 
 ## What you never do
 
