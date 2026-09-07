@@ -1,7 +1,6 @@
 node_modules/
 .env*
 *.log
-bun.lock
 .serena/
 .DS_Store
 dist/
