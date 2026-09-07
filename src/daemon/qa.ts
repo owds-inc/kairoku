@@ -65,10 +65,48 @@ const goTest: Parser = (text) => {
   return pass + fail + skip === 0 ? undefined : { pass, fail, skip, errors: 0 };
 };
 
+/**
+ * cargo nextest: one `Summary [<time>] N tests run: …` line, and it is last.
+ *
+ * Reached ONLY through `parseSummary`'s command check, never by sniffing — see
+ * the comment there. `(N flaky, M leaky)` is read past and moves no count: a
+ * flake that did not recover is reported as `failed`, kairokud sets
+ * `retries = 1` so a flake is a routine event, and `runQa` catches a non-zero
+ * exit on its own. nextest has no error counter, so `errors` is always 0.
+ *
+ * The `, N skipped` clause is optional here because no recorded run of this
+ * workspace has had zero skipped, so whether nextest omits the clause at zero
+ * is untested. Defaulting to 0 is right either way.
+ */
+const nextest: Parser = (text) => {
+  const found = [...text.matchAll(/^\s*Summary \[[^\]]*\]\s+\d+\s+tests? run:\s*(.+)$/gm)];
+  const tail = found.length === 0 ? undefined : found[found.length - 1]![1];
+  if (tail === undefined) return undefined;
+  const read = (word: string): number | undefined => {
+    const hit = tail.match(new RegExp(`(\\d+) ${word}`));
+    return hit ? Number(hit[1]) : undefined;
+  };
+  const pass = read("passed");
+  // A summary line with no `passed` clause is a shape this parser has not seen.
+  // Counts unavailable is the honest answer; a guessed zero is not.
+  if (pass === undefined) return undefined;
+  return { pass, fail: read("failed") ?? 0, skip: read("skipped") ?? 0, errors: 0 };
+};
+
+/** `cargo nextest …`, with an optional `+toolchain` and any leading env prefix. */
+const NEXTEST_COMMAND = /(^|[\s;&|])cargo\s+(\+\S+\s+)?nextest\b/;
+
 /** Ordered: the most specific line shapes first, bun's loose one last. */
 const PARSERS: Parser[] = [vitest, jest, goTest, bun];
 
-export function parseSummary(text: string): SuiteCounts | undefined {
+export function parseSummary(text: string, command?: string): SuiteCounts | undefined {
+  // Selection is by the COMMAND the daemon just ran, never by sniffing the text.
+  // A failing Rust test's captured stdout is echoed into this output and can
+  // carry another runner's summary shape, so an ordered fallback could read a
+  // red suite as a clean one. And it FAILS CLOSED: a nextest run with no
+  // Summary line was cancelled or died, so it does not fall through to the
+  // other four.
+  if (command !== undefined && NEXTEST_COMMAND.test(command)) return nextest(text);
   for (const parser of PARSERS) {
     const counts = parser(text);
     if (counts) return counts;
@@ -294,7 +332,7 @@ export async function runQa(worktree: string, deps: QaDeps): Promise<QaResult> {
 
   const result = await withGate(plan.key, plan.concurrency, () => exec(plan.test!, worktree, env));
   const output = `${result.stdout}${result.stderr}`;
-  const counts = parseSummary(output);
+  const counts = parseSummary(output, plan.test);
 
   if (!counts) {
     return {
