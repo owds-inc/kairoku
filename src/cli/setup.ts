@@ -50,7 +50,9 @@ export const usage = `usage: kairoku setup [--plugin] [--daemon] [--all] [--yes]
   --app-token    its daemon credential — both are printed once by
                  Settings → Daemons in the app
   --link         bind a loopback listener and open the app's /link page in a
-                 browser to mint this machine's daemon token — ten minutes,
+                 browser; write the kairokud credential for the future Rust
+                 daemon. For the Bun daemon, still use --app-token or the
+                 prompt. Wait ten minutes for the browser callback,
                  then it gives up. A rerun replaces the token.`;
 
 function parse(args: string[]) {

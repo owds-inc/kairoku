@@ -49,7 +49,7 @@ export function daemonHome(io: Io): string | null {
 export interface DaemonStatus {
   version?: string;
   capacity?: { running: number; max: number };
-  link?: { linked?: boolean; liveness?: string; stopped?: string };
+  link?: { linked?: boolean; liveness?: string; stopped?: string; lastError?: string };
   runs?: unknown[];
 }
 
@@ -110,11 +110,19 @@ export async function appLink(
     runs === undefined
       ? warn("runs in flight", "unknown — the daemon is not answering")
       : pass("runs in flight", String(runs));
+  const linkErrors =
+    status === null
+      ? warn("link errors", "unknown — the daemon is not answering")
+      : status.link?.stopped
+        ? fail("link errors", `stopped: ${status.link.stopped} — ${status.link.lastError}`)
+        : status.link?.lastError
+          ? warn("link errors", status.link.lastError)
+          : pass("link errors", "none");
 
-  if (!result.ok) return [fail("app link", result.error), inFlight];
+  if (!result.ok) return [fail("app link", result.error), inFlight, linkErrors];
   const protocol = result.body.protocol ? `, protocol ${result.body.protocol}` : "";
   const cadence = `events flush: ${ACTIVE_FLUSH_MS / 1000} s while active`;
-  return [pass("app link", `${normaliseAppUrl(appUrl)} — ${result.body.liveness}${protocol}, ${cadence}`), inFlight];
+  return [pass("app link", `${normaliseAppUrl(appUrl)} — ${result.body.liveness}${protocol}, ${cadence}`), inFlight, linkErrors];
 }
 
 const NO_PLUGIN_PATH =
