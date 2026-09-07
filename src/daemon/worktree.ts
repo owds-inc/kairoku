@@ -2,15 +2,16 @@
  * Worktree lifecycle (SPEC §Worktree module).
  *
  * Create: `git fetch origin`, then `git worktree add -b run/<runId> <dir> <base>`
- * against the configured base checkout, then `bun install` and a copy of the
- * base checkout's `.env*` files.
+ * against the configured base checkout, then the install this repo's own
+ * lockfile names — none at all for a repo with no `package.json` — and a copy
+ * of the base checkout's `.env*` files.
  *
  * Teardown removes the worktree but KEEPS the `run/<runId>` branch: the run's
  * commits are the deliverable, and the v0 exit criterion requires each run's
  * branch to remain checkable from its ledger entry alone.
  */
 
-import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { copyFile, readdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
@@ -152,6 +153,48 @@ export async function copyEnvFiles(
   return envFiles.length;
 }
 
+/**
+ * R12 / DECISIONS §79.6(4) — the install a fresh worktree needs, chosen by the
+ * lockfile that is on disk the moment git finishes.
+ *
+ * NOT from `kairoku.json`: `create()` runs before the run has a manifest in
+ * hand, so a manifest-driven install would need an ordering this daemon does
+ * not have. The lockfile is already there, which makes the choice
+ * order-independent.
+ *
+ * NO `package.json` MEANS NO INSTALL. kairokud is a Rust workspace with none,
+ * and `bun install` there exits 1 with "Bun could not find a package.json file
+ * to install from" — which `must` turns into `worktree-setup-failed` before any
+ * role runs. That is the defect this exists for.
+ *
+ * `corepack pnpm` rather than a bare `pnpm`: it is what kairoku-desktop's own
+ * CI runs, and corepack ships with Node, so it needs nothing installed on the
+ * box beyond the Node this daemon already assumes.
+ *
+ * Only the two package managers this workspace's repos actually use are here.
+ * A yarn or npm branch would be a claim nothing exercises; add one the day a
+ * repo arrives with that lockfile.
+ */
+async function installDependencies(path: string): Promise<void> {
+  if (!existsSync(join(path, "package.json"))) return;
+  if (existsSync(join(path, "pnpm-lock.yaml"))) {
+    // Resolve `corepack` to an absolute path first — the daemon's own rule-3
+    // idiom (dispatch.ts:243, :260). `Bun.spawn` on a bare name resolves against
+    // the PATH captured at process start, so a PATH shadow (a test, or a service
+    // manager's PATH) would not reach a different corepack; the resolved path
+    // keeps `which` and `spawn` answering from the same PATH.
+    const corepack = Bun.which("corepack", { PATH: process.env.PATH ?? "" });
+    if (!corepack) {
+      throw new Error(
+        "corepack not found on PATH — a pnpm-lock.yaml repo needs it to install",
+      );
+    }
+    await must([corepack, "pnpm", "install", "--frozen-lockfile"], path);
+    return;
+  }
+  await must(["bun", "install"], path);
+}
+
 export function gitWorktreeOps(
   repoPath: string,
   worktreesDir: string,
@@ -180,7 +223,7 @@ export function gitWorktreeOps(
           repoPath,
         );
       });
-      await must(["bun", "install"], path);
+      await installDependencies(path);
       await copyEnvFiles(repoPath, path);
       return { path, branch };
     },
