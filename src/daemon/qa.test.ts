@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseManifest, type Manifest } from "./manifest";
@@ -63,6 +63,82 @@ describe("qa — the summary parsers (one per known runner)", () => {
   test("an unknown runner yields nothing — which the step treats as a failure", () => {
     expect(parseSummary("everything went great, honestly")).toBeUndefined();
     expect(parseSummary("")).toBeUndefined();
+  });
+});
+
+describe("qa — the cargo nextest parser (R12; DECISIONS §79.6 item 4)", () => {
+  // The three fixtures are summary lines this workspace recorded from real
+  // kairokud runs: CONTINUITY.md:213 (!115), :257 (!109) and :4228. The record
+  // strips nextest's own leading indentation, which is why test 4 asserts both.
+  const fixture = (name: string) =>
+    readFileSync(join(import.meta.dir, "..", "..", "fixtures", "nextest", name), "utf8");
+  const NEXTEST = "cargo nextest run --workspace --no-fail-fast";
+
+  test("a clean run reads 1671 / 0 / 3 / 0", () => {
+    expect(parseSummary(fixture("clean.txt"), NEXTEST)).toEqual({ pass: 1671, fail: 0, skip: 3, errors: 0 });
+  });
+
+  test("flaky and leaky move no count", () => {
+    expect(parseSummary(fixture("flaky-leaky.txt"), NEXTEST)).toEqual({ pass: 5986, fail: 0, skip: 3, errors: 0 });
+  });
+
+  test("a failure, and nextest's singular `1 test run:`", () => {
+    expect(parseSummary(fixture("failure.txt"), NEXTEST)).toEqual({ pass: 0, fail: 1, skip: 4213, errors: 0 });
+  });
+
+  test("the real indentation and the no-space bracket both parse", () => {
+    // The fixture strips nextest's leading indentation; real output indents it.
+    expect(parseSummary("     " + fixture("clean.txt"), NEXTEST)).toEqual({ pass: 1671, fail: 0, skip: 3, errors: 0 });
+    expect(
+      parseSummary("Summary [197.630s] 6063 tests run: 6063 passed (1 leaky), 2 skipped", NEXTEST),
+    ).toEqual({ pass: 6063, fail: 0, skip: 2, errors: 0 });
+  });
+
+  test("only the LAST Summary line is read", () => {
+    // The first line is synthetic — it stands in for a failing Rust test's
+    // captured stdout, and is not a recorded form.
+    expect(parseSummary("Summary [ 0.001s] 9 tests run: 9 passed, 0 skipped\n" + fixture("clean.txt"), NEXTEST)).toEqual({
+      pass: 1671,
+      fail: 0,
+      skip: 3,
+      errors: 0,
+    });
+  });
+
+  test("without the command the parser is unreachable — selection is not sniffing", () => {
+    expect(parseSummary(fixture("clean.txt"), NEXTEST)).toEqual({ pass: 1671, fail: 0, skip: 3, errors: 0 });
+    expect(parseSummary(fixture("clean.txt"))).toBeUndefined();
+    expect(parseSummary(fixture("clean.txt"), "bun test")).toBeUndefined();
+  });
+
+  test("a nextest command does not fall through to another parser", () => {
+    expect(parseSummary(" 341 pass\n 2 skip\n 1 fail\n", NEXTEST)).toBeUndefined();
+  });
+
+  test("a nextest run that printed no Summary is counts-unavailable, not zero", () => {
+    expect(parseSummary(fixture("clean.txt"), NEXTEST)).toEqual({ pass: 1671, fail: 0, skip: 3, errors: 0 });
+    expect(parseSummary("Canceling due to test failure", NEXTEST)).toBeUndefined();
+  });
+
+  test("a +toolchain or an env prefix still selects nextest; a wrapper script does not", () => {
+    expect(parseSummary(fixture("clean.txt"), "cargo +nightly nextest run")).toEqual({ pass: 1671, fail: 0, skip: 3, errors: 0 });
+    expect(parseSummary(fixture("clean.txt"), "env RUST_LOG=warn cargo nextest run -p kairokud")).toEqual({
+      pass: 1671,
+      fail: 0,
+      skip: 3,
+      errors: 0,
+    });
+    expect(parseSummary(fixture("clean.txt"), "./scripts/nextest-wrapper.sh")).toBeUndefined();
+  });
+
+  test("runQa reads a nextest suite through the plan's own command", async () => {
+    const plan = { check: [], test: NEXTEST, concurrency: 1, key: "owds-inc/kairoku", source: "kairoku.json" } satisfies QaPlan;
+    const result = await runQa("/wt", {
+      plan,
+      exec: async () => ({ code: 0, stdout: fixture("clean.txt"), stderr: "" }),
+    });
+    expect(result.ok).toBe(true);
+    expect(result.summary).toBe("QA: 1671 pass · 0 fail · 3 skip · 0 errors");
   });
 });
 
