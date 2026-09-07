@@ -52,6 +52,12 @@ export interface EnvProfile {
 }
 
 export interface Manifest {
+  /**
+   * §20.11's name for the pre-run step. PARSED AND VALIDATED, BUT NOT EXECUTED:
+   * nothing in this daemon runs these commands today. A repo's install or
+   * codegen belongs in `env.<profile>.init[]` (`environment.ts:168`), which does
+   * run, in the worktree, before both the agent and QA.
+   */
   readonly setup: string[];
   readonly env: Record<string, EnvProfile>;
   readonly check: string[];

@@ -4,7 +4,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -32,6 +32,19 @@ async function git(args: string[], cwd: string) {
     throw new Error(`git ${args.join(" ")}: ${result.stderr || result.stdout}`);
   }
   return result;
+}
+
+/** A second fixture repo in the same root, with a chosen file set. */
+async function fixtureRepo(name: string, files: Record<string, string>): Promise<string> {
+  const origin = join(root, `${name}-origin.git`);
+  const base = join(root, name);
+  await git(["init", "--bare", "--initial-branch=main", origin], root);
+  await git(["clone", origin, base], root);
+  for (const [file, body] of Object.entries(files)) writeFileSync(join(base, file), body);
+  await git(["add", "-A"], base);
+  await git(["commit", "-m", "fixture"], base);
+  await git(["push", "origin", "main"], base);
+  return base;
 }
 
 beforeEach(async () => {
@@ -180,6 +193,35 @@ describe("worktree", () => {
       /git could not be started in .*absent-checkout/,
     );
   });
+
+  test("a repo with no package.json gets NO install, and the worktree is still cut", async () => {
+    const base = await fixtureRepo("rust-repo", { "Cargo.toml": "[workspace]\n", "README.md": "fixture\n" });
+    const worktree = await gitWorktreeOps(base, worktreesDir).create("rust1");
+    expect(existsSync(join(worktree.path, "Cargo.toml"))).toBe(true);
+    expect(existsSync(join(worktree.path, "node_modules"))).toBe(false);
+  }, 30_000);
+
+  test("a pnpm repo is installed with corepack pnpm, never with bun", async () => {
+    const base = await fixtureRepo("pnpm-repo", {
+      "package.json": '{"name":"pnpm-fixture"}\n',
+      "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+    });
+    // A PATH-shadowing stub that records its argv — the same idiom e2e.test.ts:61-64
+    // uses for `glab`. No network, no real install.
+    const bin = join(root, "stub-bin");
+    mkdirSync(bin, { recursive: true });
+    const log = join(root, "corepack-argv.txt");
+    writeFileSync(join(bin, "corepack"), `#!/bin/sh\necho "$@" >> ${log}\nexit 0\n`);
+    chmodSync(join(bin, "corepack"), 0o755);
+    const previous = process.env.PATH;
+    process.env.PATH = `${bin}:${previous}`;
+    try {
+      await gitWorktreeOps(base, worktreesDir).create("pnpm1");
+    } finally {
+      process.env.PATH = previous;
+    }
+    expect(readFileSync(log, "utf8").trim()).toBe("pnpm install --frozen-lockfile");
+  }, 30_000);
 });
 
 describe("§20.9 — the checkout's own owner/name", () => {
