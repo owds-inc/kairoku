@@ -232,6 +232,7 @@ describe("kairoku doctor", () => {
       "daemon reachable": "PASS",
       "app link": "PASS",
       "runs in flight": "PASS",
+      "link errors": "PASS",
       "paseo.service": "PASS",
       "repo present": "PASS",
       "docker compose": "PASS",
@@ -250,6 +251,7 @@ describe("kairoku doctor", () => {
     // §23.2 — the curated-events cadence, off the heartbeat entirely.
     expect(byName(list, "app link")?.detail).toContain("events flush: 2 s while active");
     expect(byName(list, "runs in flight")?.detail).toBe("1");
+    expect(byName(list, "link errors")?.detail).toBe("none");
     expect(await run([], io)).toBe(0);
     expect(io.lines.some((l) => /^\s*PASS\s+daemon service/.test(l))).toBe(true);
     expect(io.lines.at(-1)).toContain("all checks passed");
@@ -291,15 +293,85 @@ describe("kairoku doctor", () => {
     expect(link.detail).toContain("kairoku setup --daemon");
   });
 
-  test("a daemon that is not listening fails reachability but the app link is still checked", async () => {
+  test("a successful heartbeat still reports the refused run verbatim", async () => {
     const io = linuxDaemon();
     const app = io.fetch;
-    io.fetch = async (url, init) =>
-      url.startsWith("http://10.0.0.5") ? Promise.reject(new Error("refused")) : app(url, init);
-    const list = await checks(io);
-    expect(byName(list, "daemon reachable")?.status).toBe("FAIL");
+    io.fetch = async (url, init) => {
+      const response = await app(url, init);
+      if (!url.endsWith("/status")) return response;
+      const status = await response.json();
+      status.link.lastError = "run r-1 of d-1: counts refused";
+      return Response.json(status);
+    };
+    const list = await checks(io, { probe: () => true });
     expect(byName(list, "app link")?.status).toBe("PASS");
-    expect(byName(list, "runs in flight")?.status).toBe("WARN");
+    expect(byName(list, "link errors")?.detail).toContain("r-1");
+    expect(byName(list, "link errors")).toEqual({
+      name: "link errors", status: "WARN", detail: "run r-1 of d-1: counts refused",
+    });
+    expect(await run([], io)).toBe(0);
+    expect(io.lines.some((line) => line.includes("WARN  link errors") && line.endsWith("run r-1 of d-1: counts refused"))).toBe(true);
+  });
+
+  test("a successful heartbeat does not hide a stopped daemon link", async () => {
+    const io = linuxDaemon();
+    const app = io.fetch;
+    io.fetch = async (url, init) => {
+      const response = await app(url, init);
+      if (!url.endsWith("/status")) return response;
+      const status = await response.json();
+      status.link.stopped = "token-rejected";
+      status.link.lastError = "token not accepted by https://app.test";
+      return Response.json(status);
+    };
+    const list = await checks(io, { probe: () => true });
+    expect(byName(list, "app link")?.status).toBe("PASS");
+    expect(byName(list, "link errors")).toEqual({
+      name: "link errors", status: "FAIL",
+      detail: "stopped: token-rejected — token not accepted by https://app.test",
+    });
+    expect(await run([], io)).toBe(1);
+  });
+
+  test("a failing heartbeat retains one link errors check after runs in flight", async () => {
+    for (const [link, expected] of [
+      [{ lastError: "run r-1 of d-1: counts refused" }, { status: "WARN", detail: "run r-1 of d-1: counts refused" }],
+      [{ stopped: "token-rejected", lastError: "token not accepted by https://app.test" },
+        { status: "FAIL", detail: "stopped: token-rejected — token not accepted by https://app.test" }],
+      [undefined, { status: "PASS", detail: "none" }],
+    ] as const) {
+      const io = linuxDaemon();
+      const app = io.fetch;
+      io.fetch = async (url, init) => {
+        if (url.endsWith("/heartbeat")) return new Response(null, { status: 503 });
+        const response = await app(url, init);
+        const status = await response.json();
+        status.link = link;
+        return Response.json(status);
+      };
+      const list = await checks(io, { probe: () => true });
+      expect(byName(list, "app link")?.status).toBe("FAIL");
+      expect(list.filter((check) => check.name === "link errors")).toEqual([{ name: "link errors", ...expected }]);
+      expect(list[list.findIndex((check) => check.name === "runs in flight") + 1]?.name).toBe("link errors");
+    }
+  });
+
+  test("a daemon that is not listening fails reachability but the app link is still checked", async () => {
+    for (const heartbeatOk of [true, false]) {
+      const io = linuxDaemon();
+      const app = io.fetch;
+      io.fetch = async (url, init) => {
+        if (url.startsWith("http://10.0.0.5")) throw new Error("refused");
+        return heartbeatOk ? app(url, init) : new Response(null, { status: 503 });
+      };
+      const list = await checks(io, { probe: () => true });
+      expect(byName(list, "daemon reachable")?.status).toBe("FAIL");
+      expect(byName(list, "app link")?.status).toBe(heartbeatOk ? "PASS" : "FAIL");
+      expect(byName(list, "runs in flight")?.status).toBe("WARN");
+      expect(byName(list, "link errors")).toEqual({
+        name: "link errors", status: "WARN", detail: "unknown — the daemon is not answering",
+      });
+    }
   });
 
   test("a dirty checkout is a WARN, a missing one a FAIL", async () => {
