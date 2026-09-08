@@ -32,7 +32,12 @@ function fakeCtx(script: {
       return { ok: true, summary: `${role} ok`, ...(next ?? {}) } as RoleTurn;
     },
     async qa() {
-      const result = script.qa?.[qaRuns] ?? { ok: true, summary: "QA: 10 pass", counts };
+      const result = script.qa?.[qaRuns] ?? {
+        ok: true,
+        summary: "QA: 10 pass",
+        counts,
+        provenance: "kairoku.json" as const,
+      };
       qaRuns++;
       return result;
     },
@@ -62,7 +67,26 @@ describe("recipes — solo (implementer → QA)", () => {
     const outcome = await recipeFor("solo")!(ctx);
     expect(ctx.calls.map((c) => c.role)).toEqual(["implementer"]);
     expect(ctx.qaRuns).toBe(1);
-    expect(outcome).toMatchObject({ ok: true, counts });
+    expect(outcome).toMatchObject({ ok: true, counts, provenance: "kairoku.json" });
+  });
+
+  test("qaGate carries plan.source as provenance for the wire emitter", async () => {
+    for (const provenance of ["kairoku.json", "package.json", "none"] as const) {
+      const ctx = fakeCtx({
+        qa: [{ ok: true, summary: "QA: 10 pass", counts, provenance }],
+      });
+      const outcome = await recipeFor("solo")!(ctx);
+      expect(outcome.provenance).toBe(provenance);
+      const wire = JSON.stringify({
+        dispatchId: "d",
+        runId: "r",
+        status: "done",
+        ...(outcome.provenance === undefined ? {} : { provenance: outcome.provenance }),
+      });
+      expect(wire).toContain(`"provenance":"${provenance}"`);
+    }
+    const without = JSON.stringify({ dispatchId: "d", runId: "r", status: "done" });
+    expect(without).not.toContain("provenance");
   });
 
   test("an implementer that fails stops before QA", async () => {
@@ -133,15 +157,16 @@ describe("recipes — build-verify (implementer → reviewer → fix loop → QA
       summary: "QA: 8 pass · 2 fail · 0 skip · 0 errors",
       counts: { pass: 8, fail: 2, skip: 0, errors: 0 },
       defect: "expected true to be false at a.test.ts:12",
+      provenance: "package.json",
     };
     const ctx = fakeCtx({
       turns: [undefined, { report: CLEAN }, undefined],
-      qa: [failing, { ok: true, summary: "QA: 10 pass", counts }],
+      qa: [failing, { ok: true, summary: "QA: 10 pass", counts, provenance: "package.json" }],
     });
     const outcome = await recipeFor("build-verify")!(ctx);
     expect(ctx.calls.map((c) => c.role)).toEqual(["implementer", "reviewer", "implementer"]);
     expect(ctx.calls[2]!.prompt).toContain("expected true to be false at a.test.ts:12");
-    expect(outcome).toMatchObject({ ok: true, counts });
+    expect(outcome).toMatchObject({ ok: true, counts, provenance: "package.json" });
   });
 
   test("two QA fix rounds and still failing reports the counts it actually saw", async () => {
@@ -150,11 +175,16 @@ describe("recipes — build-verify (implementer → reviewer → fix loop → QA
       summary: "QA: 8 pass · 2 fail · 0 skip · 0 errors",
       counts: { pass: 8, fail: 2, skip: 0, errors: 0 },
       defect: "nope",
+      provenance: "none",
     };
     const ctx = fakeCtx({ turns: [undefined, { report: CLEAN }], qa: [failing, failing, failing] });
     const outcome = await recipeFor("build-verify")!(ctx);
     expect(ctx.qaRuns).toBe(MAX_FIX_ROUNDS + 1);
-    expect(outcome).toMatchObject({ ok: false, counts: { pass: 8, fail: 2, skip: 0, errors: 0 } });
+    expect(outcome).toMatchObject({
+      ok: false,
+      counts: { pass: 8, fail: 2, skip: 0, errors: 0 },
+      provenance: "none",
+    });
   });
 });
 
@@ -166,6 +196,7 @@ describe("recipes — plan and research (the primary role, then a reviewer)", ()
     expect(outcome).toMatchObject({ ok: true, report: { phases: [] } });
     // No suite is run for a plan: there is nothing to test.
     expect(ctx.qaRuns).toBe(0);
+    expect(outcome.provenance).toBeUndefined();
   });
 
   test("research is researcher then reviewer", async () => {

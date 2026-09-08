@@ -246,6 +246,8 @@ export interface QaResult {
   readonly counts?: SuiteCounts;
   /** What the implementer's fix loop is given, verbatim. */
   readonly defect?: string;
+  /** Always `plan.source` — the wire provenance the CLI emits after p2-02b. */
+  readonly provenance: QaPlan["source"];
 }
 
 export interface QaDeps {
@@ -286,6 +288,7 @@ const shell = (command: string, cwd: string, env?: Record<string, string>) =>
 export async function runQa(worktree: string, deps: QaDeps): Promise<QaResult> {
   const { plan, env } = deps;
   const exec = deps.exec ?? shell;
+  const provenance = plan.source;
 
   // FIRST, before the repo's own commands. A violation is a defect the fix loop
   // can act on in seconds; making the agent wait out a full suite to hear it is
@@ -299,6 +302,7 @@ export async function runQa(worktree: string, deps: QaDeps): Promise<QaResult> {
         ok: false,
         summary: "QA: the repo's rules could not be checked",
         defect: scan.error,
+        provenance,
       };
     }
     if (scan.matches.length > 0) {
@@ -307,6 +311,7 @@ export async function runQa(worktree: string, deps: QaDeps): Promise<QaResult> {
         ok: false,
         summary: `QA: ${n} violation(s) of this repo's own rules (${[...new Set(scan.matches.map((m) => m.ruleId))].join(", ")})`,
         defect: formatMatches(scan.matches),
+        provenance,
       };
     }
   }
@@ -318,6 +323,7 @@ export async function runQa(worktree: string, deps: QaDeps): Promise<QaResult> {
         ok: false,
         summary: `QA: \`${command}\` exited ${result.code}`,
         defect: tail(`${result.stdout}${result.stderr}`),
+        provenance,
       };
     }
   }
@@ -327,6 +333,7 @@ export async function runQa(worktree: string, deps: QaDeps): Promise<QaResult> {
       ok: false,
       summary: "QA: no test command in this repo, so no suite can be cited (invariant 7)",
       defect: `No \`test\` in ${plan.source === "none" ? "kairoku.json or package.json" : plan.source}.`,
+      provenance,
     };
   }
 
@@ -339,6 +346,7 @@ export async function runQa(worktree: string, deps: QaDeps): Promise<QaResult> {
       ok: false,
       summary: `QA: counts unavailable — \`${plan.test}\` printed no summary this daemon can read`,
       defect: tail(output),
+      provenance,
     };
   }
   if (counts.fail > 0 || counts.errors > 0 || result.code !== 0) {
@@ -347,11 +355,13 @@ export async function runQa(worktree: string, deps: QaDeps): Promise<QaResult> {
       summary: `QA: ${counts.pass} pass · ${counts.fail} fail · ${counts.skip} skip · ${counts.errors} errors`,
       counts,
       defect: tail(output),
+      provenance,
     };
   }
   return {
     ok: true,
     summary: `QA: ${counts.pass} pass · ${counts.fail} fail · ${counts.skip} skip · ${counts.errors} errors`,
     counts,
+    provenance,
   };
 }

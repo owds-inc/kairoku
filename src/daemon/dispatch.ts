@@ -699,6 +699,7 @@ async function runMember(args: MemberArgs): Promise<void> {
     // A `failed` report needs no counts; a `done` implement run does, and a run
     // that never measured a suite has already failed for exactly that reason.
     ...(counts === undefined ? {} : { counts: counts as SuiteCounts }),
+    ...(outcome.provenance === undefined ? {} : { provenance: outcome.provenance }),
     ...(trailing.length === 0 ? {} : { events: trailing }),
   };
 

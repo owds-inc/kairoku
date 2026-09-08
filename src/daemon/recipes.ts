@@ -83,6 +83,8 @@ export interface MemberOutcome {
   readonly summary: string;
   readonly counts?: SuiteCounts;
   readonly report?: unknown;
+  /** Set when `qaGate` ran — CLI emitter for wire `provenance`. */
+  readonly provenance?: QaResult["provenance"];
 }
 
 export type Recipe = (ctx: MemberContext) => Promise<MemberOutcome>;
@@ -182,10 +184,20 @@ async function qaGate(ctx: MemberContext): Promise<MemberOutcome> {
     if (ctx.cancelled()) return CANCELLED;
     last = await ctx.qa();
     if (last.ok) {
-      return { ok: true, summary: last.summary, ...(last.counts === undefined ? {} : { counts: last.counts }) };
+      return {
+        ok: true,
+        summary: last.summary,
+        provenance: last.provenance,
+        ...(last.counts === undefined ? {} : { counts: last.counts }),
+      };
     }
     if (round >= MAX_FIX_ROUNDS) {
-      return { ok: false, summary: last.summary, ...(last.counts === undefined ? {} : { counts: last.counts }) };
+      return {
+        ok: false,
+        summary: last.summary,
+        provenance: last.provenance,
+        ...(last.counts === undefined ? {} : { counts: last.counts }),
+      };
     }
     if (ctx.cancelled()) return CANCELLED;
     const fix = await ctx.runRole("implementer", fixPrompt(ctx, "QA step", last.defect ? [last.defect] : []));
@@ -193,6 +205,7 @@ async function qaGate(ctx: MemberContext): Promise<MemberOutcome> {
       return {
         ok: false,
         summary: `the implementer failed on a QA fix round: ${fix.summary}`,
+        provenance: last.provenance,
         ...(last.counts === undefined ? {} : { counts: last.counts }),
       };
     }
