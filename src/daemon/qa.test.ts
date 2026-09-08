@@ -228,7 +228,21 @@ describe("qa — the step (§20 item 4, no model)", () => {
       },
     });
     expect(ran).toEqual(["true", "bun test"]);
-    expect(result).toMatchObject({ ok: true, counts: { pass: 10, fail: 0, skip: 0, errors: 0 } });
+    expect(result).toMatchObject({
+      ok: true,
+      counts: { pass: 10, fail: 0, skip: 0, errors: 0 },
+      provenance: "package.json",
+    });
+  });
+
+  test("runQa always returns plan.source as provenance (wire emitter)", async () => {
+    for (const source of ["kairoku.json", "package.json", "none"] as const) {
+      const result = await runQa("/wt", {
+        plan: { check: [], test: source === "none" ? undefined : "bun test", concurrency: 1, key: "k", source },
+        exec: async () => ({ code: 0, stdout: " 1 pass\n 0 fail\n", stderr: "" }),
+      });
+      expect(result.provenance).toBe(source);
+    }
   });
 
   test("a failing check stops before the test and attaches the last 100 lines", async () => {

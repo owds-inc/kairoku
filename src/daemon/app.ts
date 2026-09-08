@@ -83,6 +83,12 @@ export interface DaemonMeta {
 }
 
 /**
+ * Which manifest supplied the QA test command (wire `RunReport.provenance`).
+ * Values match kairokud `Provenance` serde renames exactly — no fourth variant.
+ */
+export type RunProvenance = "kairoku.json" | "package.json" | "none";
+
+/**
  * One report about one RUN. `status` is optional on a beat and required on
  * `/update`: a beat says what is happening, an update says what happened.
  */
@@ -96,6 +102,8 @@ export interface RunReport {
   readonly artifacts?: RunArtifacts;
   readonly counts?: SuiteCounts;
   readonly events?: RunEvent[];
+  /** Present once QA ran; omitted when the recipe never enters the QA gate. */
+  readonly provenance?: RunProvenance;
 }
 
 export interface HeartbeatBody {
