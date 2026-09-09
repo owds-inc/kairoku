@@ -20,7 +20,8 @@ describe("service files", () => {
     expect(unit).toContain("ExecStart=/home/neil/.local/bin/kairoku daemon\n");
   });
 
-  test("launchd agent is io.kairoku.daemon, kept alive, logging under ~/.kairoku", () => {
+  test("launchdPlist helper keeps historical Bun shape for label io.kairoku.daemon (install no longer writes it)", () => {
+    // Kept for format assertions / doctor label constant; Bun install refuses this label.
     const plist = launchdPlist({ execPath: "/opt/homebrew/bin/kairoku", home: "/Users/neil", path: "/opt/homebrew/bin:/usr/bin:/bin" });
     expect(plist.startsWith('<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist')).toBe(true);
     expect(plist).toContain("<key>Label</key>\n\t<string>io.kairoku.daemon</string>");

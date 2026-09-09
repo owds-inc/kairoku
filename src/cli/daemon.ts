@@ -2,9 +2,12 @@
  * `kairoku daemon` — the daemon in the foreground (SPEC v0, unchanged), and
  * `daemon install|start|stop|status` around it: a systemd unit on linux
  * (system when passwordless sudo is there, else a user unit with the manual
- * step named), a launchd agent on mac. `daemon prune` is the human-run
- * worktree cleanup. Install rewrites the service file only when its content
- * changes and never bounces a running daemon whose definition is unchanged.
+ * step named). On mac, LaunchAgent label `io.kairoku.daemon` is owned by
+ * Rust `kairokud` — Bun `install` refuses to write/bootstrap it; status may
+ * still report the label if a Rust agent is loaded. `daemon prune` is the
+ * human-run worktree cleanup. Linux install rewrites the unit only when its
+ * content changes and never bounces a running daemon whose definition is
+ * unchanged.
  */
 
 import { dirname, join } from "node:path";
@@ -12,14 +15,14 @@ import { kairokuHome } from "../daemon/config";
 import { main as prune } from "../daemon/prune";
 import { serve } from "../daemon/server";
 import type { Io } from "./io";
-import { LAUNCHD_LABEL, SYSTEMD_UNIT, launchdPlist, systemdUnit } from "./service";
+import { LAUNCHD_LABEL, SYSTEMD_UNIT, systemdUnit } from "./service";
 
 export const usage = `usage: kairoku daemon [install|start|stop|status|prune]
 
   (no verb)  run the daemon in the foreground until SIGTERM
-  install    write the service (systemd unit / launchd agent) and start it;
-             the file is rewritten only when its content changes, and an
-             unchanged, running daemon is left alone
+  install    linux: write the systemd unit and start it (rewritten only when
+             content changes; unchanged running daemon left alone).
+             mac: refused — io.kairoku.daemon is owned by Rust kairokud
   start      start the service
   stop       stop the service
   status     is the service running? (nonzero when not)
@@ -112,28 +115,24 @@ const plistPath = (io: Io) => join(io.home, "Library", "LaunchAgents", `${LAUNCH
 const target = (io: Io) => `gui/${io.uid}/${LAUNCHD_LABEL}`;
 const loaded = async (io: Io) => (await io.shell(["launchctl", "print", target(io)])).code === 0;
 
+/** Documented stop: Rust kairokud owns `io.kairoku.daemon` (Neil Q11 / §80). */
+export const MAC_LAUNCHAGENT_INSTALL_STOP =
+  `kairoku daemon install: ${LAUNCHD_LABEL} is owned by Rust kairokud — Bun CLI does not install or overwrite that LaunchAgent.\n` +
+  `Install the Mac service with kairokud (scripts/install.sh from the kairokud repo, or your kairokud install path).\n` +
+  `Do not use \`kairoku daemon install\` for this label.`;
+
 const mac: Record<string, Verb> = {
   async install(io) {
-    const path = plistPath(io);
-    const text = launchdPlist({ execPath: io.execPath, home: io.home, path: servicePath(io) });
-    const isLoaded = await loaded(io);
-    if (io.readFile(path) === text) {
-      if (isLoaded) {
-        io.out(`agent unchanged and ${LAUNCHD_LABEL} loaded — left running`);
-        return 0;
-      }
-      io.out("agent unchanged; loading it");
-    } else {
-      if (isLoaded) await io.shell(["launchctl", "bootout", target(io)]);
-      io.writeFile(path, text);
-      io.out(`agent written to ${path}`);
-    }
-    return (await io.shell(["launchctl", "bootstrap", `gui/${io.uid}`, path])).code;
+    // Refuse even when a plist already exists — never overwrite a Rust-owned agent.
+    io.err(MAC_LAUNCHAGENT_INSTALL_STOP);
+    return 1;
   },
   async start(io) {
     const path = plistPath(io);
     if (!io.exists(path)) {
-      io.err(`no agent at ${path} — run \`kairoku daemon install\` first`);
+      io.err(
+        `no agent at ${path} — install via kairokud (scripts/install.sh); Bun does not own ${LAUNCHD_LABEL}`,
+      );
       return 1;
     }
     const argv = (await loaded(io))
