@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { run } from "./daemon";
+import { MAC_LAUNCHAGENT_INSTALL_STOP, run } from "./daemon";
 import { LAUNCHD_LABEL, launchdPlist, systemdUnit } from "./service";
 import { fakeIo, type FakeIo } from "./testkit";
 
@@ -92,25 +92,23 @@ describe("kairoku daemon on mac", () => {
   }
   const rendered = () => launchdPlist({ execPath: "/opt/homebrew/bin/kairoku", home: "/Users/neil", path: "/opt/homebrew/bin:/Users/neil/.bun/bin:/usr/local/bin:/usr/bin:/bin" });
 
-  test("install writes the agent and bootstraps it", async () => {
+  test("install refuses io.kairoku.daemon — Rust kairokud owns the label", async () => {
     const io = mac(false);
-    expect(await run(["install"], io)).toBe(0);
-    expect(io.files[plistPath]).toBe(rendered());
-    expect(calls(io)).toEqual([`launchctl print ${target}`, `launchctl bootstrap gui/501 ${plistPath}`]);
+    expect(await run(["install"], io)).toBe(1);
+    expect(io.files[plistPath]).toBeUndefined();
+    expect(calls(io)).toEqual([]);
+    expect(io.errors.join("\n")).toBe(MAC_LAUNCHAGENT_INSTALL_STOP);
+    expect(io.errors.join("\n")).toContain("scripts/install.sh");
+    expect(io.errors.join("\n")).toContain("kairokud");
   });
 
-  test("install leaves an unchanged, loaded agent alone; a changed one is bounced", async () => {
+  test("install does not overwrite an existing plist (Rust or foreign)", async () => {
     const io = mac(true);
-    io.files[plistPath] = rendered();
-    expect(await run(["install"], io)).toBe(0);
-    expect(calls(io)).toEqual([`launchctl print ${target}`]);
-    expect(io.lines.join("\n")).toContain("left running");
-
-    const changed = mac(true);
-    changed.files[plistPath] = "old definition";
-    expect(await run(["install"], changed)).toBe(0);
-    expect(calls(changed)).toEqual([`launchctl print ${target}`, `launchctl bootout ${target}`, `launchctl bootstrap gui/501 ${plistPath}`]);
-    expect(changed.files[plistPath]).toBe(rendered());
+    io.files[plistPath] = "rust kairokud owns this";
+    expect(await run(["install"], io)).toBe(1);
+    expect(io.files[plistPath]).toBe("rust kairokud owns this");
+    expect(calls(io)).toEqual([]);
+    expect(io.errors.join("\n")).toContain("does not install or overwrite");
   });
 
   test("start bootstraps when unloaded, kickstarts when loaded; stop boots out; status prints the state", async () => {
@@ -132,10 +130,11 @@ describe("kairoku daemon on mac", () => {
     expect(io.lines.join("\n")).toContain("state = running");
   });
 
-  test("start without an installed agent says to install first", async () => {
+  test("start without an installed agent points at kairokud install", async () => {
     const io = mac(false);
     expect(await run(["start"], io)).toBe(1);
-    expect(io.errors.join("\n")).toContain("kairoku daemon install");
+    expect(io.errors.join("\n")).toContain("install via kairokud");
+    expect(io.errors.join("\n")).not.toContain("kairoku daemon install");
   });
 });
 

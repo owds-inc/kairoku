@@ -1,10 +1,17 @@
 /**
- * The daemon as a service: the systemd unit (linux) and the launchd agent
- * (mac), rendered as text. Neither carries the token — the daemon reads
+ * The daemon as a service: the systemd unit (linux) and helpers for the
+ * launchd agent label (mac). Neither carries the token — the daemon reads
  * `token.env` beside its config — so the files hold nothing secret.
+ *
+ * Mac LaunchAgent label `io.kairoku.daemon` is owned by Rust `kairokud`
+ * (Neil Q11 / DECISIONS §80). Bun CLI must not install or overwrite that
+ * label for MVP — `kairoku daemon install` refuses on darwin. The constant
+ * and `launchdPlist` remain so status/doctor can still report a Rust-owned
+ * agent already loaded, and tests can assert the historical Bun plist shape.
  */
 
 export const SYSTEMD_UNIT = "kairoku-daemon";
+/** Rust kairokud owns this LaunchAgent label; Bun install refuses to claim it. */
 export const LAUNCHD_LABEL = "io.kairoku.daemon";
 
 export function systemdUnit(o: { scope: "system" | "user"; execPath: string; user: string; path: string }): string {
