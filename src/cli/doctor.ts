@@ -45,12 +45,124 @@ export function daemonHome(io: Io): string | null {
   return null;
 }
 
+/**
+ * Slack install / probe view on `GET /status` (W3 Q14). Soft-parallel with
+ * kairokud: the Bun listener may omit this until the Rust daemon advertises
+ * it; doctor still reports WARN with an install hint. Never carries tokens.
+ *
+ * Field names track the expected kairokud freeze shape; reconcile if
+ * `lanes/post-w3/freeze.md` pins different keys.
+ */
+export interface SlackProbeView {
+  /** Catalog entry id when known (expected `slack` until freeze pins otherwise). */
+  entryId?: string;
+  /**
+   * Connection / install state. Recognized values:
+   * `installed` | `connected` | `ok` → PASS;
+   * `not_installed` | `absent` → WARN;
+   * `probe_failed` | `error` | `auth_required` | `expired` → FAIL;
+   * anything else with a safe `lastError` → FAIL; bare unknown → WARN.
+   */
+  status?: string;
+  /** Human-safe failure hint from the daemon — never a token. */
+  lastError?: string;
+  /** Connected workspace display name when available (safe to print). */
+  teamName?: string;
+  /** Whether a vault credential exists — boolean only. */
+  hasCredential?: boolean;
+}
+
 /** What `GET /status` answers; only the fields doctor reads are named. */
 export interface DaemonStatus {
   version?: string;
   capacity?: { running: number; max: number };
   link?: { linked?: boolean; liveness?: string; stopped?: string; lastError?: string };
   runs?: unknown[];
+  /** Optional Slack section — absent means the daemon does not report Slack yet. */
+  slack?: SlackProbeView | null;
+}
+
+/** Catalog id doctor looks for until post-w3 freeze pins the Slack entry. */
+export const SLACK_ENTRY_ID = "slack";
+
+const SLACK_CHECK = "slack connection";
+
+/**
+ * Strip anything that looks like a secret from doctor detail text. Tokens are
+ * read and sent elsewhere; they must never appear on a doctor line.
+ */
+export function redactSecrets(text: string): string {
+  return text
+    .replace(/\bxox[baprs](?:-[A-Za-z0-9]+)+\b/gi, "[redacted]")
+    .replace(/\bkai_[A-Za-z0-9._-]+\b/g, "[redacted]")
+    .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/\b(token|secret|password|client_secret)\s*[:=]\s*\S+/gi, "$1=[redacted]");
+}
+
+/**
+ * Q14 — Slack install / probe failure hints. Pure over a status snapshot so
+ * unit tests never need a live Slack or kairokud; live doctor passes
+ * `status?.slack` from `/status` (or undefined when the daemon omits it).
+ */
+export function slackCheck(view: SlackProbeView | null | undefined, daemonAnswered: boolean): Check {
+  if (!daemonAnswered) {
+    return warn(SLACK_CHECK, "unknown — the daemon is not answering");
+  }
+  if (view == null || typeof view !== "object") {
+    return warn(
+      SLACK_CHECK,
+      "not installed — connect Slack in desktop Connections (full install / OAuth stays there)",
+    );
+  }
+
+  const rawStatus = typeof view.status === "string" ? view.status.trim().toLowerCase() : "";
+  const team =
+    typeof view.teamName === "string" && view.teamName.trim() ? view.teamName.trim() : undefined;
+  const safeError =
+    typeof view.lastError === "string" && view.lastError.trim()
+      ? redactSecrets(view.lastError.trim())
+      : undefined;
+  const entry =
+    typeof view.entryId === "string" && view.entryId.trim() ? view.entryId.trim() : SLACK_ENTRY_ID;
+
+  if (rawStatus === "installed" || rawStatus === "connected" || rawStatus === "ok") {
+    const where = team ? ` — ${team}` : view.hasCredential === true ? " — credential present" : "";
+    return pass(SLACK_CHECK, `${entry}${where}`);
+  }
+
+  if (rawStatus === "not_installed" || rawStatus === "absent" || rawStatus === "") {
+    return warn(
+      SLACK_CHECK,
+      "not installed — connect Slack in desktop Connections (full install / OAuth stays there)",
+    );
+  }
+
+  if (rawStatus === "auth_required" || rawStatus === "expired") {
+    return fail(
+      SLACK_CHECK,
+      safeError
+        ? `${safeError} — complete Slack OAuth in desktop Connections`
+        : "auth required — complete Slack OAuth in desktop Connections",
+    );
+  }
+
+  if (rawStatus === "probe_failed" || rawStatus === "error") {
+    return fail(
+      SLACK_CHECK,
+      safeError
+        ? `${safeError} — reconnect Slack in desktop Connections`
+        : "probe failed — reconnect Slack in desktop Connections",
+    );
+  }
+
+  // Unknown status string: prefer a FAIL when the daemon named an error, else WARN.
+  if (safeError) {
+    return fail(SLACK_CHECK, `${safeError} — reconnect Slack in desktop Connections`);
+  }
+  return warn(
+    SLACK_CHECK,
+    `status "${redactSecrets(view.status ?? "")}" — check Slack in desktop Connections`,
+  );
 }
 
 /**
@@ -457,6 +569,10 @@ export async function checks(io: Io, probe?: PortDeps): Promise<Check[]> {
       : fail("daemon reachable", "cannot test — listen host/port is missing from config.json"),
   );
   out.push(...(await appLink(io, config.appUrl, token, status)));
+  // Q14 — Slack install / probe hints. Reads optional `status.slack` only; never
+  // prints tokens. Absent field → WARN with desktop install hint (soft-parallel
+  // until kairokud advertises the section).
+  out.push(slackCheck(status?.slack ?? undefined, status !== null));
   out.push(...(await environment(io, config, probe)));
 
   if (io.platform === "linux") {
