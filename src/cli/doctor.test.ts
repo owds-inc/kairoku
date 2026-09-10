@@ -80,6 +80,8 @@ function linuxDaemon(): FakeIo {
         capacity: { running: 1, max: 2 },
         link: { linked: true, appUrl: "https://app.test", liveness: "online", protocol: "1", runsInFlight: 1, pendingReports: 0 },
         runs: [{ dispatchId: "d-1", status: "running", startedAt: "t", branch: "run/d-1" }],
+        // Q14 — healthy Slack section so the full-VM suite stays all-PASS.
+        slack: { entryId: "slack", status: "connected", teamName: "Acme Workspace", hasCredential: true },
       });
     }
     // The app: one real heartbeat, exactly as the daemon would send it.
@@ -233,6 +235,7 @@ describe("kairoku doctor", () => {
       "app link": "PASS",
       "runs in flight": "PASS",
       "link errors": "PASS",
+      "slack connection": "PASS",
       "paseo.service": "PASS",
       "repo present": "PASS",
       "docker compose": "PASS",
@@ -252,6 +255,7 @@ describe("kairoku doctor", () => {
     expect(byName(list, "app link")?.detail).toContain("events flush: 2 s while active");
     expect(byName(list, "runs in flight")?.detail).toBe("1");
     expect(byName(list, "link errors")?.detail).toBe("none");
+    expect(byName(list, "slack connection")?.detail).toContain("Acme Workspace");
     expect(await run([], io)).toBe(0);
     expect(io.lines.some((l) => /^\s*PASS\s+daemon service/.test(l))).toBe(true);
     expect(io.lines.at(-1)).toContain("all checks passed");
@@ -582,5 +586,121 @@ describe("§21 — doctor's three new lines", () => {
     io.bins.delete("codex");
     const list = await checks(io, { probe: () => true });
     expect(byName(list, "codex MCP is a human login")?.status).toBe("PASS");
+  });
+});
+
+// -------------------------------------------------------------- W3 Q14 Slack
+
+describe("Q14 — Slack connection doctor", () => {
+  test("a connected Slack section PASSes with the team name and never echoes secrets", async () => {
+    const io = linuxDaemon();
+    const list = await checks(io, { probe: () => true });
+    const check = byName(list, "slack connection")!;
+    expect(check.status).toBe("PASS");
+    expect(check.detail).toContain("Acme Workspace");
+    expect(JSON.stringify(list)).not.toMatch(/xox[baprs]-/i);
+  });
+
+  test("absent slack on /status is a WARN naming desktop Connections", async () => {
+    const io = linuxDaemon();
+    const app = io.fetch;
+    io.fetch = async (url, init) => {
+      if (!url.endsWith("/status")) return app(url, init);
+      const status = await (await app(url, init)).json();
+      delete status.slack;
+      return Response.json(status);
+    };
+    const check = byName(await checks(io, { probe: () => true }), "slack connection");
+    expect(check?.status).toBe("WARN");
+    expect(check?.detail).toContain("desktop Connections");
+    expect(await run([], io)).toBe(0);
+  });
+
+  test("not_installed is a WARN with the install hint", async () => {
+    const io = linuxDaemon();
+    const app = io.fetch;
+    io.fetch = async (url, init) => {
+      if (!url.endsWith("/status")) return app(url, init);
+      const status = await (await app(url, init)).json();
+      status.slack = { entryId: "slack", status: "not_installed" };
+      return Response.json(status);
+    };
+    const check = byName(await checks(io, { probe: () => true }), "slack connection");
+    expect(check).toEqual({
+      name: "slack connection",
+      status: "WARN",
+      detail: "not installed — connect Slack in desktop Connections (full install / OAuth stays there)",
+    });
+  });
+
+  test("probe_failed FAILs with an actionable reconnect hint", async () => {
+    const io = linuxDaemon();
+    const app = io.fetch;
+    io.fetch = async (url, init) => {
+      if (!url.endsWith("/status")) return app(url, init);
+      const status = await (await app(url, init)).json();
+      status.slack = { status: "probe_failed", lastError: "auth.test refused" };
+      return Response.json(status);
+    };
+    const check = byName(await checks(io, { probe: () => true }), "slack connection");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain("auth.test refused");
+    expect(check?.detail).toContain("desktop Connections");
+    expect(await run([], io)).toBe(1);
+  });
+
+  test("auth_required FAILs naming OAuth in desktop", async () => {
+    const io = linuxDaemon();
+    const app = io.fetch;
+    io.fetch = async (url, init) => {
+      if (!url.endsWith("/status")) return app(url, init);
+      const status = await (await app(url, init)).json();
+      status.slack = { status: "auth_required" };
+      return Response.json(status);
+    };
+    const check = byName(await checks(io, { probe: () => true }), "slack connection");
+    expect(check?.status).toBe("FAIL");
+    expect(check?.detail).toContain("OAuth");
+    expect(check?.detail).toContain("desktop Connections");
+  });
+
+  test("a token-shaped lastError is redacted and never printed", async () => {
+    const io = linuxDaemon();
+    const leak = "xoxb-1234567890-abcdefghijklmnop";
+    const app = io.fetch;
+    io.fetch = async (url, init) => {
+      if (!url.endsWith("/status")) return app(url, init);
+      const status = await (await app(url, init)).json();
+      status.slack = { status: "error", lastError: `refresh failed with ${leak}` };
+      return Response.json(status);
+    };
+    const list = await checks(io, { probe: () => true });
+    const check = byName(list, "slack connection")!;
+    expect(check.status).toBe("FAIL");
+    expect(check.detail).toContain("[redacted]");
+    expect(check.detail).not.toContain(leak);
+    expect(JSON.stringify(list)).not.toContain(leak);
+    expect(await run([], io)).toBe(1);
+    expect(io.lines.join("\n")).not.toContain(leak);
+  });
+
+  test("a daemon that is not listening WARNs Slack as unknown", async () => {
+    const io = linuxDaemon();
+    const app = io.fetch;
+    io.fetch = async (url, init) => {
+      if (url.startsWith("http://10.0.0.5")) throw new Error("refused");
+      return app(url, init);
+    };
+    const check = byName(await checks(io, { probe: () => true }), "slack connection");
+    expect(check).toEqual({
+      name: "slack connection",
+      status: "WARN",
+      detail: "unknown — the daemon is not answering",
+    });
+  });
+
+  test("a laptop without a daemon skips the Slack line entirely", async () => {
+    const list = await checks(laptop());
+    expect(byName(list, "slack connection")).toBeUndefined();
   });
 });
