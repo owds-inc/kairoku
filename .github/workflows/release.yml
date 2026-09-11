@@ -7,6 +7,10 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      # Step-level `if:` cannot read the `secrets` context, so the tap token is
+      # surfaced as an env var and the push step skips itself when it is unset.
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -18,7 +22,43 @@ jobs:
       - run: bun test
       - run: bunx tsc --noEmit
       - run: bun run build:release
+      # cut.ts accepts a prerelease version and the trigger is `v*`, so mark one as
+      # such: an unmarked prerelease becomes `releases/latest`, which is exactly what
+      # install.sh and `kairoku update` resolve. Same `*-*` guard kairokud's publish
+      # job uses.
       - name: publish
-        run: gh release create "$GITHUB_REF_NAME" dist/kairoku-* dist/checksums.txt dist/kairoku.rb --title "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          case "$GITHUB_REF_NAME" in *-*) PRERELEASE=--prerelease ;; *) PRERELEASE= ;; esac
+          gh release create "$GITHUB_REF_NAME" $PRERELEASE \
+            dist/kairoku-* dist/checksums.txt dist/kairoku.rb \
+            --title "$GITHUB_REF_NAME" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
+      # The formula build-release.ts renders already carries this release's URLs
+      # and checksums, so the tap only ever needs the file copied in. Skipped
+      # (not failed) when HOMEBREW_TAP_TOKEN is not configured, and never run for a
+      # prerelease tag — the tap is what `brew install owds-inc/tap/kairoku` resolves,
+      # so a beta must not become the default formula.
+      - name: push the formula to owds-inc/homebrew-tap
+        if: env.HOMEBREW_TAP_TOKEN != '' && !contains(github.ref_name, '-')
+        run: |
+          # Credential as a per-invocation header, not in the remote URL: a URL
+          # credential is persisted into tap/.git/config for the rest of the job and
+          # appears in any URL git echoes on failure. `git -c` (before the subcommand)
+          # is not written to the new repo's config, unlike `git clone -c`.
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$HOMEBREW_TAP_TOKEN" | base64 -w0)"
+          git -c http.extraheader="$AUTH" clone --depth 1 \
+            https://github.com/owds-inc/homebrew-tap.git tap
+          install -m 644 dist/kairoku.rb tap/Formula/kairoku.rb
+          cd tap
+          git add Formula/kairoku.rb
+          # "Nothing changed" is the only clean skip. Letting `commit` fail open also
+          # swallowed pathspec, hook and permission errors, leaving the tap on the
+          # previous version while the release went green.
+          if git diff --cached --quiet; then
+            echo "formula already matches $GITHUB_REF_NAME"
+            exit 0
+          fi
+          git -c user.name="kairoku-release" -c user.email="hello@kairoku.io" \
+            commit -m "kairoku $GITHUB_REF_NAME" -- Formula/kairoku.rb
+          git -c http.extraheader="$AUTH" push
