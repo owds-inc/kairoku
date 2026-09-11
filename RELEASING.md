@@ -49,6 +49,19 @@ On a `v*` tag it:
    `HOMEBREW_TAP_TOKEN` is not configured, and exits cleanly when the formula
    already matches.
 
+### Prerelease tags
+
+A tag with a prerelease suffix (`v1.0.1-beta.1` — `bun run cut` accepts one) is
+published with `--prerelease`, and the tap push is **skipped**. Both matter
+because the two default install paths resolve a pointer, not a tag:
+
+- `install.sh` downloads from `releases/latest/download`, and `kairoku update`
+  reads `releases/latest` — a prerelease not marked as one *is* `latest`;
+- the tap is what `brew install owds-inc/tap/kairoku` resolves, so a beta formula
+  there would become the default install.
+
+Promote a prerelease by cutting the final version and tagging that.
+
 Installing is then `brew install owds-inc/tap/kairoku`.
 
 ## Required secrets
