@@ -7,6 +7,10 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      # Step-level `if:` cannot read the `secrets` context, so the tap token is
+      # surfaced as an env var and the push step skips itself when it is unset.
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -22,3 +26,17 @@ jobs:
         run: gh release create "$GITHUB_REF_NAME" dist/kairoku-* dist/checksums.txt dist/kairoku.rb --title "$GITHUB_REF_NAME" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
+      # The formula build-release.ts renders already carries this release's URLs
+      # and checksums, so the tap only ever needs the file copied in. Skipped
+      # (not failed) when HOMEBREW_TAP_TOKEN is not configured.
+      - name: push the formula to owds-inc/homebrew-tap
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:$HOMEBREW_TAP_TOKEN@github.com/owds-inc/homebrew-tap.git" tap
+          install -m 644 dist/kairoku.rb tap/Formula/kairoku.rb
+          cd tap
+          git -c user.name="kairoku-release" -c user.email="hello@kairoku.io" \
+            commit -m "kairoku $GITHUB_REF_NAME" -- Formula/kairoku.rb || {
+              echo "formula already matches $GITHUB_REF_NAME"; exit 0; }
+          git push

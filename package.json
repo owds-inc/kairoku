@@ -12,6 +12,7 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "build:release": "bun run scripts/build-release.ts",
+    "cut": "bun run scripts/cut.ts",
     "prune": "bun run src/daemon/prune.ts"
   },
   "devDependencies": {
