@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checks, run, type Check } from "./doctor";
+import { checks, kairokudRpc, run, type Check } from "./doctor";
 import { fakeIo, type FakeIo } from "./testkit";
 
 /** A directory registration left behind by a repo move — the shape cli-4 measured on a real machine. */
@@ -854,11 +854,78 @@ describe("desktop daemon (kairokud)", () => {
     const dir = mkdtempSync(join(tmpdir(), "kairoku-kairokud-"));
     dirs.push(dir);
     const socketPath = join(dir, "kairokud.sock");
+    // A real leftover file on disk, so `Bun.connect` refuses it the way it does
+    // after a crash — not an in-memory fake the production `Io` cannot produce.
+    writeFileSync(socketPath, "");
     const io = laptop();
     io.env.KAIROKUD_SOCKET = socketPath;
     io.files[socketPath] = "";
     const check = byName(await checks(io), "desktop daemon (kairokud)")!;
     expect(check.status).toBe("WARN");
     expect(check.detail).toContain("did not answer");
+  });
+
+  test("a daemon that answers one method and hangs up reports that, never a version", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "kairoku-kairokud-"));
+    dirs.push(dir);
+    const socketPath = join(dir, "kairokud.sock");
+    servers.push(
+      Bun.listen({
+        unix: socketPath,
+        socket: {
+          data(socket, chunk) {
+            for (const line of chunk.toString().split("\n")) {
+              if (!line.trim()) continue;
+              const req = JSON.parse(line) as { id: number; method: string };
+              if (req.method !== "integration.slack.status") continue; // system.status never answered
+              socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: req.id, result: slackStatus({}) })}\n`);
+              socket.end();
+            }
+          },
+        },
+      }),
+    );
+    const io = laptop();
+    io.env.KAIROKUD_SOCKET = socketPath;
+    io.files[socketPath] = "";
+    const list = await checks(io);
+    expect(byName(list, "desktop daemon (kairokud)")).toEqual({
+      name: "desktop daemon (kairokud)",
+      status: "WARN",
+      detail: `${socketPath} did not answer system.status`,
+    });
+    // The one answer that did arrive is still reported, and neither row FAILs.
+    expect(byName(list, "desktop daemon slack")?.status).toBe("WARN");
+    expect(await run([], io)).toBe(0);
+  });
+
+  test("replies are matched by id, out of order and across a split frame", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "kairoku-kairokud-"));
+    dirs.push(dir);
+    const socketPath = join(dir, "kairokud.sock");
+    servers.push(
+      Bun.listen({
+        unix: socketPath,
+        socket: {
+          data(socket, chunk) {
+            const ids = chunk
+              .toString()
+              .split("\n")
+              .filter((line) => line.trim())
+              .map((line) => (JSON.parse(line) as { id: number }).id);
+            if (ids.length < 2) return;
+            // Second method first, both frames in one write, cut mid-frame.
+            const frames =
+              `${JSON.stringify({ jsonrpc: "2.0", id: ids[1], result: { n: 2 } })}\n` +
+              `${JSON.stringify({ jsonrpc: "2.0", id: ids[0], result: { n: 1 } })}\n`;
+            socket.write(frames.slice(0, 9));
+            socket.write(frames.slice(9));
+          },
+        },
+      }),
+    );
+    const [first, second] = await kairokudRpc(socketPath, ["system.status", "integration.slack.status"], 2_000);
+    expect(first?.result).toEqual({ n: 1 });
+    expect(second?.result).toEqual({ n: 2 });
   });
 });

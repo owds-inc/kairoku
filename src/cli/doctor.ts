@@ -203,16 +203,27 @@ export type RpcReply = { id?: unknown; result?: unknown; error?: { message?: str
  * these frames). Reaching the 0600 socket IS the trust boundary. The listener
  * can also PUSH `events.event` notifications; doctor never subscribes, and
  * matching on a numeric `id` drops one if it ever arrives anyway.
+ *
+ * A method the daemon never answers comes back `undefined` rather than
+ * failing the whole call: one slow method must not make doctor claim a daemon
+ * that just told us its version is not running.
  */
-export async function kairokudRpc(socketPath: string, methods: string[], timeoutMs = 3000): Promise<RpcReply[]> {
-  let resolve!: (replies: RpcReply[]) => void;
+export async function kairokudRpc(
+  socketPath: string,
+  methods: string[],
+  timeoutMs = 3000,
+): Promise<(RpcReply | undefined)[]> {
+  let resolve!: (replies: (RpcReply | undefined)[]) => void;
   let reject!: (error: Error) => void;
-  const answered = new Promise<RpcReply[]>((res, rej) => {
+  const answered = new Promise<(RpcReply | undefined)[]>((res, rej) => {
     resolve = res;
     reject = rej;
   });
   const replies = new Map<number, RpcReply>();
   let buffer = "";
+  const collected = () => methods.map((_, i) => replies.get(i + 1));
+  /** Whatever arrived is worth reporting; nothing at all means nobody is serving. */
+  const settle = (why: string) => (replies.size ? resolve(collected()) : reject(new Error(why)));
 
   const conn = await Bun.connect({
     unix: socketPath,
@@ -231,14 +242,16 @@ export async function kairokudRpc(socketPath: string, methods: string[], timeout
           }
           if (typeof frame.id !== "number") continue; // a server-initiated notification
           replies.set(frame.id, frame);
-          if (replies.size >= methods.length) resolve(methods.map((_, i) => replies.get(i + 1)!));
+          // Every id, not just the right count: an extra frame must not pass
+          // for an answer we never got.
+          if (methods.every((_, i) => replies.has(i + 1))) resolve(collected());
         }
       },
       error: (_socket, error) => reject(error),
-      close: () => reject(new Error("the daemon closed the connection without answering")),
+      close: () => settle("the daemon closed the connection without answering"),
     },
   });
-  const timer = setTimeout(() => reject(new Error(`no answer within ${timeoutMs} ms`)), timeoutMs);
+  const timer = setTimeout(() => settle(`no answer within ${timeoutMs} ms`), timeoutMs);
   try {
     for (const [i, method] of methods.entries()) {
       conn.write(`${JSON.stringify({ jsonrpc: "2.0", id: i + 1, method, params: {} })}\n`);
@@ -302,7 +315,7 @@ export async function kairokudChecks(io: Io): Promise<Check[]> {
   const socket = kairokudSocket(io);
   if (!io.exists(socket)) return [warn(KAIROKUD_CHECK, `desktop daemon not running — no socket at ${socket}`)];
 
-  let replies: RpcReply[];
+  let replies: (RpcReply | undefined)[];
   try {
     replies = await kairokudRpc(socket, ["system.status", "integration.slack.status"]);
   } catch (error) {
@@ -314,10 +327,13 @@ export async function kairokudChecks(io: Io): Promise<Check[]> {
 
   const [system, slack] = replies;
   const out: Check[] = [];
-  if (system?.error) {
+  if (system === undefined) {
+    // The socket answered something, but not this: report that, never a version.
+    out.push(warn(KAIROKUD_CHECK, `${socket} did not answer system.status`));
+  } else if (system.error) {
     out.push(warn(KAIROKUD_CHECK, redactSecrets(system.error.message ?? "system.status failed")));
   } else {
-    const status = (system?.result ?? {}) as { version?: unknown; uptimeSeconds?: unknown };
+    const status = (system.result ?? {}) as { version?: unknown; uptimeSeconds?: unknown };
     const version = typeof status.version === "string" && status.version ? status.version : "unknown version";
     const up = typeof status.uptimeSeconds === "number" ? `, up ${uptime(status.uptimeSeconds)}` : "";
     out.push(pass(KAIROKUD_CHECK, `${version}${up} — ${socket}`));
