@@ -1,4 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { checks, run, type Check } from "./doctor";
 import { fakeIo, type FakeIo } from "./testkit";
 
@@ -106,7 +109,7 @@ const byName = (list: Check[], name: string) => list.find((c) => c.name === name
 const statuses = (list: Check[]) => Object.fromEntries(list.map((c) => [c.name, c.status]));
 
 describe("kairoku doctor", () => {
-  test("a laptop with only the plugin passes; the daemon section is one WARN", async () => {
+  test("a laptop with only the plugin passes; the desktop and daemon sections WARN", async () => {
     const io = laptop();
     const list = await checks(io);
     expect(statuses(list)).toEqual({
@@ -114,6 +117,7 @@ describe("kairoku doctor", () => {
       "kairoku plugin installed": "PASS",
       "kairoku marketplace source": "PASS",
       "kairoku plugin path": "PASS",
+      "desktop daemon (kairokud)": "WARN",
       "daemon configured": "WARN",
     });
     expect(byName(list, "daemon configured")?.detail).toContain("kairoku setup --daemon");
@@ -231,6 +235,7 @@ describe("kairoku doctor", () => {
       "config.json": "PASS",
       "token.env": "PASS",
       "daemon service": "PASS",
+      "desktop daemon (kairokud)": "WARN",
       "daemon reachable": "PASS",
       "app link": "PASS",
       "runs in flight": "PASS",
@@ -256,6 +261,8 @@ describe("kairoku doctor", () => {
     expect(byName(list, "runs in flight")?.detail).toBe("1");
     expect(byName(list, "link errors")?.detail).toBe("none");
     expect(byName(list, "slack connection")?.detail).toContain("Acme Workspace");
+    // The one WARN: a headless runner carries no desktop daemon, and that is fine.
+    expect(byName(list, "desktop daemon (kairokud)")?.detail).toContain("not running");
     expect(await run([], io)).toBe(0);
     expect(io.lines.some((l) => /^\s*PASS\s+daemon service/.test(l))).toBe(true);
     expect(io.lines.at(-1)).toContain("all checks passed");
@@ -601,7 +608,7 @@ describe("Q14 — Slack connection doctor", () => {
     expect(JSON.stringify(list)).not.toMatch(/xox[baprs]-/i);
   });
 
-  test("absent slack on /status is a WARN naming desktop Connections", async () => {
+  test("absent slack on /status emits no row at all — the runner never reports Slack", async () => {
     const io = linuxDaemon();
     const app = io.fetch;
     io.fetch = async (url, init) => {
@@ -610,9 +617,7 @@ describe("Q14 — Slack connection doctor", () => {
       delete status.slack;
       return Response.json(status);
     };
-    const check = byName(await checks(io, { probe: () => true }), "slack connection");
-    expect(check?.status).toBe("WARN");
-    expect(check?.detail).toContain("desktop Connections");
+    expect(byName(await checks(io, { probe: () => true }), "slack connection")).toBeUndefined();
     expect(await run([], io)).toBe(0);
   });
 
@@ -684,23 +689,176 @@ describe("Q14 — Slack connection doctor", () => {
     expect(io.lines.join("\n")).not.toContain(leak);
   });
 
-  test("a daemon that is not listening WARNs Slack as unknown", async () => {
+  test("a runner that is not listening emits no Slack row — kairokud owns that answer", async () => {
     const io = linuxDaemon();
     const app = io.fetch;
     io.fetch = async (url, init) => {
       if (url.startsWith("http://10.0.0.5")) throw new Error("refused");
       return app(url, init);
     };
-    const check = byName(await checks(io, { probe: () => true }), "slack connection");
-    expect(check).toEqual({
-      name: "slack connection",
-      status: "WARN",
-      detail: "unknown — the daemon is not answering",
-    });
+    const list = await checks(io, { probe: () => true });
+    expect(byName(list, "slack connection")).toBeUndefined();
+    expect(byName(list, "daemon reachable")?.status).toBe("FAIL");
   });
 
   test("a laptop without a daemon skips the Slack line entirely", async () => {
     const list = await checks(laptop());
     expect(byName(list, "slack connection")).toBeUndefined();
+  });
+});
+// ------------------------------------------ the desktop daemon (kairokud) group
+
+/**
+ * A fake kairokud local listener: newline-delimited JSON-RPC 2.0 over a Unix
+ * socket, the framing `crates/kairoku-transport/src/listener.rs` serves and
+ * `crates/kairokud/src/client.rs` writes. `answers` is keyed by method.
+ */
+function fakeKairokud(socketPath: string, answers: Record<string, unknown>) {
+  return Bun.listen({
+    unix: socketPath,
+    socket: {
+      data(socket, chunk) {
+        for (const line of chunk.toString().split("\n")) {
+          if (!line.trim()) continue;
+          const req = JSON.parse(line) as { id: number; method: string };
+          const answer = answers[req.method];
+          const body =
+            answer === undefined
+              ? { error: { code: -32601, message: `method not found: ${req.method}` } }
+              : { result: answer };
+          socket.write(`${JSON.stringify({ jsonrpc: "2.0", id: req.id, ...body })}\n`);
+        }
+      },
+    },
+  });
+}
+
+describe("desktop daemon (kairokud)", () => {
+  const dirs: string[] = [];
+  const servers: ReturnType<typeof fakeKairokud>[] = [];
+  afterEach(() => {
+    while (servers.length) servers.pop()!.stop(true);
+    while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+  });
+
+  /** A laptop whose kairokud is serving `answers` on a real socket. */
+  function withDaemon(answers: Record<string, unknown>): FakeIo {
+    const dir = mkdtempSync(join(tmpdir(), "kairoku-kairokud-"));
+    dirs.push(dir);
+    const socketPath = join(dir, "kairokud.sock");
+    servers.push(fakeKairokud(socketPath, answers));
+    const io = laptop();
+    io.env.KAIROKUD_SOCKET = socketPath;
+    // The fake Io's `exists` is its in-memory file map; the socket is real.
+    io.files[socketPath] = "";
+    return io;
+  }
+
+  const SYSTEM_STATUS = { running: true, version: "0.9.3", uptimeSeconds: 3_725, protocolVersion: 3 };
+  const slackStatus = (over: Record<string, unknown>) => ({
+    kind: "slackStatus",
+    entryId: "slack",
+    installed: false,
+    hasToken: false,
+    credentialId: null,
+    status: "notInstalled",
+    teamId: null,
+    teamName: null,
+    flow: null,
+    ...over,
+  });
+
+  test("no socket is a WARN naming the default path, and the group stops there", async () => {
+    const io = laptop();
+    const list = await checks(io);
+    expect(byName(list, "desktop daemon (kairokud)")).toEqual({
+      name: "desktop daemon (kairokud)",
+      status: "WARN",
+      detail: "desktop daemon not running — no socket at /home/tester/.kairoku/daemon/kairokud.sock",
+    });
+    expect(byName(list, "desktop daemon slack")).toBeUndefined();
+  });
+
+  test("KAIROKUD_DATA_DIR moves the socket, KAIROKUD_SOCKET overrides it outright", async () => {
+    const io = laptop();
+    io.env.KAIROKUD_DATA_DIR = "/srv/kairokud";
+    expect(byName(await checks(io), "desktop daemon (kairokud)")?.detail).toContain("/srv/kairokud/kairokud.sock");
+    io.env.KAIROKUD_SOCKET = "/run/kd.sock";
+    expect(byName(await checks(io), "desktop daemon (kairokud)")?.detail).toContain("/run/kd.sock");
+  });
+
+  test("a healthy daemon PASSes with its version and uptime", async () => {
+    const io = withDaemon({ "system.status": SYSTEM_STATUS, "integration.slack.status": slackStatus({}) });
+    const check = byName(await checks(io), "desktop daemon (kairokud)")!;
+    expect(check.status).toBe("PASS");
+    expect(check.detail).toContain("0.9.3");
+    expect(check.detail).toContain("up 1h 2m");
+  });
+
+  test("connected Slack PASSes with the workspace name and never the credential id", async () => {
+    const io = withDaemon({
+      "system.status": SYSTEM_STATUS,
+      "integration.slack.status": slackStatus({
+        installed: true,
+        hasToken: true,
+        credentialId: "3f1c9e2a-1f45-4a51-9f2e-9a2f0c1d3b44",
+        status: "connected",
+        teamId: "T0123456789",
+        teamName: "Acme",
+      }),
+    });
+    const list = await checks(io);
+    expect(byName(list, "desktop daemon slack")).toEqual({
+      name: "desktop daemon slack",
+      status: "PASS",
+      detail: "connected — Acme",
+    });
+    expect(JSON.stringify(list)).not.toContain("3f1c9e2a");
+    expect(JSON.stringify(list)).not.toContain("T0123456789");
+    expect(await run([], io)).toBe(0);
+  });
+
+  test("installed without a token is a WARN, not a PASS", async () => {
+    const io = withDaemon({
+      "system.status": SYSTEM_STATUS,
+      "integration.slack.status": slackStatus({ installed: true, status: "installed" }),
+    });
+    expect(byName(await checks(io), "desktop daemon slack")).toEqual({
+      name: "desktop daemon slack",
+      status: "WARN",
+      detail: "installed, no token — reconnect Slack in desktop Connections",
+    });
+  });
+
+  test("notInstalled is a WARN with the connect hint", async () => {
+    const io = withDaemon({ "system.status": SYSTEM_STATUS, "integration.slack.status": slackStatus({}) });
+    expect(byName(await checks(io), "desktop daemon slack")).toEqual({
+      name: "desktop daemon slack",
+      status: "WARN",
+      detail: "not installed — connect Slack in desktop Connections",
+    });
+  });
+
+  test("a daemon too old to know the method WARNs instead of failing the machine", async () => {
+    const io = withDaemon({ "system.status": SYSTEM_STATUS });
+    const list = await checks(io);
+    expect(byName(list, "desktop daemon (kairokud)")?.status).toBe("PASS");
+    const slack = byName(list, "desktop daemon slack")!;
+    expect(slack.status).toBe("WARN");
+    expect(slack.detail).toContain("integration.slack.status");
+    // Never a FAIL: the desktop daemon is optional, so it cannot fail a runner.
+    expect(await run([], io)).toBe(0);
+  });
+
+  test("a stale socket file nobody is serving is the same WARN as no socket", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "kairoku-kairokud-"));
+    dirs.push(dir);
+    const socketPath = join(dir, "kairokud.sock");
+    const io = laptop();
+    io.env.KAIROKUD_SOCKET = socketPath;
+    io.files[socketPath] = "";
+    const check = byName(await checks(io), "desktop daemon (kairokud)")!;
+    expect(check.status).toBe("WARN");
+    expect(check.detail).toContain("did not answer");
   });
 });

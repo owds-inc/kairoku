@@ -23,9 +23,17 @@ import { version as cliVersion } from "../../package.json";
 export const usage = `usage: kairoku doctor
 
   Verifies this machine and changes nothing. One line per check — PASS, WARN
-  or FAIL — and a nonzero exit when any check FAILs. The plugin checks run
-  everywhere; the daemon checks run where ~/.kairoku (or the pre-rename
-  ~/.hikyaku) exists, and they include one real heartbeat to the app.`;
+  or FAIL — and a nonzero exit when any check FAILs. The plugin checks and the
+  desktop-daemon (kairokud) checks run everywhere; the daemon checks run where
+  ~/.kairoku (or the pre-rename ~/.hikyaku) exists, and they include one real
+  heartbeat to the app.
+
+  "desktop daemon (kairokud)" is the Rust desktop daemon — a different program
+  from this CLI's own "kairoku daemon" run runner. Doctor dials its Unix socket
+  (KAIROKUD_SOCKET, else KAIROKUD_DATA_DIR/kairokud.sock, else
+  ~/.kairoku/daemon/kairokud.sock) and asks it for its version and its Slack
+  install state. An absent socket is a WARN, never a FAIL — the desktop app is
+  optional on a runner.`;
 
 export type Check = { name: string; status: "PASS" | "WARN" | "FAIL"; detail?: string };
 
@@ -100,14 +108,12 @@ export function redactSecrets(text: string): string {
 }
 
 /**
- * Q14 — Slack install / probe failure hints. Pure over a status snapshot so
- * unit tests never need a live Slack or kairokud; live doctor passes
- * `status?.slack` from `/status` (or undefined when the daemon omits it).
+ * Q14 — Slack install / probe failure hints, for a runner that reports the
+ * optional `slack` section on `GET /status`. Pure over the snapshot, and only
+ * called when the section is actually there: Slack itself lives in kairokud, and
+ * `kairokudSlackCheck` is the row that asks kairokud directly.
  */
-export function slackCheck(view: SlackProbeView | null | undefined, daemonAnswered: boolean): Check {
-  if (!daemonAnswered) {
-    return warn(SLACK_CHECK, "unknown — the daemon is not answering");
-  }
+export function slackCheck(view: SlackProbeView): Check {
   if (view == null || typeof view !== "object") {
     return warn(
       SLACK_CHECK,
@@ -163,6 +169,161 @@ export function slackCheck(view: SlackProbeView | null | undefined, daemonAnswer
     SLACK_CHECK,
     `status "${redactSecrets(view.status ?? "")}" — check Slack in desktop Connections`,
   );
+}
+
+
+// ------------------------------------------------- the desktop daemon, kairokud
+
+const KAIROKUD_CHECK = "desktop daemon (kairokud)";
+const KAIROKUD_SLACK_CHECK = "desktop daemon slack";
+
+/**
+ * Where kairokud's local listener lives, resolved the way the daemon itself
+ * resolves it (kairokud `crates/kairoku-paths`: `KAIROKUD_DATA_DIR` overrides
+ * the root, the socket is always `kairokud.sock`). `KAIROKUD_SOCKET` is the
+ * direct override a dev instance sets.
+ */
+export function kairokudSocket(io: Io): string {
+  const explicit = io.env.KAIROKUD_SOCKET?.trim();
+  if (explicit) return explicit;
+  const dataDir = io.env.KAIROKUD_DATA_DIR?.trim();
+  return join(dataDir || join(io.home, ".kairoku", "daemon"), "kairokud.sock");
+}
+
+/** A JSON-RPC 2.0 response envelope, only the members doctor reads. */
+export type RpcReply = { id?: unknown; result?: unknown; error?: { message?: string } };
+
+/**
+ * One connection, one request per method, replies matched by id.
+ *
+ * kairokud's local listener speaks NEWLINE-DELIMITED JSON-RPC 2.0 over the Unix
+ * socket — no WebSocket upgrade, no bearer (kairokud
+ * `crates/kairoku-transport/src/listener.rs`, and the daemon's own
+ * `kairokud status` client in `crates/kairokud/src/client.rs` writes exactly
+ * these frames). Reaching the 0600 socket IS the trust boundary. The listener
+ * can also PUSH `events.event` notifications; doctor never subscribes, and
+ * matching on a numeric `id` drops one if it ever arrives anyway.
+ */
+export async function kairokudRpc(socketPath: string, methods: string[], timeoutMs = 3000): Promise<RpcReply[]> {
+  let resolve!: (replies: RpcReply[]) => void;
+  let reject!: (error: Error) => void;
+  const answered = new Promise<RpcReply[]>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  const replies = new Map<number, RpcReply>();
+  let buffer = "";
+
+  const conn = await Bun.connect({
+    unix: socketPath,
+    socket: {
+      data(_socket, chunk) {
+        buffer += chunk.toString();
+        for (let nl = buffer.indexOf("\n"); nl >= 0; nl = buffer.indexOf("\n")) {
+          const line = buffer.slice(0, nl).trim();
+          buffer = buffer.slice(nl + 1);
+          if (!line) continue;
+          let frame: RpcReply;
+          try {
+            frame = JSON.parse(line) as RpcReply;
+          } catch {
+            continue; // a frame we cannot read is one we do not answer for
+          }
+          if (typeof frame.id !== "number") continue; // a server-initiated notification
+          replies.set(frame.id, frame);
+          if (replies.size >= methods.length) resolve(methods.map((_, i) => replies.get(i + 1)!));
+        }
+      },
+      error: (_socket, error) => reject(error),
+      close: () => reject(new Error("the daemon closed the connection without answering")),
+    },
+  });
+  const timer = setTimeout(() => reject(new Error(`no answer within ${timeoutMs} ms`)), timeoutMs);
+  try {
+    for (const [i, method] of methods.entries()) {
+      conn.write(`${JSON.stringify({ jsonrpc: "2.0", id: i + 1, method, params: {} })}\n`);
+    }
+    return await answered;
+  } finally {
+    clearTimeout(timer);
+    conn.end();
+  }
+}
+
+/** `1h 2m`, `2m 3s`, `4s` — enough to tell "just restarted" from "up for days". */
+function uptime(seconds: number): string {
+  const units: [number, string][] = [[86400, "d"], [3600, "h"], [60, "m"], [1, "s"]];
+  const parts: string[] = [];
+  let left = Math.floor(seconds);
+  for (const [size, suffix] of units) {
+    if (left >= size && parts.length < 2) {
+      parts.push(`${Math.floor(left / size)}${suffix}`);
+      left %= size;
+    }
+  }
+  return parts.length ? parts.join(" ") : "0s";
+}
+
+/**
+ * `integration.slack.status` → one doctor line. Presence only: the result
+ * carries a `credentialId` and this never prints it, and the bot token never
+ * leaves kairokud's vault at all (kairokud
+ * `docs/protocol/methods/integration.slack.status.md`).
+ */
+export function kairokudSlackCheck(reply: RpcReply | undefined): Check {
+  if (reply === undefined) return warn(KAIROKUD_SLACK_CHECK, "the daemon did not answer");
+  if (reply.error) {
+    return warn(KAIROKUD_SLACK_CHECK, redactSecrets(reply.error.message ?? "integration.slack.status failed"));
+  }
+  const result = (reply.result ?? {}) as { status?: unknown; teamName?: unknown };
+  const team = typeof result.teamName === "string" && result.teamName.trim() ? result.teamName.trim() : undefined;
+  switch (result.status) {
+    case "connected":
+      return pass(KAIROKUD_SLACK_CHECK, team ? `connected — ${team}` : "connected");
+    case "installed":
+      return warn(KAIROKUD_SLACK_CHECK, "installed, no token — reconnect Slack in desktop Connections");
+    case "notInstalled":
+      return warn(KAIROKUD_SLACK_CHECK, "not installed — connect Slack in desktop Connections");
+    default:
+      return warn(
+        KAIROKUD_SLACK_CHECK,
+        `unexpected status "${redactSecrets(String(result.status ?? "none"))}" — check Slack in desktop Connections`,
+      );
+  }
+}
+
+/**
+ * The desktop daemon, asked rather than assumed — and asked over ITS socket,
+ * not the runner's loopback port. No socket means the desktop app is not
+ * running on this machine, which is a WARN (a headless runner never has one)
+ * and the rest of the group is skipped.
+ */
+export async function kairokudChecks(io: Io): Promise<Check[]> {
+  const socket = kairokudSocket(io);
+  if (!io.exists(socket)) return [warn(KAIROKUD_CHECK, `desktop daemon not running — no socket at ${socket}`)];
+
+  let replies: RpcReply[];
+  try {
+    replies = await kairokudRpc(socket, ["system.status", "integration.slack.status"]);
+  } catch (error) {
+    // A socket file that refuses or stalls is the same fact as an absent one:
+    // the desktop daemon is not serving here.
+    const why = redactSecrets(error instanceof Error ? error.message : String(error));
+    return [warn(KAIROKUD_CHECK, `desktop daemon not running — ${socket} did not answer (${why})`)];
+  }
+
+  const [system, slack] = replies;
+  const out: Check[] = [];
+  if (system?.error) {
+    out.push(warn(KAIROKUD_CHECK, redactSecrets(system.error.message ?? "system.status failed")));
+  } else {
+    const status = (system?.result ?? {}) as { version?: unknown; uptimeSeconds?: unknown };
+    const version = typeof status.version === "string" && status.version ? status.version : "unknown version";
+    const up = typeof status.uptimeSeconds === "number" ? `, up ${uptime(status.uptimeSeconds)}` : "";
+    out.push(pass(KAIROKUD_CHECK, `${version}${up} — ${socket}`));
+  }
+  out.push(kairokudSlackCheck(slack));
+  return out;
 }
 
 /**
@@ -442,6 +603,10 @@ export async function checks(io: Io, probe?: PortDeps): Promise<Check[]> {
     out.push(path ? pass("kairoku plugin path", path) : fail("kairoku plugin path", NO_PLUGIN_PATH));
   }
 
+  // -- the desktop daemon, everywhere: it is its own program on its own socket,
+  //    so a machine that carries only the desktop app still gets these two rows.
+  out.push(...(await kairokudChecks(io)));
+
   // -- the daemon, only where one is configured
   const home = daemonHome(io);
   if (home === null) {
@@ -569,10 +734,11 @@ export async function checks(io: Io, probe?: PortDeps): Promise<Check[]> {
       : fail("daemon reachable", "cannot test — listen host/port is missing from config.json"),
   );
   out.push(...(await appLink(io, config.appUrl, token, status)));
-  // Q14 — Slack install / probe hints. Reads optional `status.slack` only; never
-  // prints tokens. Absent field → WARN with desktop install hint (soft-parallel
-  // until kairokud advertises the section).
-  out.push(slackCheck(status?.slack ?? undefined, status !== null));
+  // Q14 — Slack install / probe hints, kept for the day the runner reports the
+  // section, and only then: the runner has never filled `status.slack` in, and
+  // an unconditional row was a WARN about Slack on every machine. Slack lives in
+  // kairokud, and the `desktop daemon slack` row above asks kairokud directly.
+  if (status?.slack != null) out.push(slackCheck(status.slack));
   out.push(...(await environment(io, config, probe)));
 
   if (io.platform === "linux") {
