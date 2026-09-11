@@ -83,6 +83,17 @@ kairoku env set|import|list|rm          # the values this machine holds for a re
 kairoku doctor                          # PASS/WARN/FAIL per check; nonzero on FAIL
 ```
 
+`doctor` also reports the DESKTOP daemon, `kairokud` — the Rust daemon behind the
+desktop app, a different program from `kairoku daemon` above. It dials kairokud's
+Unix socket at `$KAIROKUD_DATA_DIR/kairokud.sock` (the directory kairokud itself
+reads), else `~/.kairoku/daemon/kairokud.sock`, and asks it for its version and
+its Slack install state. `KAIROKUD_SOCKET` is doctor's own override, checked
+first, for pointing doctor at a dev instance — kairokud has no such variable and
+never reads it. So the `desktop daemon slack` row is Slack's real answer rather
+than a guess from this runner's `/status`. No socket is a WARN, never a FAIL: a
+headless runner has no desktop app, and Slack install / OAuth stays in the
+desktop Connections UI.
+
 From source: `bun run start` (= `bun run src/daemon/server.ts`).
 
 Config — `~/.kairoku/config.json` (`KAIROKU_DAEMON_CONFIG` overrides the path).
