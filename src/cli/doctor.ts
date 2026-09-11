@@ -29,11 +29,12 @@ export const usage = `usage: kairoku doctor
   heartbeat to the app.
 
   "desktop daemon (kairokud)" is the Rust desktop daemon — a different program
-  from this CLI's own "kairoku daemon" run runner. Doctor dials its Unix socket
-  (KAIROKUD_SOCKET, else KAIROKUD_DATA_DIR/kairokud.sock, else
-  ~/.kairoku/daemon/kairokud.sock) and asks it for its version and its Slack
-  install state. An absent socket is a WARN, never a FAIL — the desktop app is
-  optional on a runner.`;
+  from this CLI's own "kairoku daemon" run runner. Doctor dials it over
+  KAIROKUD_DATA_DIR/kairokud.sock (the directory kairokud itself reads), else
+  ~/.kairoku/daemon/kairokud.sock, and asks it for its version and its Slack
+  install state. KAIROKUD_SOCKET is doctor's OWN override for pointing at a dev
+  instance — kairokud has no such variable and never reads it. An absent socket
+  is a WARN, never a FAIL — the desktop app is optional on a runner.`;
 
 export type Check = { name: string; status: "PASS" | "WARN" | "FAIL"; detail?: string };
 
@@ -97,14 +98,19 @@ const SLACK_CHECK = "slack connection";
 
 /**
  * Strip anything that looks like a secret from doctor detail text. Tokens are
- * read and sent elsewhere; they must never appear on a doctor line.
+ * read and sent elsewhere; they must never appear on a doctor line. Also
+ * flattens control characters (CR/LF, ANSI escapes): a daemon- or
+ * Slack-supplied string (teamName, a version) gets echoed into one printed
+ * line verbatim, and whoever names a Slack workspace controls that string —
+ * a name containing CR/LF could otherwise forge or distort the row.
  */
 export function redactSecrets(text: string): string {
   return text
     .replace(/\bxox[baprs](?:-[A-Za-z0-9]+)+\b/gi, "[redacted]")
     .replace(/\bkai_[A-Za-z0-9._-]+\b/g, "[redacted]")
     .replace(/\bBearer\s+\S+/gi, "Bearer [redacted]")
-    .replace(/\b(token|secret|password|client_secret)\s*[:=]\s*\S+/gi, "$1=[redacted]");
+    .replace(/\b(token|secret|password|client_secret)\s*[:=]\s*\S+/gi, "$1=[redacted]")
+    .replace(/[^\P{C}]/gu, "");
 }
 
 /**
@@ -114,16 +120,11 @@ export function redactSecrets(text: string): string {
  * `kairokudSlackCheck` is the row that asks kairokud directly.
  */
 export function slackCheck(view: SlackProbeView): Check {
-  if (view == null || typeof view !== "object") {
-    return warn(
-      SLACK_CHECK,
-      "not installed — connect Slack in desktop Connections (full install / OAuth stays there)",
-    );
-  }
-
   const rawStatus = typeof view.status === "string" ? view.status.trim().toLowerCase() : "";
   const team =
-    typeof view.teamName === "string" && view.teamName.trim() ? view.teamName.trim() : undefined;
+    typeof view.teamName === "string" && view.teamName.trim()
+      ? redactSecrets(view.teamName.trim())
+      : undefined;
   const safeError =
     typeof view.lastError === "string" && view.lastError.trim()
       ? redactSecrets(view.lastError.trim())
@@ -178,10 +179,12 @@ const KAIROKUD_CHECK = "desktop daemon (kairokud)";
 const KAIROKUD_SLACK_CHECK = "desktop daemon slack";
 
 /**
- * Where kairokud's local listener lives, resolved the way the daemon itself
- * resolves it (kairokud `crates/kairoku-paths`: `KAIROKUD_DATA_DIR` overrides
- * the root, the socket is always `kairokud.sock`). `KAIROKUD_SOCKET` is the
- * direct override a dev instance sets.
+ * Where kairokud's local listener lives. `KAIROKUD_DATA_DIR` is real — kairokud
+ * itself reads it and overrides the root (kairokud `crates/kairoku-paths`); the
+ * socket under it is always `kairokud.sock`. `KAIROKUD_SOCKET` is doctor's OWN
+ * override, checked first, for pointing doctor at a dev instance — kairokud has
+ * no such variable and never reads it, so setting it does not move where the
+ * real daemon binds.
  */
 export function kairokudSocket(io: Io): string {
   const explicit = io.env.KAIROKUD_SOCKET?.trim();
@@ -225,11 +228,21 @@ export async function kairokudRpc(
   /** Whatever arrived is worth reporting; nothing at all means nobody is serving. */
   const settle = (why: string) => (replies.size ? resolve(collected()) : reject(new Error(why)));
 
+  // kairokud's own read loop caps inbound frames (MAX_INBOUND_MESSAGE_BYTES,
+  // listener.rs); mirror that bound on this side so a wedged or malicious
+  // writer on the socket cannot grow `buffer` unbounded before the 3 s
+  // timeout closes the connection. Generous for two small replies.
+  const MAX_BUFFER_BYTES = 256 * 1024;
+
   const conn = await Bun.connect({
     unix: socketPath,
     socket: {
       data(_socket, chunk) {
         buffer += chunk.toString();
+        if (buffer.length > MAX_BUFFER_BYTES) {
+          settle(`reply exceeded ${MAX_BUFFER_BYTES} bytes without a newline`);
+          return;
+        }
         for (let nl = buffer.indexOf("\n"); nl >= 0; nl = buffer.indexOf("\n")) {
           const line = buffer.slice(0, nl).trim();
           buffer = buffer.slice(nl + 1);
@@ -289,7 +302,10 @@ export function kairokudSlackCheck(reply: RpcReply | undefined): Check {
     return warn(KAIROKUD_SLACK_CHECK, redactSecrets(reply.error.message ?? "integration.slack.status failed"));
   }
   const result = (reply.result ?? {}) as { status?: unknown; teamName?: unknown };
-  const team = typeof result.teamName === "string" && result.teamName.trim() ? result.teamName.trim() : undefined;
+  const team =
+    typeof result.teamName === "string" && result.teamName.trim()
+      ? redactSecrets(result.teamName.trim())
+      : undefined;
   switch (result.status) {
     case "connected":
       return pass(KAIROKUD_SLACK_CHECK, team ? `connected — ${team}` : "connected");
@@ -334,7 +350,8 @@ export async function kairokudChecks(io: Io): Promise<Check[]> {
     out.push(warn(KAIROKUD_CHECK, redactSecrets(system.error.message ?? "system.status failed")));
   } else {
     const status = (system.result ?? {}) as { version?: unknown; uptimeSeconds?: unknown };
-    const version = typeof status.version === "string" && status.version ? status.version : "unknown version";
+    const version =
+      typeof status.version === "string" && status.version ? redactSecrets(status.version) : "unknown version";
     const up = typeof status.uptimeSeconds === "number" ? `, up ${uptime(status.uptimeSeconds)}` : "";
     out.push(pass(KAIROKUD_CHECK, `${version}${up} — ${socket}`));
   }

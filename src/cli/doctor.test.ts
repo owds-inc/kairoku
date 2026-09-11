@@ -818,6 +818,21 @@ describe("desktop daemon (kairokud)", () => {
     expect(await run([], io)).toBe(0);
   });
 
+  test("a workspace name with a forged newline cannot inject a fake row", async () => {
+    const io = withDaemon({
+      "system.status": SYSTEM_STATUS,
+      "integration.slack.status": slackStatus({
+        installed: true,
+        hasToken: true,
+        status: "connected",
+        teamName: "Acme\nFAIL fake row — pwned",
+      }),
+    });
+    const check = byName(await checks(io), "desktop daemon slack")!;
+    expect(check.detail).not.toContain("\n");
+    expect(check.detail).toBe("connected — AcmeFAIL fake row — pwned");
+  });
+
   test("installed without a token is a WARN, not a PASS", async () => {
     const io = withDaemon({
       "system.status": SYSTEM_STATUS,
@@ -927,5 +942,26 @@ describe("desktop daemon (kairokud)", () => {
     const [first, second] = await kairokudRpc(socketPath, ["system.status", "integration.slack.status"], 2_000);
     expect(first?.result).toEqual({ n: 1 });
     expect(second?.result).toEqual({ n: 2 });
+  });
+
+  test("a reply with no newline is capped rather than buffered without bound", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "kairoku-kairokud-"));
+    dirs.push(dir);
+    const socketPath = join(dir, "kairokud.sock");
+    // A wedged or malicious writer: bytes dribble out, never a "\n". One
+    // `socket.write()` this large is a partial write (the OS socket buffer is
+    // smaller), so drip it across several ticks like a real slow writer would.
+    servers.push(
+      Bun.listen({
+        unix: socketPath,
+        socket: {
+          data(socket) {
+            const timer = setInterval(() => socket.write("x".repeat(64 * 1024)), 20);
+            setTimeout(() => clearInterval(timer), 1_000);
+          },
+        },
+      }),
+    );
+    await expect(kairokudRpc(socketPath, ["system.status"], 2_000)).rejects.toThrow(/exceeded/);
   });
 });
