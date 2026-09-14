@@ -142,7 +142,7 @@ describe("kairoku daemon verbs", () => {
   test("an unknown verb prints usage and exits 2", async () => {
     const io = fakeIo();
     expect(await run(["frob"], io)).toBe(2);
-    expect(io.errors.join("\n")).toContain("kairoku daemon [install|start|stop|status|drain|prune]");
+    expect(io.errors.join("\n")).toContain("kairoku daemon [install|start|stop|status|drain|update|prune]");
   });
 });
 
@@ -208,6 +208,61 @@ describe("kairoku daemon drain", () => {
   });
 });
 
+describe("kairoku daemon via resolved Rust installation", () => {
+  const rustInstall = {
+    schemaVersion: 1 as const,
+    installationId: "inst-1",
+    dataRoot: "/Users/neil/.local/share/kairokud",
+    profile: "macos-personal" as const,
+    executionUser: "neil",
+    executable: "/usr/bin/kairokud",
+    service: {
+      manager: "launchd" as const,
+      scope: "user" as const,
+      label: "io.kairoku.daemon",
+      package: "homebrew" as const,
+    },
+  };
+
+  function withRust(io: FakeIo): FakeIo {
+    io.bins.add("kairokud");
+    io.canned["/usr/bin/kairokud instance --json"] = { stdout: JSON.stringify(rustInstall) };
+    return io;
+  }
+
+  test("install bootstraps the recorded launchd label when the plist exists", async () => {
+    const io = withRust(fakeIo({ platform: "darwin", home: "/Users/neil", uid: 501 }));
+    const plist = `/Users/neil/Library/LaunchAgents/${rustInstall.service.label}.plist`;
+    io.files[plist] = "rust";
+    io.canned[`launchctl print gui/501/${rustInstall.service.label}`] = { code: 113 };
+    expect(await run(["install"], io)).toBe(0);
+    expect(calls(io)).toEqual([
+      "/usr/bin/kairokud instance --json",
+      `launchctl print gui/501/${rustInstall.service.label}`,
+      `launchctl bootstrap gui/501 ${plist}`,
+    ]);
+  });
+
+  test("update delegates to system.requestUpdate without a second updater", async () => {
+    const io = withRust(fakeIo({ platform: "darwin", home: "/Users/neil" }));
+    io.canned['/usr/bin/kairokud call system.requestUpdate --params {}'] = {
+      stdout: JSON.stringify({ ok: true }),
+    };
+    expect(await run(["update"], io)).toBe(0);
+    expect(calls(io)).toEqual([
+      "/usr/bin/kairokud instance --json",
+      "/usr/bin/kairokud call system.requestUpdate --params {}",
+    ]);
+  });
+
+  test("prune refuses the Rust data root", async () => {
+    const io = withRust(fakeIo({ platform: "darwin", home: "/Users/neil" }));
+    expect(await run(["prune"], io)).toBe(1);
+    expect(io.errors.join("\n")).toContain("blocked pending deletion-policy review");
+    expect(io.errors.join("\n")).toContain(rustInstall.dataRoot);
+  });
+});
+
 describe("kairoku daemon in the foreground", () => {
   const dirs: string[] = [];
   afterEach(() => {
@@ -224,7 +279,14 @@ describe("kairoku daemon in the foreground", () => {
     mkdirSync(join(dir, "runs"));
     writeFileSync(join(dir, "token.env"), "KAIROKU_DAEMON_TOKEN=cli-daemon-token\n");
     const proc = Bun.spawn(["bun", "run", main, "daemon"], {
-      env: { ...process.env, KAIROKU_DAEMON_CONFIG: configPath, KAIROKU_DAEMON_TOKEN: "", HIKYAKU_TOKEN: "" },
+      // Keep kairokud off PATH so this Bun listener fixture is not diverted to Rust.
+      env: {
+        ...process.env,
+        PATH: "/usr/bin:/bin",
+        KAIROKU_DAEMON_CONFIG: configPath,
+        KAIROKU_DAEMON_TOKEN: "",
+        HIKYAKU_TOKEN: "",
+      },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -255,7 +317,13 @@ describe("kairoku daemon in the foreground", () => {
     const configPath = join(dir, "config.json");
     writeFileSync(configPath, JSON.stringify({ listen: { host: "0.0.0.0", port: 0 } }));
     const proc = Bun.spawn(["bun", "run", main, "daemon"], {
-      env: { ...process.env, KAIROKU_DAEMON_CONFIG: configPath, KAIROKU_DAEMON_TOKEN: "", HIKYAKU_TOKEN: "" },
+      env: {
+        ...process.env,
+        PATH: "/usr/bin:/bin",
+        KAIROKU_DAEMON_CONFIG: configPath,
+        KAIROKU_DAEMON_TOKEN: "",
+        HIKYAKU_TOKEN: "",
+      },
       stdout: "pipe",
       stderr: "pipe",
     });

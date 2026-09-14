@@ -12,9 +12,10 @@ export const REPO = "owds-inc/kairoku";
 
 export const usage = `usage: kairoku update
 
-  Replaces this binary with the latest GitHub release's asset for this
+  Replaces this CLI binary with the latest GitHub release's asset for this
   platform after its sha256 matches the release's checksums.txt. A Homebrew
-  install is left to \`brew upgrade kairoku\`.`;
+  install is left to \`brew upgrade kairoku\`. Does not update the Rust daemon —
+  use \`kairoku daemon update\` for that.`;
 
 /** `kairoku-<os>-<arch>` for the four release targets; null for anything else. */
 export function assetName(platform: string, arch: string): string | null {
@@ -45,7 +46,7 @@ export async function run(_args: string[], io: Io): Promise<number> {
   const rel = (await res.json()) as Release;
   const latest = rel.tag_name.replace(/^v/, "");
   if (latest === version) {
-    io.out(`kairoku ${version} is already the latest`);
+    io.out(`CLI component kairoku ${version} is already the latest`);
     return 0;
   }
   const url = (name: string) => rel.assets.find((a) => a.name === name)?.browser_download_url;
@@ -79,6 +80,6 @@ export async function run(_args: string[], io: Io): Promise<number> {
     io.err(`cannot replace ${io.execPath}: ${(e as Error).message} — rerun with sudo, or reinstall with install.sh`);
     return 1;
   }
-  io.out(`kairoku ${version} → ${latest} (${io.execPath})`);
+  io.out(`CLI component kairoku ${version} → ${latest} (${io.execPath})`);
   return 0;
 }

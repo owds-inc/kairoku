@@ -423,6 +423,7 @@ export async function rustRuntimeChecks(io: Io): Promise<Check[]> {
       `${installation.installationId} ${installation.profile} ${installation.service.package}/${installation.service.label}`,
     ),
   );
+  out.push(pass("CLI version", cliVersion));
 
   const status = await io.shell(["kairokud", "status", "--json"]);
   if (status.code !== 0) {
@@ -441,7 +442,23 @@ export async function rustRuntimeChecks(io: Io): Promise<Check[]> {
       providerReady?: boolean | null;
       providerReasons?: string[] | null;
       daemonId?: string | null;
+      version?: string | null;
+      daemonVersion?: string | null;
+      supervisorVersion?: string | null;
+      sitterVersion?: string | null;
     };
+    const daemonVer = body.daemonVersion ?? body.version;
+    if (typeof daemonVer === "string" && daemonVer) {
+      out.push(pass("daemon version", daemonVer));
+    } else {
+      out.push(warn("daemon version", "unknown from status --json"));
+    }
+    const supervisorVer = body.supervisorVersion ?? body.sitterVersion;
+    if (typeof supervisorVer === "string" && supervisorVer) {
+      out.push(pass("supervisor version", supervisorVer));
+    } else {
+      out.push(warn("supervisor version", "unknown — sitter may be unsupervised"));
+    }
     const running = body.service?.running;
     if (running === true) {
       out.push(pass("rust daemon health", `running; connectivity ${body.connectivity ?? "unknown"}`));

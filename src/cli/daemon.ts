@@ -15,21 +15,21 @@ import { isLoopbackHost, kairokuHome } from "../daemon/config";
 import { main as prune } from "../daemon/prune";
 import { serve } from "../daemon/server";
 import type { Io } from "./io";
-import { resolveRuntime } from "./runtime";
+import { resolveRuntime, type Installation } from "./runtime";
 import { LAUNCHD_LABEL, SYSTEMD_UNIT, systemdUnit } from "./service";
 
-export const usage = `usage: kairoku daemon [install|start|stop|status|drain|prune]
+export const usage = `usage: kairoku daemon [install|start|stop|status|drain|update|prune]
 
-  (no verb)  run the daemon in the foreground until SIGTERM
-  install    linux: write the systemd unit and start it (rewritten only when
-             content changes; unchanged running daemon left alone).
-             mac: refused — io.kairoku.daemon is owned by Rust kairokud
-  start      start the service
-  stop       stop the service
+  (no verb)  run the resolved daemon in the foreground until SIGTERM
+  install    install/enable the resolved Rust service when present; else
+             linux Bun systemd (mac Bun LaunchAgent remains refused)
+  start      start the resolved service
+  stop       stop the resolved service
   status     is the service running? (nonzero when not)
   drain      latch local claim drain and acknowledge cloud drain; heartbeat,
              flush and cancellation continue
-  prune      remove stale run worktrees — asks first, never touches a branch`;
+  update     ask the live Rust daemon to check for an update (system.requestUpdate)
+  prune      remove stale Bun run worktrees — blocked against Rust data roots`;
 
 /** PATH for the service: the binary's dir, bun, node's dir, the usual bins. */
 export function servicePath(io: Io): string {
@@ -212,9 +212,124 @@ async function drainCommand(io: Io): Promise<number> {
   return drainLegacy(io);
 }
 
+async function pruneCommand(args: string[], io: Io): Promise<number> {
+  let installation = null;
+  try {
+    installation = await resolveRuntime(io);
+  } catch (e) {
+    io.err(`kairoku daemon prune: ${(e as Error).message}`);
+    return 1;
+  }
+  if (installation) {
+    io.err(
+      `kairoku daemon prune: Rust data root ${installation.dataRoot} is blocked pending deletion-policy review`,
+    );
+    return 1;
+  }
+  return prune(args);
+}
+
+async function updateCommand(io: Io): Promise<number> {
+  let installation = null;
+  try {
+    installation = await resolveRuntime(io);
+  } catch (e) {
+    io.err(`kairoku daemon update: ${(e as Error).message}`);
+    return 1;
+  }
+  if (!installation) {
+    io.err("kairoku daemon update: no resolved Rust installation — install kairokud first");
+    return 1;
+  }
+  const bin = io.which("kairokud") ?? installation.executable;
+  // Delegate to the existing Rust updater surface — never a second updater.
+  const result = await io.shell([bin, "call", "system.requestUpdate", "--params", "{}"]);
+  if (result.stdout.trim()) io.out(result.stdout.trim());
+  if (result.code !== 0 && result.stderr.trim()) io.err(result.stderr.trim());
+  return result.code;
+}
+
+async function rustForeground(io: Io, installation: Installation): Promise<number> {
+  const bin = io.which("kairokud") ?? installation.executable;
+  const result = await io.shell([bin, "serve"]);
+  if (result.code !== 0 && result.stderr.trim()) io.err(result.stderr.trim());
+  return result.code;
+}
+
+async function rustLifecycle(verb: string, installation: Installation, io: Io): Promise<number> {
+  const { manager, scope, label } = installation.service;
+  if (manager === "launchd") {
+    const path = join(io.home, "Library", "LaunchAgents", `${label}.plist`);
+    const target = `gui/${io.uid}/${label}`;
+    const loaded = async () => (await io.shell(["launchctl", "print", target])).code === 0;
+    if (verb === "install") {
+      if (!io.exists(path)) {
+        io.err(
+          `kairoku daemon install: no agent at ${path} — install via kairokud package (scripts/install.sh / brew)`,
+        );
+        return 1;
+      }
+      if (await loaded()) {
+        io.out(`${label} already loaded — left running`);
+        return 0;
+      }
+      return (await io.shell(["launchctl", "bootstrap", `gui/${io.uid}`, path])).code;
+    }
+    if (verb === "start") {
+      if (!io.exists(path)) {
+        io.err(`no agent at ${path} — install via kairokud package first`);
+        return 1;
+      }
+      const argv = (await loaded())
+        ? ["launchctl", "kickstart", "-k", target]
+        : ["launchctl", "bootstrap", `gui/${io.uid}`, path];
+      return (await io.shell(argv)).code;
+    }
+    if (verb === "stop") {
+      return (await io.shell(["launchctl", "bootout", target])).code;
+    }
+    if (verb === "status") {
+      const r = await io.shell(["launchctl", "print", target]);
+      const state = r.stdout.match(/state = .*/)?.[0] ?? r.stdout.trim().split("\n")[0] ?? "";
+      io.out(r.code === 0 ? `${label} loaded, ${state}` : `${label} not loaded`);
+      return r.code;
+    }
+  } else {
+    const ctl = scope === "system" ? ["sudo", "systemctl"] : ["systemctl", "--user"];
+    if (verb === "install") {
+      const enable = await io.shell([...ctl, "enable", "--now", label]);
+      if (enable.code === 0) io.out(`enabled ${label} (${scope})`);
+      return enable.code;
+    }
+    if (verb === "start") return (await io.shell([...ctl, "start", label])).code;
+    if (verb === "stop") return (await io.shell([...ctl, "stop", label])).code;
+    if (verb === "status") {
+      const active = (await io.shell([...ctl, "is-active", label])).stdout.trim() || "not installed";
+      const enabled = (await io.shell([...ctl, "is-enabled", label])).stdout.trim();
+      io.out(`${label} ${active}${enabled ? `, ${enabled}` : ""}`);
+      return active === "active" ? 0 : 1;
+    }
+  }
+  io.err(usage);
+  return 2;
+}
+
 export async function run(args: string[], io: Io): Promise<number> {
   const [verb] = args;
+  if (verb === "prune") return pruneCommand(args.slice(1), io);
+  if (verb === "drain") return drainCommand(io);
+  if (verb === "update") return updateCommand(io);
+
+  let installation = null;
+  try {
+    installation = await resolveRuntime(io);
+  } catch (e) {
+    io.err(`kairoku daemon: ${(e as Error).message}`);
+    return 1;
+  }
+
   if (verb === undefined) {
+    if (installation) return rustForeground(io, installation);
     try {
       return await serve();
     } catch (e) {
@@ -222,8 +337,9 @@ export async function run(args: string[], io: Io): Promise<number> {
       return 1;
     }
   }
-  if (verb === "prune") return prune(args.slice(1));
-  if (verb === "drain") return drainCommand(io);
+
+  if (installation) return rustLifecycle(verb, installation, io);
+
   const table = io.platform === "darwin" ? mac : io.platform === "linux" ? linux : null;
   const fn = table?.[verb];
   if (!fn) {

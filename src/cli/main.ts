@@ -20,13 +20,13 @@ export const usage = `kairoku ${version} — the Kairoku CLI
                                    set up the Claude Code plugin and/or the daemon;
                                    a wizard without flags
   kairoku doctor                   verify this machine, change nothing; nonzero on FAIL
-  kairoku daemon [install|start|stop|status|drain|prune]
+  kairoku daemon [install|start|stop|status|drain|update|prune]
                                    the orchestration daemon: foreground, or as a service
   kairoku plugin install|update|status
                                    the Claude Code plugin, through the claude CLI
   kairoku env set|import|list|rm [--repo <owner/name>] [--profile <name>]
                                    the values this machine holds for a repo's runs
-  kairoku update                   replace this binary with the latest release
+  kairoku update                   replace this CLI binary with the latest release
   kairoku version
   kairoku help`;
 
