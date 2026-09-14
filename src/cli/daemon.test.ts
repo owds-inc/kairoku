@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { MAC_LAUNCHAGENT_INSTALL_STOP, run } from "./daemon";
 import { LAUNCHD_LABEL, launchdPlist, systemdUnit } from "./service";
 import { fakeIo, type FakeIo } from "./testkit";
