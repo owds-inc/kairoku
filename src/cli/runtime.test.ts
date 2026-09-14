@@ -1,0 +1,112 @@
+import { describe, expect, test } from "bun:test";
+import { fakeIo } from "./testkit";
+import {
+  chooseSetupAction,
+  decideFromInventory,
+  resolveRuntime,
+  type Installation,
+} from "./runtime";
+
+const sample: Installation = {
+  schemaVersion: 1,
+  installationId: "inst-1",
+  dataRoot: "/home/tester/.local/share/kairokud",
+  profile: "linux-personal",
+  executionUser: "tester",
+  executable: "/home/tester/.local/bin/kairokud",
+  service: {
+    manager: "systemd",
+    scope: "user",
+    label: "kairokud",
+    package: "direct",
+  },
+};
+
+describe("chooseSetupAction", () => {
+  test("repeat setup preserves a matching running service", () => {
+    expect(chooseSetupAction(1, true, true)).toBe("preserve");
+    expect(chooseSetupAction(2, true, true)).toBe("refuse");
+  });
+
+  test("install when nothing is found", () => {
+    expect(chooseSetupAction(0, false, false)).toBe("install");
+  });
+
+  test("start when matching but not running", () => {
+    expect(chooseSetupAction(1, true, false)).toBe("start");
+  });
+
+  test("refuse a single non-matching owner", () => {
+    expect(chooseSetupAction(1, false, true)).toBe("refuse");
+  });
+});
+
+describe("decideFromInventory", () => {
+  test("two detected service owners refuse without mutation", () => {
+    const action = decideFromInventory({
+      owners: ["homebrew:io.kairoku.daemon", "direct:io.kairoku.daemon"],
+      matching: true,
+      running: true,
+    });
+    expect(action).toBe("refuse");
+  });
+});
+
+describe("resolveRuntime", () => {
+  test("returns null when kairokud is absent", async () => {
+    const io = fakeIo({ bins: new Set() });
+    expect(await resolveRuntime(io)).toBeNull();
+    expect(io.calls).toEqual([]);
+  });
+
+  test("returns null when installation metadata is absent", async () => {
+    const io = fakeIo({
+      bins: new Set(["kairokud"]),
+      canned: {
+        "kairokud instance --json": {
+          code: 1,
+          stderr: "error: no installation.json under /tmp/data — run configure first\n",
+        },
+      },
+    });
+    expect(await resolveRuntime(io)).toBeNull();
+    expect(io.calls).toEqual([["/usr/bin/kairokud", "instance", "--json"]]);
+  });
+
+  test("parses kairokud instance --json without duplicating path computation", async () => {
+    const io = fakeIo({
+      bins: new Set(["kairokud"]),
+      canned: {
+        "kairokud instance --json": { stdout: JSON.stringify(sample) + "\n" },
+      },
+    });
+    const got = await resolveRuntime(io);
+    expect(got).toEqual(sample);
+    expect(io.calls).toEqual([["/usr/bin/kairokud", "instance", "--json"]]);
+  });
+
+  test("throws on corrupt JSON without writing files", async () => {
+    const io = fakeIo({
+      bins: new Set(["kairokud"]),
+      canned: {
+        "kairokud instance --json": { stdout: "{not-json" },
+      },
+    });
+    await expect(resolveRuntime(io)).rejects.toThrow(/corrupt JSON/);
+    expect(Object.keys(io.files)).toHaveLength(0);
+  });
+
+  test("throws on ambiguous failure without mutation", async () => {
+    const io = fakeIo({
+      bins: new Set(["kairokud"]),
+      canned: {
+        "kairokud instance --json": {
+          code: 1,
+          stderr: "error: ambiguous service ownership (2 owners); refuse\n",
+        },
+      },
+    });
+    await expect(resolveRuntime(io)).rejects.toThrow(/failed/);
+    expect(Object.keys(io.files)).toHaveLength(0);
+  });
+});
