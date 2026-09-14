@@ -38,7 +38,23 @@ function fixture(opts: { activeRuns?: number; statusOk?: boolean; statusBody?: u
   io.canned["/usr/bin/kairokud status --json"] = {
     stdout: JSON.stringify({
       installationId: "inst-rust-1",
+      dataRoot: installation.dataRoot,
+      daemonId: "daemon-rust-1",
+      ownerId: "owner-rust-1",
+      processInstanceId: "process-rust-1",
+      backendUrl: "https://app.kairoku.dev",
+      heartbeatOk: true,
       service: { running: true },
+    }),
+  };
+  io.canned["/usr/bin/kairokud call system.recoveryDecide --params"] = {
+    stdout: JSON.stringify({
+      released: true,
+      operationId: "migration-inst-rust-1",
+      purpose: "migration",
+      previousRevision: 2,
+      appliedRevision: 3,
+      claimsInhibited: false,
     }),
   };
   const activeRuns = opts.activeRuns ?? 1;
@@ -152,8 +168,60 @@ describe("runMigration", () => {
     const io = fixture({ activeRuns: 0 });
     io.canned["systemctl --user disable --now kairoku-daemon"] = { code: 0 };
     await runMigration(io, installation, { cutover: true });
-    const admission = JSON.parse(io.files["/home/neil/.local/share/kairokud/local-admission.json"]!);
-    expect(admission.maintenancePurpose).toBeNull();
-    expect(admission.claimsInhibited).toBe(false);
+    const release = io.calls.find((call) => call.includes("system.recoveryDecide"));
+    expect(release).toBeDefined();
+    expect(JSON.parse(release![release!.indexOf("--params") + 1]!)).toEqual({
+      action: "releaseMaintenance",
+      operationId: "migration-inst-rust-1",
+      purpose: "migration",
+      expectedRevision: 2,
+    });
+  });
+
+  test("missing replacement identity blocks before authoritative release", async () => {
+    const io = fixture({ activeRuns: 0 });
+    io.canned["systemctl --user disable --now kairoku-daemon"] = { code: 0 };
+    io.canned["/usr/bin/kairokud status --json"] = {
+      stdout: JSON.stringify({ installationId: installation.installationId, service: { running: true } }),
+    };
+
+    const result = await runMigration(io, installation, { cutover: true });
+
+    expect(result).toEqual({ state: "blocked", blockers: ["rust_identity_unknown"] });
+    expect(io.calls.some((call) => call.includes("system.recoveryDecide"))).toBe(false);
+  });
+
+  test("failed authoritative release cannot produce a complete receipt", async () => {
+    const io = fixture({ activeRuns: 0 });
+    io.canned["systemctl --user disable --now kairoku-daemon"] = { code: 0 };
+    io.canned["/usr/bin/kairokud call system.recoveryDecide --params"] = {
+      code: 1,
+      stderr: "revision conflict",
+    };
+
+    const result = await runMigration(io, installation, { cutover: true });
+
+    expect(result).toEqual({ state: "blocked", blockers: ["replacement_release_failed"] });
+    expect(handoffComplete(io)).toBe(false);
+  });
+
+  test("foreign or ineffective release result cannot produce complete", async () => {
+    const io = fixture({ activeRuns: 0 });
+    io.canned["systemctl --user disable --now kairoku-daemon"] = { code: 0 };
+    io.canned["/usr/bin/kairokud call system.recoveryDecide --params"] = {
+      stdout: JSON.stringify({
+        released: true,
+        operationId: "foreign-operation",
+        purpose: "migration",
+        previousRevision: 2,
+        appliedRevision: 3,
+        claimsInhibited: false,
+      }),
+    };
+
+    const result = await runMigration(io, installation, { cutover: true });
+
+    expect(result).toEqual({ state: "blocked", blockers: ["replacement_release_unverified"] });
+    expect(handoffComplete(io)).toBe(false);
   });
 });

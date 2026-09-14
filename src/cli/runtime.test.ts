@@ -139,6 +139,7 @@ describe("probeRustLiveHealth", () => {
             daemonId: "daemon-1",
             ownerId: "owner-1",
             processInstanceId: "proc-1",
+            backendUrl: "https://app.kairoku.dev",
             heartbeatOk: true,
           }),
         },
@@ -167,5 +168,25 @@ describe("probeRustLiveHealth", () => {
     });
     const health = await probeRustLiveHealth(io, 1);
     expect(health.ok).toBe(false);
+  });
+
+  test("missing backend identity is not live proof", async () => {
+    const io = fakeIo({
+      bins: new Set(["kairokud"]),
+      canned: {
+        "/usr/bin/kairokud status --json": {
+          code: 0,
+          stdout: JSON.stringify({
+            installationId: "inst-1",
+            daemonId: "daemon-1",
+            ownerId: "owner-1",
+            processInstanceId: "proc-1",
+            heartbeatOk: true,
+          }),
+        },
+      },
+    });
+
+    expect((await probeRustLiveHealth(io, 1)).ok).toBe(false);
   });
 });

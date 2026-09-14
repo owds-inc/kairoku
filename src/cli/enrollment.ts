@@ -77,15 +77,23 @@ function progressPath(io: Io, installation: Installation): string {
 export function loadEnrollmentProgress(io: Io, installation: Installation): EnrollmentProgress | null {
   const path = progressPath(io, installation);
   const raw = io.readFile(path);
-  if (raw === null) return null;
-  try {
-    const parsed = JSON.parse(raw) as EnrollmentProgress;
-    if (parsed.schemaVersion !== 1) return null;
-    if (parsed.installationId !== installation.installationId) return null;
-    return parsed;
-  } catch {
+  if (raw === null) {
+    if (io.exists(path)) throw new EnrollmentIncompleteError("enrollment progress is unreadable");
     return null;
   }
+  let parsed: EnrollmentProgress;
+  try {
+    parsed = JSON.parse(raw) as EnrollmentProgress;
+  } catch {
+    throw new EnrollmentIncompleteError("enrollment progress is corrupt");
+  }
+  if (parsed.schemaVersion !== 1) {
+    throw new EnrollmentIncompleteError(`enrollment progress schema ${String(parsed.schemaVersion)} is unsupported`);
+  }
+  if (parsed.installationId !== installation.installationId) {
+    throw new EnrollmentIncompleteError("enrollment progress installation mismatch");
+  }
+  return parsed;
 }
 
 export function saveEnrollmentProgress(
@@ -94,7 +102,9 @@ export function saveEnrollmentProgress(
   progress: EnrollmentProgress,
 ): void {
   const path = progressPath(io, installation);
-  io.writeFile(path, `${JSON.stringify(progress, null, 2)}\n`, 0o600);
+  const temp = `${path}.tmp`;
+  io.writeFile(temp, `${JSON.stringify(progress, null, 2)}\n`, 0o600);
+  io.rename(temp, path);
 }
 
 /** Overwrite private progress: drop pollSecret without deleting the file. */
@@ -567,13 +577,9 @@ async function awaitLiveRustProof(
           ownerId === expected.ownerId &&
           typeof processInstanceId === "string" &&
           processInstanceId.length > 0 &&
-          heartbeatOk
+          heartbeatOk &&
+          body.backendUrl === expected.backendUrl
         ) {
-          if (body.backendUrl && body.backendUrl !== expected.backendUrl) {
-            throw new EnrollmentIncompleteError(
-              `live proof backendUrl mismatch (expected ${expected.backendUrl})`,
-            );
-          }
           return;
         }
       } catch (e) {

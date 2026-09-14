@@ -182,6 +182,27 @@ describe("runEnrollment — observable IO contract", () => {
     expect(loadEnrollmentProgress(io, installation)?.requestId).toBe(requestId);
     expect(loadEnrollmentProgress(io, installation)?.state).toBe("activated");
   });
+
+  test("missing backend identity is not accepted as live proof", async () => {
+    const io = baseIo();
+    seedHappyFetches(io);
+    canAcknowledge(io);
+    canLiveProof(io, { backendUrl: undefined });
+    saveEnrollmentProgress(io, installation, {
+      schemaVersion: 1,
+      installationId,
+      requestId,
+      pollSecret: "poll-secret-value",
+      backendUrl,
+      state: "pending",
+      intervalSeconds: 5,
+    });
+
+    await expect(runEnrollment(io, installation, { backendUrl, maxHeartbeatAttempts: 1 })).rejects.toThrow(
+      /live Rust proof/,
+    );
+    expect(loadEnrollmentProgress(io, installation)?.state).toBe("activated");
+  });
 });
 
 describe("runEnrollment — failure and resume paths", () => {
@@ -359,7 +380,7 @@ describe("runEnrollment — failure and resume paths", () => {
     expect(after?.installedOwnerId).toBe(expectedOwnerId);
   });
 
-  test("restores only matching installation progress", () => {
+  test("mismatched installation progress is recoverable evidence, not absence", () => {
     const io = baseIo();
     const progress: EnrollmentProgress = {
       schemaVersion: 1,
@@ -369,7 +390,38 @@ describe("runEnrollment — failure and resume paths", () => {
       backendUrl,
     };
     saveEnrollmentProgress(io, { ...installation, installationId: "other-install" }, progress);
-    expect(loadEnrollmentProgress(io, installation)).toBeNull();
+    expect(() => loadEnrollmentProgress(io, installation)).toThrow(/installation.*mismatch/i);
+  });
+
+  test("corrupt and unsupported progress are recoverable evidence, not absence", () => {
+    const io = baseIo();
+    io.files[progressFile(io)] = "{not-json";
+    expect(() => loadEnrollmentProgress(io, installation)).toThrow(/corrupt/i);
+
+    io.files[progressFile(io)] = JSON.stringify({ schemaVersion: 2, installationId });
+    expect(() => loadEnrollmentProgress(io, installation)).toThrow(/unsupported/i);
+  });
+
+  test("progress replacement is atomic and private", () => {
+    const io = baseIo();
+    const target = progressFile(io);
+    const writes: string[] = [];
+    const write = io.writeFile;
+    io.writeFile = (path, data, mode) => {
+      writes.push(path);
+      write(path, data, mode);
+    };
+
+    saveEnrollmentProgress(io, installation, {
+      schemaVersion: 1,
+      installationId,
+      requestId,
+      backendUrl,
+    });
+
+    expect(writes).toEqual([`${target}.tmp`]);
+    expect(io.files[`${target}.tmp`]).toBeUndefined();
+    expect(io.mode(target)).toBe(0o600);
   });
 
   test("clearEnrollmentSecrets overwrites pollSecret without deleting the file", () => {

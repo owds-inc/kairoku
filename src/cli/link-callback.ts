@@ -260,9 +260,11 @@ async function persistLoopbackToken(
   appUrl: string,
   payload: LinkPersistPayload,
 ): Promise<void> {
-  setTokenEnv(io, LINK_TOKEN_KEY, payload.token);
-  const installation = await resolveRuntime(io).catch(() => null);
-  if (!installation) return;
+  const installation = await resolveRuntime(io);
+  if (!installation) {
+    setTokenEnv(io, LINK_TOKEN_KEY, payload.token);
+    return;
+  }
   try {
     await installLoopbackRustToken(io, installation, {
       backendUrl: appUrl,
@@ -271,6 +273,7 @@ async function persistLoopbackToken(
       ...(payload.ownerId ? { ownerId: payload.ownerId } : {}),
       ...(payload.requestId ? { requestId: payload.requestId } : {}),
     });
+    setTokenEnv(io, LINK_TOKEN_KEY, payload.token);
   } catch (e) {
     if (e instanceof EnrollmentIncompleteError) throw e;
     throw new Error((e as Error).message);

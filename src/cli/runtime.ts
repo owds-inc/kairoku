@@ -114,6 +114,7 @@ export async function probeRustLiveHealth(io: Io, attempts = 10): Promise<RustLi
           daemonId?: string | null;
           ownerId?: string | null;
           processInstanceId?: string | null;
+          backendUrl?: string | null;
           heartbeatOk?: boolean;
           service?: { running?: boolean | null };
         };
@@ -126,6 +127,8 @@ export async function probeRustLiveHealth(io: Io, attempts = 10): Promise<RustLi
           body.ownerId &&
           typeof body.processInstanceId === "string" &&
           body.processInstanceId &&
+          typeof body.backendUrl === "string" &&
+          body.backendUrl &&
           body.heartbeatOk === true
         ) {
           return {
@@ -139,5 +142,5 @@ export async function probeRustLiveHealth(io: Io, attempts = 10): Promise<RustLi
     }
     if (i + 1 < attempts) await new Promise((r) => setTimeout(r, 200));
   }
-  return { ok: false, detail: "kairokud status --json did not report live proof (installationId/daemonId/ownerId/processInstanceId/heartbeatOk)" };
+  return { ok: false, detail: "kairokud status --json did not report live proof (installationId/daemonId/ownerId/processInstanceId/backendUrl/heartbeatOk)" };
 }

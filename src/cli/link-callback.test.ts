@@ -526,4 +526,23 @@ describe("linkDaemon — bind first, THEN open the browser (item 1)", () => {
     expect(fake.files[tokenEnv]).toBeUndefined();
     expect((fake.lines.join("\n") + fake.errors.join("\n"))).not.toContain(TOKEN);
   });
+
+  test("a corrupt Rust installation refuses the callback before mutating credentials", async () => {
+    const fake = fakeIo({ platform: "linux", home });
+    fake.bins.add("xdg-open");
+    fake.bins.add("kairokud");
+    fake.canned["/usr/bin/kairokud instance --json"] = { stdout: "{not-json" };
+    browser(fake, (link) => ({
+      token: TOKEN,
+      nonce: link.searchParams.get("nonce"),
+      daemonId: "daemon-1",
+      ownerId: "owner-1",
+    }));
+
+    const step = await linkDaemon(fake, APP, { timeoutMs: 20 });
+
+    expect(step.outcome).toBe("manual");
+    expect(fake.files[tokenEnv]).toBeUndefined();
+    expect(fake.files[`${tokenEnv}.tmp`]).toBeUndefined();
+  });
 });

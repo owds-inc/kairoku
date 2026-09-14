@@ -312,38 +312,61 @@ export function ensureReplacementInhibition(io: Io, installation: Installation):
   return opId;
 }
 
-/** Release only the matching migration operation after verified handoff. */
-export function releaseMigrationInhibition(
+type ReleaseResult = { ok: true } | { ok: false; blocker: "replacement_release_failed" | "replacement_release_unverified" };
+
+/** Release only the matching migration operation through the running daemon. */
+export async function releaseMigrationInhibition(
   io: Io,
   installation: Installation,
   operationId: string | undefined,
-): boolean {
-  if (!operationId) return false;
+): Promise<ReleaseResult> {
+  if (!operationId) return { ok: false, blocker: "replacement_release_unverified" };
   const path = join(installation.dataRoot, "local-admission.json");
   const raw = io.readFile(path);
-  if (!raw) return false;
+  if (!raw) return { ok: false, blocker: "replacement_release_unverified" };
+  let expectedRevision: number;
   try {
     const base = JSON.parse(raw) as Record<string, unknown>;
-    if (base.schema !== 1) return false;
-    if (base.maintenanceOperationId !== operationId) return false;
-    if (base.maintenancePurpose !== "migration") return false;
-    const revision = typeof base.revision === "number" ? base.revision : 1;
-    const humanDrain = base.humanDrain === true;
-    const next = {
-      ...base,
-      previousRevision: revision,
-      revision: revision + 1,
-      claimsInhibited: humanDrain,
-      maintenanceOperationId: null,
-      maintenancePurpose: null,
-      stagedVersion: null,
-      reason: humanDrain ? "human drain still latched after migration clear" : null,
-    };
-    io.writeFile(path, `${JSON.stringify(next, null, 2)}\n`, 0o600);
-    return true;
+    if (
+      base.schema !== 1 ||
+      base.maintenanceOperationId !== operationId ||
+      base.maintenancePurpose !== "migration" ||
+      typeof base.revision !== "number"
+    ) {
+      return { ok: false, blocker: "replacement_release_unverified" };
+    }
+    expectedRevision = base.revision;
   } catch {
-    return false;
+    return { ok: false, blocker: "replacement_release_unverified" };
   }
+
+  const bin = io.which("kairokud") ?? installation.executable;
+  const params = { action: "releaseMaintenance", operationId, purpose: "migration", expectedRevision };
+  const result = await io.shell([
+    bin,
+    "call",
+    "system.recoveryDecide",
+    "--params",
+    JSON.stringify(params),
+  ]);
+  if (result.code !== 0) return { ok: false, blocker: "replacement_release_failed" };
+  try {
+    const body = JSON.parse(result.stdout) as Record<string, unknown>;
+    if (
+      body.released !== true ||
+      body.operationId !== operationId ||
+      body.purpose !== "migration" ||
+      body.previousRevision !== expectedRevision ||
+      typeof body.appliedRevision !== "number" ||
+      body.appliedRevision <= expectedRevision ||
+      body.claimsInhibited !== false
+    ) {
+      return { ok: false, blocker: "replacement_release_unverified" };
+    }
+  } catch {
+    return { ok: false, blocker: "replacement_release_unverified" };
+  }
+  return { ok: true };
 }
 
 export type MigrationOptions = {
@@ -485,6 +508,11 @@ export async function runMigration(
       service?: { running?: boolean | null };
       installationId?: string;
       dataRoot?: string;
+      daemonId?: string | null;
+      ownerId?: string | null;
+      processInstanceId?: string | null;
+      backendUrl?: string | null;
+      heartbeatOk?: boolean;
     };
     if (body.service?.running !== true) {
       receipt.state = "blocked";
@@ -492,13 +520,31 @@ export async function runMigration(
       saveReceipt(io, receipt);
       return { state: "blocked", blockers: receipt.blockers };
     }
-    // Same-root live Rust evidence — installation id must match replacement.
-    if (body.installationId && body.installationId !== installation.installationId) {
+    if (
+      (body.installationId !== undefined && body.installationId !== installation.installationId) ||
+      (body.dataRoot !== undefined && body.dataRoot !== installation.dataRoot)
+    ) {
       receipt.state = "blocked";
       receipt.blockers = ["rust_identity_mismatch"];
       saveReceipt(io, receipt);
       return { state: "blocked", blockers: receipt.blockers };
     }
+    if (
+      body.installationId !== installation.installationId ||
+      body.dataRoot !== installation.dataRoot ||
+      typeof body.daemonId !== "string" || !body.daemonId ||
+      typeof body.ownerId !== "string" || !body.ownerId ||
+      typeof body.processInstanceId !== "string" || !body.processInstanceId ||
+      typeof body.backendUrl !== "string" || !body.backendUrl ||
+      body.heartbeatOk !== true
+    ) {
+      receipt.state = "blocked";
+      receipt.blockers = ["rust_identity_unknown"];
+      saveReceipt(io, receipt);
+      return { state: "blocked", blockers: receipt.blockers };
+    }
+    receipt.newDaemonId = body.daemonId;
+    receipt.newOwners = [body.ownerId];
   } catch {
     receipt.state = "blocked";
     receipt.blockers = ["rust_not_proven"];
@@ -506,7 +552,13 @@ export async function runMigration(
     return { state: "blocked", blockers: receipt.blockers };
   }
 
-  releaseMigrationInhibition(io, installation, receipt.migrationOperationId);
+  const release = await releaseMigrationInhibition(io, installation, receipt.migrationOperationId);
+  if (!release.ok) {
+    receipt.state = "blocked";
+    receipt.blockers = [release.blocker];
+    saveReceipt(io, receipt);
+    return { state: "blocked", blockers: receipt.blockers };
+  }
   receipt.state = "complete";
   receipt.blockers = [];
   saveReceipt(io, receipt);

@@ -228,7 +228,26 @@ describe("FRV09 facade gating", () => {
     };
     io.canned["systemctl --user disable --now kairoku-daemon"] = { code: 0 };
     io.canned["/usr/bin/kairokud status --json"] = {
-      stdout: JSON.stringify({ installationId: "inst-1", service: { running: true } }),
+      stdout: JSON.stringify({
+        installationId: "inst-1",
+        dataRoot: rustInstall.dataRoot,
+        daemonId: "daemon-1",
+        ownerId: "owner-1",
+        processInstanceId: "process-1",
+        backendUrl: "https://app.kairoku.dev",
+        heartbeatOk: true,
+        service: { running: true },
+      }),
+    };
+    io.canned["/usr/bin/kairokud call system.recoveryDecide --params"] = {
+      stdout: JSON.stringify({
+        released: true,
+        operationId: "migration-inst-1",
+        purpose: "migration",
+        previousRevision: 2,
+        appliedRevision: 3,
+        claimsInhibited: false,
+      }),
     };
     expect(await run(["migrate", "--cutover"], io)).toBe(0);
     expect(io.lines.join("\n")).toContain('"state":"complete"');
