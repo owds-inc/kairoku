@@ -278,11 +278,13 @@ describe("kairoku daemon in the foreground", () => {
     writeFileSync(configPath, JSON.stringify({ listen: { host: "127.0.0.1", port }, maxConcurrent: 1, repoPath: join(dir, "repo"), worktreesDir: join(dir, "wt"), runsDir: join(dir, "runs") }));
     mkdirSync(join(dir, "runs"));
     writeFileSync(join(dir, "token.env"), "KAIROKU_DAEMON_TOKEN=cli-daemon-token\n");
-    const proc = Bun.spawn(["bun", "run", main, "daemon"], {
+    const bunBin = Bun.which("bun") ?? "bun";
+    const bunDir = dirname(bunBin);
+    const proc = Bun.spawn([bunBin, "run", main, "daemon"], {
       // Keep kairokud off PATH so this Bun listener fixture is not diverted to Rust.
       env: {
         ...process.env,
-        PATH: "/usr/bin:/bin",
+        PATH: `${bunDir}:/usr/bin:/bin`,
         KAIROKU_DAEMON_CONFIG: configPath,
         KAIROKU_DAEMON_TOKEN: "",
         HIKYAKU_TOKEN: "",
@@ -316,10 +318,12 @@ describe("kairoku daemon in the foreground", () => {
     dirs.push(dir);
     const configPath = join(dir, "config.json");
     writeFileSync(configPath, JSON.stringify({ listen: { host: "0.0.0.0", port: 0 } }));
-    const proc = Bun.spawn(["bun", "run", main, "daemon"], {
+    const bunBin = Bun.which("bun") ?? "bun";
+    const bunDir = dirname(bunBin);
+    const proc = Bun.spawn([bunBin, "run", main, "daemon"], {
       env: {
         ...process.env,
-        PATH: "/usr/bin:/bin",
+        PATH: `${bunDir}:/usr/bin:/bin`,
         KAIROKU_DAEMON_CONFIG: configPath,
         KAIROKU_DAEMON_TOKEN: "",
         HIKYAKU_TOKEN: "",
