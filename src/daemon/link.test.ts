@@ -235,6 +235,32 @@ describe("backoff (RF-012)", () => {
     expect(store.cancel("r-drain")).toBe(true);
     await finished;
   });
+
+  test("a late claim after drain latches does not start provider work (FRV09/C5)", async () => {
+    const { link, app, store } = setup({ maxConcurrent: 2 });
+    await link.beat();
+    app.queue({
+      id: "d-late",
+      taskType: "implement",
+      items: [fakeItem(9)],
+    });
+    app.holdNextClaim();
+    const pollPromise = link.poll();
+    await waitFor(() => (link.status().claimsInFlight ?? 0) === 1, "claim in flight");
+    expect(link.drainReady()).toBe(false);
+    link.setDraining(true);
+    expect(link.status().draining).toBe(true);
+    expect(link.drainReady()).toBe(false);
+    app.releaseClaim();
+    expect(await pollPromise).toBe(false);
+    await waitFor(() => (link.status().claimsInFlight ?? 0) === 0, "claim settled");
+    expect(link.drainReady()).toBe(true);
+    expect(store.list()).toEqual([]);
+    await waitFor(
+      () => updates(app).some((u) => u.runId === "run-9" && u.status === "failed"),
+      "late claim reconciled as failed",
+    );
+  });
 });
 
 describe("401 stops the loop and nothing else (RF-012)", () => {

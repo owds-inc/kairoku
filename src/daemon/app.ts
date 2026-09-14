@@ -2,9 +2,10 @@
  * RF-011 — the Kairoku app client. THE ONLY OUTBOUND MODULE IN THE DAEMON.
  *
  * `constraints.test.ts` asserts that: no other production module may call
- * `fetch`, and this one may build only the three paths in `DAEMON_ROUTES`
+ * `fetch`, and this one may build only the paths in `DAEMON_ROUTES`
  * under the configured `appUrl`. That is the mechanical form of §20.3 — the
- * daemon dials out, to one place, for three things.
+ * daemon dials out, to one place, for the pinned routes (heartbeat/claim/update
+ * plus drain acknowledgement).
  *
  * Every answer is turned into a TAG rather than handed on as a status code,
  * because the loop's whole policy is a function of which of four things
@@ -28,6 +29,7 @@ export const DAEMON_ROUTES = [
   "/api/daemon/heartbeat",
   "/api/daemon/claim",
   "/api/daemon/update",
+  "/api/daemon/drain",
 ] as const;
 
 const DEFAULT_TIMEOUT_MS = 15_000;
@@ -188,6 +190,12 @@ export interface UpdateResponse {
   readonly status?: string;
 }
 
+/** Cloud drain acknowledgement (F04/F08). Daemon cannot reactivate via this route. */
+export interface DrainResponse {
+  readonly ok?: boolean;
+  readonly admissionMode?: "pending" | "active" | "draining" | "disabled";
+}
+
 // -------------------------------------------------------------------- results
 
 export type AppErrorKind = "unauthorized" | "rejected" | "server" | "network";
@@ -207,6 +215,8 @@ export interface AppClient {
   heartbeat(body: HeartbeatBody): Promise<AppResult<HeartbeatResponse>>;
   claim(): Promise<AppResult<ClaimResponse>>;
   update(body: RunReport): Promise<AppResult<UpdateResponse>>;
+  /** Ask the app to latch cloud admission to draining. */
+  drain(): Promise<AppResult<DrainResponse>>;
 }
 
 export interface AppClientOptions {
@@ -274,6 +284,7 @@ export function appClient(options: AppClientOptions): AppClient {
     heartbeat: (body) => post<HeartbeatResponse>(DAEMON_ROUTES[0], body),
     claim: () => post<ClaimResponse>(DAEMON_ROUTES[1]),
     update: (body) => post<UpdateResponse>(DAEMON_ROUTES[2], body),
+    drain: () => post<DrainResponse>(DAEMON_ROUTES[3], { mode: "draining" }),
   };
 }
 

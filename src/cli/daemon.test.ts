@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import { MAC_LAUNCHAGENT_INSTALL_STOP, run } from "./daemon";
+import { MAC_LAUNCHAGENT_INSTALL_STOP, run, usage } from "./daemon";
 import { LAUNCHD_LABEL, launchdPlist, systemdUnit } from "./service";
 import { fakeIo, type FakeIo } from "./testkit";
 
@@ -142,7 +142,98 @@ describe("kairoku daemon verbs", () => {
   test("an unknown verb prints usage and exits 2", async () => {
     const io = fakeIo();
     expect(await run(["frob"], io)).toBe(2);
-    expect(io.errors.join("\n")).toContain("kairoku daemon [install|start|stop|status|drain|update|prune]");
+    expect(io.errors.join("\n")).toContain("kairoku daemon [install|start|stop|status|drain|update|prune|migrate]");
+  });
+});
+
+describe("FRV09 facade gating", () => {
+  const rustInstall = {
+    schemaVersion: 1 as const,
+    installationId: "inst-1",
+    dataRoot: "/home/neil/.local/share/kairokud",
+    profile: "linux-personal" as const,
+    executionUser: "neil",
+    executable: "/usr/bin/kairokud",
+    service: {
+      manager: "systemd" as const,
+      scope: "user" as const,
+      label: "io.kairoku.daemon",
+      package: "direct" as const,
+    },
+  };
+
+  function withRustAndBun(io: FakeIo): FakeIo {
+    io.bins.add("kairokud");
+    io.canned["/usr/bin/kairokud instance --json"] = { stdout: JSON.stringify(rustInstall) };
+    io.files["/home/neil/.kairoku/config.json"] = JSON.stringify({ listen: { host: "127.0.0.1", port: 7801 } });
+    io.files["/home/neil/.kairoku/token.env"] = "KAIROKU_DAEMON_TOKEN=legacy\n";
+    io.files["/home/neil/.config/systemd/user/kairoku-daemon.service"] = "[Unit]\n";
+    return io;
+  }
+
+  test("Rust metadata with Bun predecessor does not route install to Rust", async () => {
+    const io = withRustAndBun(fakeIo({ platform: "linux", home: "/home/neil", env: { USER: "neil" } }));
+    expect(await run(["install"], io)).toBe(1);
+    expect(io.errors.join("\n")).toContain("legacy predecessor");
+    expect(calls(io).some((c) => c.includes("enable --now io.kairoku.daemon"))).toBe(false);
+  });
+
+  test("completed handoff admits Rust lifecycle", async () => {
+    const io = withRustAndBun(fakeIo({ platform: "linux", home: "/home/neil", env: { USER: "neil" } }));
+    io.files["/home/neil/.kairoku/migration-receipt.json"] = JSON.stringify({
+      schemaVersion: 1,
+      state: "complete",
+      blockers: [],
+      oldOwners: [],
+      newOwners: [],
+      serviceLabels: [],
+      unresolved: [],
+      dispositioned: [],
+    });
+    io.canned["systemctl --user enable --now io.kairoku.daemon"] = { code: 0 };
+    expect(await run(["install"], io)).toBe(0);
+    expect(calls(io)).toContain("systemctl --user enable --now io.kairoku.daemon");
+  });
+
+  test("drain with dual-runtime targets Bun predecessor not kairokud", async () => {
+    const io = withRustAndBun(fakeIo({ platform: "linux", home: "/home/neil", env: { USER: "neil" } }));
+    const token = "a".repeat(64);
+    io.files["/home/neil/.kairoku/drain.token"] = `${token}\n`;
+    io.modes["/home/neil/.kairoku"] = 0o700;
+    io.modes["/home/neil/.kairoku/drain.token"] = 0o600;
+    const fetched: string[] = [];
+    io.fetch = async (url) => {
+      fetched.push(url);
+      return Response.json({ local: "draining", cloud: "pending", activeAttempts: 0, pendingReports: 0 });
+    };
+    expect(await run(["drain"], io)).toBe(0);
+    expect(fetched).toEqual(["http://127.0.0.1:7801/drain"]);
+    expect(calls(io).join(" ")).not.toContain("kairokud drain");
+  });
+
+  test("migrate --cutover is reachable and documented", async () => {
+    const io = withRustAndBun(fakeIo({ platform: "linux", home: "/home/neil", env: { USER: "neil" } }));
+    io.modes["/home/neil/.kairoku"] = 0o700;
+    io.files["/home/neil/.kairoku/drain.token"] = `${"b".repeat(64)}\n`;
+    io.modes["/home/neil/.kairoku/drain.token"] = 0o600;
+    io.fetch = async (url) => {
+      if (String(url).endsWith("/drain")) {
+        return Response.json({ local: "draining", cloud: "pending", activeAttempts: 0, pendingReports: 0, claimsInFlight: 0 });
+      }
+      return Response.json({
+        capacity: { running: 0, max: 2 },
+        runs: [],
+        link: { linked: true, pendingReports: 0, claimsInFlight: 0 },
+      });
+    };
+    io.canned["systemctl --user disable --now kairoku-daemon"] = { code: 0 };
+    io.canned["/usr/bin/kairokud status --json"] = {
+      stdout: JSON.stringify({ installationId: "inst-1", service: { running: true } }),
+    };
+    expect(await run(["migrate", "--cutover"], io)).toBe(0);
+    expect(io.lines.join("\n")).toContain('"state":"complete"');
+    expect(usage).toContain("migrate");
+    expect(usage).toContain("--cutover");
   });
 });
 

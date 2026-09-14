@@ -79,6 +79,8 @@ export interface LinkStatus {
   readonly pendingReports: number;
   /** Human/cloud drain: claim polls inhibited; heartbeat/flush/cancel continue. */
   readonly draining?: boolean;
+  /** Claim HTTP requests already in flight when drain latched (FRV09/C5). */
+  readonly claimsInFlight?: number;
 }
 
 export interface Link {
@@ -91,6 +93,8 @@ export interface Link {
   flush(): Promise<void>;
   /** Inhibit claim polls only. Heartbeat, flush and cancellation keep running. */
   setDraining(draining: boolean): void;
+  /** True when drain is latched and no claim HTTP is still outstanding. */
+  drainReady(): boolean;
   stop(): void;
 }
 
@@ -138,6 +142,8 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
 
   let stopped: "token-rejected" | undefined;
   let draining = false;
+  /** Outstanding claim HTTP requests that started before drain (or race). */
+  let claimsInFlight = 0;
   let lastBeatOk = false;
   let lastBeatAt: string | undefined;
   let lastError: string | undefined;
@@ -177,6 +183,7 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     ...(lastError === undefined ? {} : { lastError }),
     ...(stopped === undefined ? {} : { stopped }),
     ...(draining ? { draining: true } : {}),
+    ...(claimsInFlight > 0 ? { claimsInFlight } : {}),
     runsInFlight: store.capacity().running,
     pendingReports: pending.length,
   });
@@ -341,7 +348,16 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     if (!lastBeatOk) return false;
     if (store.free() === 0) return false;
 
-    const result = await client.claim();
+    claimsInFlight += 1;
+    let result: Awaited<ReturnType<NonNullable<typeof client>["claim"]>>;
+    try {
+      result = await client.claim();
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      return false;
+    } finally {
+      claimsInFlight = Math.max(0, claimsInFlight - 1);
+    }
     if (halted(result)) return false;
     if (!result.ok) {
       lastError = result.error;
@@ -350,6 +366,23 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
 
     const dispatch = result.body.dispatch;
     if (!dispatch) return false;
+
+    // FRV09/C5: drain may latch while this request was in flight. Never start
+    // provider work after readiness was reported; settle the late claim without
+    // an unaccounted launch.
+    if (draining) {
+      log(`app link: reconciling late claim of ${dispatch.id} after drain — not starting`);
+      for (const item of dispatch.items ?? []) {
+        void report({
+          dispatchId: dispatch.id,
+          runId: item.runId,
+          status: "failed",
+          summary: "claimed during drain; not started",
+        });
+      }
+      return false;
+    }
+
     if (active.has(dispatch.id)) {
       // The lease re-issued a row we already hold. Running it twice is worse
       // than any stuck row (§20.7); say nothing new and carry on.
@@ -506,6 +539,9 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     flush,
     setDraining(next) {
       draining = next;
+    },
+    drainReady() {
+      return draining && claimsInFlight === 0;
     },
     stop() {
       clearTimeout(beatTimer);

@@ -8,6 +8,12 @@
  * human-run worktree cleanup. Linux install rewrites the unit only when its
  * content changes and never bounces a running daemon whose definition is
  * unchanged.
+ *
+ * FRV09: Rust metadata alone does not switch the facade while a Bun predecessor
+ * remains. Lifecycle/foreground route to Rust only after a completed handoff
+ * receipt, or when predecessor absence is positively established. Unreadable
+ * predecessor inventory blocks. Explicit `migrate`/`cutover` drives handoff;
+ * install/setup never silently cut over.
  */
 
 import { dirname, join } from "node:path";
@@ -15,10 +21,15 @@ import { isLoopbackHost, kairokuHome } from "../daemon/config";
 import { main as prune } from "../daemon/prune";
 import { serve } from "../daemon/server";
 import type { Io } from "./io";
+import {
+  handoffComplete,
+  inventoryPredecessor,
+  runMigration,
+} from "./migration";
 import { resolveRuntime, type Installation } from "./runtime";
 import { LAUNCHD_LABEL, SYSTEMD_UNIT, systemdUnit } from "./service";
 
-export const usage = `usage: kairoku daemon [install|start|stop|status|drain|update|prune]
+export const usage = `usage: kairoku daemon [install|start|stop|status|drain|update|prune|migrate]
 
   (no verb)  run the resolved daemon in the foreground until SIGTERM
   install    install/enable the resolved Rust service when present; else
@@ -29,7 +40,9 @@ export const usage = `usage: kairoku daemon [install|start|stop|status|drain|upd
   drain      latch local claim drain and acknowledge cloud drain; heartbeat,
              flush and cancellation continue
   update     ask the live Rust daemon to check for an update (system.requestUpdate)
-  prune      remove stale Bun run worktrees — blocked against Rust data roots`;
+  prune      remove stale Bun run worktrees — blocked against Rust data roots
+  migrate    inventory/drain/reconcile Bun→Rust handoff (add --cutover only when
+             a human directs disable of the inventoried predecessor)`;
 
 /** PATH for the service: the binary's dir, bun, node's dir, the usual bins. */
 export function servicePath(io: Io): string {
@@ -46,6 +59,24 @@ export function servicePath(io: Io): string {
     "/bin",
   ];
   return [...new Set(dirs.filter(Boolean))].join(":");
+}
+
+/**
+ * Whether CLI lifecycle/foreground may use the resolved Rust installation.
+ * Fresh installs (no predecessor) are admitted; dual-runtime waits for handoff.
+ */
+export function admitRustFacade(io: Io): { ok: true } | { ok: false; reason: string } {
+  if (handoffComplete(io)) return { ok: true };
+  const predecessor = inventoryPredecessor(io);
+  if (predecessor === "unknown") {
+    return { ok: false, reason: "unreadable predecessor inventory — cannot switch facade" };
+  }
+  if (predecessor === null) return { ok: true };
+  return {
+    ok: false,
+    reason:
+      "legacy predecessor present — complete `kairoku daemon migrate --cutover` before switching the facade",
+  };
 }
 
 type Verb = (io: Io) => Promise<number>;
@@ -202,7 +233,9 @@ async function drainCommand(io: Io): Promise<number> {
     io.err(`kairoku daemon drain: ${(e as Error).message}`);
     return 1;
   }
-  if (installation) {
+  // Dual-runtime / incomplete handoff: drain the Bun predecessor, not Rust.
+  const admit = admitRustFacade(io);
+  if (installation && admit.ok) {
     const bin = io.which("kairokud") ?? installation.executable;
     const result = await io.shell([bin, "drain", "--json"]);
     if (result.stdout.trim()) io.out(result.stdout.trim());
@@ -210,6 +243,24 @@ async function drainCommand(io: Io): Promise<number> {
     return result.code;
   }
   return drainLegacy(io);
+}
+
+async function migrateCommand(args: string[], io: Io): Promise<number> {
+  const cutover = args.includes("--cutover");
+  let installation = null;
+  try {
+    installation = await resolveRuntime(io);
+  } catch (e) {
+    io.err(`kairoku daemon migrate: ${(e as Error).message}`);
+    return 1;
+  }
+  if (!installation) {
+    io.err("kairoku daemon migrate: no resolved Rust installation — install kairokud first");
+    return 1;
+  }
+  const result = await runMigration(io, installation, { cutover });
+  io.out(JSON.stringify(result));
+  return result.state === "blocked" ? 1 : 0;
 }
 
 async function pruneCommand(args: string[], io: Io): Promise<number> {
@@ -315,10 +366,11 @@ async function rustLifecycle(verb: string, installation: Installation, io: Io): 
 }
 
 export async function run(args: string[], io: Io): Promise<number> {
-  const [verb] = args;
-  if (verb === "prune") return pruneCommand(args.slice(1), io);
+  const [verb, ...rest] = args;
+  if (verb === "prune") return pruneCommand(rest, io);
   if (verb === "drain") return drainCommand(io);
   if (verb === "update") return updateCommand(io);
+  if (verb === "migrate") return migrateCommand(rest, io);
 
   let installation = null;
   try {
@@ -328,8 +380,24 @@ export async function run(args: string[], io: Io): Promise<number> {
     return 1;
   }
 
+  // FRV09/C4: Rust metadata alone must not switch the facade while a predecessor
+  // remains, or when predecessor inventory is unreadable.
+  let useRust = false;
+  if (installation) {
+    const admit = admitRustFacade(io);
+    if (admit.ok) {
+      useRust = true;
+    } else if (verb === undefined || verb === "install") {
+      io.err(`kairoku daemon: ${admit.reason}`);
+      return 1;
+    } else if (verb === "start") {
+      // Keep Bun start available so the predecessor stays operable; surface the gate.
+      io.err(`kairoku daemon: ${admit.reason}`);
+    }
+  }
+
   if (verb === undefined) {
-    if (installation) return rustForeground(io, installation);
+    if (useRust && installation) return rustForeground(io, installation);
     try {
       return await serve();
     } catch (e) {
@@ -338,7 +406,7 @@ export async function run(args: string[], io: Io): Promise<number> {
     }
   }
 
-  if (installation) return rustLifecycle(verb, installation, io);
+  if (useRust && installation) return rustLifecycle(verb, installation, io);
 
   const table = io.platform === "darwin" ? mac : io.platform === "linux" ? linux : null;
   const fn = table?.[verb];

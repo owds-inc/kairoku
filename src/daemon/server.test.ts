@@ -185,6 +185,7 @@ describe("listener — authenticated POST /drain (F08)", () => {
       cloud: "pending",
       activeAttempts: 0,
       pendingReports: 2,
+      claimsInFlight: 0,
     });
     expect(set).toBe(true);
     expect(loadHumanDrain(h.dir)).toBe(true);

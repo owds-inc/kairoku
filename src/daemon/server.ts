@@ -14,6 +14,7 @@
  */
 
 import { version } from "../../package.json";
+import { appClient } from "./app";
 import {
   assertBindable,
   configDirOf,
@@ -39,7 +40,7 @@ export interface LinkView {
 export interface DaemonDeps {
   readonly store?: RunStore;
   readonly link?: LinkView;
-  /** Test seam: cloud drain POST. Defaults to `fetch`. */
+  /** Test seam: cloud drain acknowledgement. Defaults to the app client. */
   readonly cloudDrain?: (config: Config) => Promise<"draining" | "pending">;
 }
 
@@ -81,23 +82,13 @@ function bearer(header: string | null): string | null {
   return match?.[1] ?? null;
 }
 
+/** Outbound cloud drain via the sole app client — never a second fetch path. */
 async function defaultCloudDrain(config: Config): Promise<"draining" | "pending"> {
   if (!config.appUrl || !config.token) return "pending";
-  try {
-    const res = await fetch(`${config.appUrl}/api/daemon/drain`, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${config.token}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ mode: "draining" }),
-    });
-    if (!res.ok) return "pending";
-    const body = (await res.json()) as { ok?: unknown; admissionMode?: unknown };
-    return body.ok === true && body.admissionMode === "draining" ? "draining" : "pending";
-  } catch {
-    return "pending";
-  }
+  const client = appClient({ appUrl: config.appUrl, token: config.token });
+  const result = await client.drain();
+  if (!result.ok) return "pending";
+  return result.body.ok === true && result.body.admissionMode === "draining" ? "draining" : "pending";
 }
 
 export function createDaemon(config: Config, deps: DaemonDeps = {}): Daemon {
@@ -149,6 +140,7 @@ export function createDaemon(config: Config, deps: DaemonDeps = {}): Daemon {
             cloud,
             activeAttempts: store.capacity().running,
             pendingReports: status?.pendingReports ?? 0,
+            claimsInFlight: status?.claimsInFlight ?? 0,
           });
         },
       },
