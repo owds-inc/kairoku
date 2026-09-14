@@ -110,4 +110,18 @@ describe("resolveRuntime", () => {
     await expect(resolveRuntime(io)).rejects.toThrow(/failed/);
     expect(Object.keys(io.files)).toHaveLength(0);
   });
+
+  test("throws on unrelated not-found stderr instead of treating as absent", async () => {
+    const io = fakeIo({
+      bins: new Set(["kairokud"]),
+      canned: {
+        "/usr/bin/kairokud instance --json": {
+          code: 127,
+          stderr: "error: shared library not found\n",
+        },
+      },
+    });
+    await expect(resolveRuntime(io)).rejects.toThrow(/failed/);
+    expect(Object.keys(io.files)).toHaveLength(0);
+  });
 });

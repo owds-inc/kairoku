@@ -50,7 +50,7 @@ function isInstallation(value: unknown): value is Installation {
 
 /**
  * Ask the resolved `kairokud` binary for installation metadata.
- * - `null` when absent (no installation.json / command reports missing)
+ * - `null` when absent (no installation.json)
  * - throws on ambiguity or corrupt state without mutating anything
  */
 export async function resolveRuntime(io: Io): Promise<Installation | null> {
@@ -60,11 +60,8 @@ export async function resolveRuntime(io: Io): Promise<Installation | null> {
   const result = await io.shell([bin, "instance", "--json"]);
   if (result.code !== 0) {
     const combined = `${result.stdout}\n${result.stderr}`.toLowerCase();
-    if (
-      combined.includes("no installation.json") ||
-      combined.includes("not found") ||
-      combined.includes("no such file")
-    ) {
+    // Only the explicit absent signal maps to null; other non-zero exits are hard errors.
+    if (combined.includes("no installation.json")) {
       return null;
     }
     throw new Error(
