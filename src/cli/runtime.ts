@@ -92,3 +92,52 @@ export function decideFromInventory(opts: {
 }): SetupAction {
   return chooseSetupAction(opts.owners.length, opts.matching, opts.running);
 }
+
+export type RustLiveHealth = {
+  ok: boolean;
+  detail: string;
+};
+
+/**
+ * Final setup health from the resolved Rust service (`status --json`), not the
+ * Bun HTTP `/status` listener. Offline progress alone is not live proof.
+ */
+export async function probeRustLiveHealth(io: Io, attempts = 10): Promise<RustLiveHealth> {
+  const bin = io.which("kairokud");
+  if (!bin) return { ok: false, detail: "kairokud not on PATH" };
+  for (let i = 0; i < attempts; i++) {
+    const status = await io.shell([bin, "status", "--json"]);
+    if (status.code === 0) {
+      try {
+        const body = JSON.parse(status.stdout) as {
+          installationId?: string;
+          daemonId?: string | null;
+          ownerId?: string | null;
+          processInstanceId?: string | null;
+          heartbeatOk?: boolean;
+          service?: { running?: boolean | null };
+        };
+        if (
+          typeof body.installationId === "string" &&
+          body.installationId &&
+          typeof body.daemonId === "string" &&
+          body.daemonId &&
+          typeof body.ownerId === "string" &&
+          body.ownerId &&
+          typeof body.processInstanceId === "string" &&
+          body.processInstanceId &&
+          body.heartbeatOk === true
+        ) {
+          return {
+            ok: true,
+            detail: `kairokud status — daemon ${body.daemonId}, process ${body.processInstanceId}, heartbeat ok`,
+          };
+        }
+      } catch {
+        // retry
+      }
+    }
+    if (i + 1 < attempts) await new Promise((r) => setTimeout(r, 200));
+  }
+  return { ok: false, detail: "kairokud status --json did not report live proof (installationId/daemonId/ownerId/processInstanceId/heartbeatOk)" };
+}

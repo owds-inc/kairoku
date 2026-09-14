@@ -17,7 +17,7 @@ import { EnrollmentIncompleteError, runEnrollment } from "./enrollment";
 import { linkDaemon } from "./link-callback";
 import type { Io } from "./io";
 import * as plugin from "./plugin";
-import { resolveRuntime } from "./runtime";
+import { probeRustLiveHealth, resolveRuntime } from "./runtime";
 import {
   appCheckoutDir,
   checkout,
@@ -225,9 +225,11 @@ export async function daemon(
     show(s);
   }
 
-  // F03 — Rust enrollment (cross-device poll) when installation metadata exists;
-  // otherwise retain the Q12 loopback callback. Never treat a Bun app token as
-  // the Rust kairoku.token.
+  // F03 / FRV08 — Rust enrollment (cross-device poll) when installation metadata
+  // exists; otherwise retain the Q12 loopback callback. Never treat a Bun app
+  // token as the Rust kairoku.token. When Rust enrollment completes, skip the
+  // Bun appLink heartbeat and final HTTP /status probe.
+  let rustEnrolled = false;
   if (opts.link) {
     const appUrl = normaliseAppUrl(opts.appUrl ?? configuredAppUrl(io) ?? DEFAULT_APP_URL);
     let installation = null;
@@ -250,6 +252,7 @@ export async function daemon(
           outcome: "done",
           detail: `Rust enrolled — daemon ${identity.daemonId}, owner ${identity.ownerId}`,
         });
+        rustEnrolled = true;
       } catch (e) {
         const detail =
           e instanceof EnrollmentIncompleteError
@@ -270,37 +273,47 @@ export async function daemon(
     }
   }
 
-  const link = await appLink(io, { yes: opts.yes, appUrl: opts.appUrl, appToken: opts.appToken });
-  show(link.step);
-  if (link.stop) {
-    // Nothing is installed behind a link that does not work.
-    io.out(`\n== stopped: ${link.stop}`);
-    io.out("   mint a fresh token in the app under Settings → Daemons and rerun with --app-token");
-    return 1;
+  if (!rustEnrolled) {
+    const link = await appLink(io, { yes: opts.yes, appUrl: opts.appUrl, appToken: opts.appToken });
+    show(link.step);
+    if (link.stop) {
+      // Nothing is installed behind a link that does not work.
+      io.out(`\n== stopped: ${link.stop}`);
+      io.out("   mint a fresh token in the app under Settings → Daemons and rerun with --app-token");
+      return 1;
+    }
   }
 
   io.out("== daemon service");
   const service = await daemonCmd.run(["install"], io);
   if (service !== 0) return service;
 
-  const home = kairokuHome(io.home);
-  let listen: { host?: string; port?: number } = {};
-  try {
-    listen = (JSON.parse(io.readFile(join(home, "config.json")) ?? "{}") as { listen?: typeof listen }).listen ?? {};
-  } catch {
-    // reported by the reachability check below
+  let finalOk = false;
+  if (rustEnrolled || (await resolveRuntime(io).catch(() => null))) {
+    const health = await probeRustLiveHealth(io, 10);
+    io.out(`   ${health.ok ? "PASS" : "FAIL"}  ${"rust daemon live".padEnd(34)} ${health.detail}`.trimEnd());
+    finalOk = health.ok;
+  } else {
+    const home = kairokuHome(io.home);
+    let listen: { host?: string; port?: number } = {};
+    try {
+      listen = (JSON.parse(io.readFile(join(home, "config.json")) ?? "{}") as { listen?: typeof listen }).listen ?? {};
+    } catch {
+      // reported by the reachability check below
+    }
+    const statusUrl = `http://${listen.host ?? "127.0.0.1"}:${listen.port ?? 7801}/status`;
+    // Ten tries: the service was started moments ago.
+    const check = reachable(statusUrl, await daemonStatus(io, statusUrl, 10));
+    io.out(`   ${check.status}  ${check.name.padEnd(34)} ${check.detail ?? ""}`.trimEnd());
+    finalOk = check.status === "PASS";
   }
-  const statusUrl = `http://${listen.host ?? "127.0.0.1"}:${listen.port ?? 7801}/status`;
-  // Ten tries: the service was started moments ago.
-  const check = reachable(statusUrl, await daemonStatus(io, statusUrl, 10));
-  io.out(`   ${check.status}  ${check.name.padEnd(34)} ${check.detail ?? ""}`.trimEnd());
 
   const owed = remainder(io, steps);
   io.out("");
   io.out(owed.length ? "== done. What is left is human-only:\n" : "== done. Nothing human-only is outstanding on this machine.");
   for (const item of owed) io.out(`  ${item}`);
   io.out("\nThen: kairoku doctor");
-  return check.status === "PASS" ? 0 : 1;
+  return finalOk ? 0 : 1;
 }
 
 export async function run(args: string[], io: Io): Promise<number> {

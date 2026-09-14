@@ -1,5 +1,6 @@
 /**
- * F03 enrollment IO contract and failure paths. Uses fakeIo — no live cloud.
+ * F03 / FRV08 enrollment IO contract and failure paths. Uses fakeIo — no live cloud.
+ * Live proof is from `kairokud status --json`, never a CLI-synthesized heartbeat.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -8,6 +9,7 @@ import {
   ENROLLMENT_PROGRESS_FILE,
   EnrollmentIncompleteError,
   clearEnrollmentSecrets,
+  installLoopbackRustToken,
   loadEnrollmentProgress,
   runEnrollment,
   saveEnrollmentProgress,
@@ -22,6 +24,7 @@ const expectedOwnerId = "user_owner_1";
 const requestId = "11111111-1111-4111-8111-111111111111";
 const installationId = "install-xyz";
 const backendUrl = "https://app.test";
+const processInstanceId = "proc-instance-1";
 
 const installation: Installation = {
   schemaVersion: 1,
@@ -56,36 +59,17 @@ function baseIo(): FakeIo {
   return io;
 }
 
-/** Seed HTTPS responses: approved (poll), then matching heartbeat. Ack is via shell. */
-function seedHappyFetches(io: FakeIo, heartbeatDaemonId = expectedDaemonId): void {
-  const queue: Array<() => Response> = [
-    () =>
-      Response.json({
+/** Seed HTTPS poll/request only — live proof is shell status, not /heartbeat. */
+function seedHappyFetches(io: FakeIo): void {
+  io.fetch = async (url) => {
+    if (String(url).includes("/api/daemon/enrollment/poll")) {
+      return Response.json({
         state: "approved",
         daemonId: expectedDaemonId,
         token: issuedToken,
         ownerId: expectedOwnerId,
         installationId,
-      }),
-    () =>
-      Response.json({
-        daemonId: heartbeatDaemonId,
-        ownerId: expectedOwnerId,
-        installationId,
-        liveness: "online",
-        heartbeatIntervalMs: 30_000,
-      }),
-  ];
-  io.fetch = async (url) => {
-    if (String(url).includes("/api/daemon/enrollment/poll")) {
-      const next = queue.shift();
-      if (!next) throw new Error("unexpected extra poll");
-      return next();
-    }
-    if (String(url).includes("/api/daemon/heartbeat")) {
-      const next = queue.shift();
-      if (!next) throw new Error("unexpected extra heartbeat");
-      return next();
+      });
     }
     if (String(url).includes("/api/daemon/enrollment/request")) {
       return Response.json({
@@ -97,6 +81,9 @@ function seedHappyFetches(io: FakeIo, heartbeatDaemonId = expectedDaemonId): voi
         intervalSeconds: 5,
         state: "pending",
       });
+    }
+    if (String(url).includes("/api/daemon/heartbeat")) {
+      throw new Error("CLI must not synthesize live proof via /api/daemon/heartbeat");
     }
     return new Response("", { status: 404 });
   };
@@ -116,11 +103,34 @@ function canAcknowledge(io: FakeIo): void {
   });
 }
 
+function canLiveProof(
+  io: FakeIo,
+  overrides: Record<string, unknown> = {},
+): void {
+  io.canned["/usr/bin/kairokud status --json"] = {
+    code: 0,
+    stdout: JSON.stringify({
+      activeAttempts: 0,
+      unresolvedAttempts: 0,
+      pendingReports: 0,
+      installationId,
+      daemonId: expectedDaemonId,
+      ownerId: expectedOwnerId,
+      processInstanceId,
+      heartbeatOk: true,
+      backendUrl,
+      service: { running: true },
+      ...overrides,
+    }),
+  };
+}
+
 describe("runEnrollment — observable IO contract", () => {
   test("writes the token via --stdin, never prints or argv-logs it, returns identity", async () => {
     const io = baseIo();
     seedHappyFetches(io);
     canAcknowledge(io);
+    canLiveProof(io);
     saveEnrollmentProgress(io, installation, {
       schemaVersion: 1,
       installationId,
@@ -137,17 +147,23 @@ describe("runEnrollment — observable IO contract", () => {
     expect(io.calls.flat().join(" ")).not.toContain(issuedToken);
     expect(io.lines.join("\n")).not.toContain(issuedToken);
     expect(result).toEqual({ daemonId: expectedDaemonId, ownerId: expectedOwnerId });
+    expect(io.calls.some((c) => c.includes("status") && c.includes("--json"))).toBe(true);
+    expect(io.fetch).toBeDefined();
 
     const after = loadEnrollmentProgress(io, installation);
     expect(after?.pollSecret).toBeUndefined();
     expect(after?.daemonId).toBe(expectedDaemonId);
+    expect(after?.installedDaemonId).toBe(expectedDaemonId);
+    expect(after?.installedOwnerId).toBe(expectedOwnerId);
+    expect(after?.state).toBe("live_proof");
     expect(io.mode(progressFile(io))).toBe(0o600);
   });
 
-  test("wrong heartbeat daemonId returns incomplete setup and does not print success", async () => {
+  test("wrong live-proof daemonId returns incomplete setup and does not print success", async () => {
     const io = baseIo();
-    seedHappyFetches(io, "wrong-daemon-id");
+    seedHappyFetches(io);
     canAcknowledge(io);
+    canLiveProof(io, { daemonId: "wrong-daemon-id" });
     saveEnrollmentProgress(io, installation, {
       schemaVersion: 1,
       installationId,
@@ -158,13 +174,13 @@ describe("runEnrollment — observable IO contract", () => {
       intervalSeconds: 5,
     });
 
-    await expect(runEnrollment(io, installation, { backendUrl })).rejects.toBeInstanceOf(
+    await expect(runEnrollment(io, installation, { backendUrl, maxHeartbeatAttempts: 3 })).rejects.toBeInstanceOf(
       EnrollmentIncompleteError,
     );
     expect(io.lines.join("\n")).not.toContain(issuedToken);
     expect(io.lines.join("\n").toLowerCase()).not.toContain("account setup complete");
-    // Progress retained for resume (still has request id).
     expect(loadEnrollmentProgress(io, installation)?.requestId).toBe(requestId);
+    expect(loadEnrollmentProgress(io, installation)?.state).toBe("activated");
   });
 });
 
@@ -190,26 +206,11 @@ describe("runEnrollment — failure and resume paths", () => {
     expect(loadEnrollmentProgress(io, installation)?.pollSecret).toBe("poll-secret-value");
   });
 
-  test("heartbeat timeout is incomplete setup with resumable progress", async () => {
+  test("live Rust proof timeout is incomplete setup with resumable progress", async () => {
     const io = baseIo();
-    let heartbeats = 0;
-    io.fetch = async (url) => {
-      if (String(url).includes("/poll")) {
-        return Response.json({
-          state: "approved",
-          daemonId: expectedDaemonId,
-          token: issuedToken,
-          ownerId: expectedOwnerId,
-          installationId,
-        });
-      }
-      if (String(url).includes("/heartbeat")) {
-        heartbeats++;
-        return Response.json({ liveness: "offline" }, { status: 503 });
-      }
-      return new Response("", { status: 404 });
-    };
+    seedHappyFetches(io);
     canAcknowledge(io);
+    canLiveProof(io, { heartbeatOk: false });
     saveEnrollmentProgress(io, installation, {
       schemaVersion: 1,
       installationId,
@@ -219,16 +220,15 @@ describe("runEnrollment — failure and resume paths", () => {
       intervalSeconds: 5,
     });
 
-    // Shrink attempts via env so the test stays fast — awaitHeartbeatProof uses maxAttempts 30;
-    // override by making every heartbeat fail and use seed with few sleeps (0 ms).
     await expect(
       runEnrollment(io, installation, { backendUrl, maxHeartbeatAttempts: 3 }),
-    ).rejects.toThrow(/heartbeat/);
-    expect(heartbeats).toBeGreaterThan(0);
+    ).rejects.toThrow(/live Rust proof/);
     expect(loadEnrollmentProgress(io, installation)?.requestId).toBe(requestId);
+    expect(loadEnrollmentProgress(io, installation)?.state).toBe("activated");
   });
 
   function seedOwnerChangeProgress(io: FakeIo): void {
+    // Prior installed authority survives a new pending request.
     saveEnrollmentProgress(io, installation, {
       schemaVersion: 1,
       installationId,
@@ -236,10 +236,12 @@ describe("runEnrollment — failure and resume paths", () => {
       pollSecret: "poll-secret-value",
       backendUrl,
       intervalSeconds: 5,
-      ownerId: "user_previous_owner",
-      daemonId: "daemon-old",
-      state: "activated",
+      installedOwnerId: "user_previous_owner",
+      installedDaemonId: "daemon-old",
+      state: "pending",
     });
+    // Credential present + missing owner would be "unknown"; here owner is known via installed*.
+    io.writeFile(join(installation.dataRoot, ".secrets.json"), "{}\n", 0o600);
   }
 
   test("owner-changing enrollment refuses while activeAttempts are reported", async () => {
@@ -266,7 +268,6 @@ describe("runEnrollment — failure and resume paths", () => {
     const io = baseIo();
     seedHappyFetches(io);
     canAcknowledge(io);
-    // Matches F01 status --json today: counters stay null until durable stores exist.
     io.canned["/usr/bin/kairokud status --json"] = {
       code: 0,
       stdout: JSON.stringify({
@@ -303,20 +304,59 @@ describe("runEnrollment — failure and resume paths", () => {
     const io = baseIo();
     seedHappyFetches(io);
     canAcknowledge(io);
-    io.canned["/usr/bin/kairokud status --json"] = {
-      code: 0,
-      stdout: JSON.stringify({
-        activeAttempts: 0,
-        unresolvedAttempts: 0,
-        pendingReports: 0,
-      }),
-    };
+    canLiveProof(io);
     seedOwnerChangeProgress(io);
 
     const result = await runEnrollment(io, installation, { backendUrl });
     expect(result).toEqual({ daemonId: expectedDaemonId, ownerId: expectedOwnerId });
     expect(io.calls.some((c) => c.includes("status") && c.includes("--json"))).toBe(true);
     expect(io.calls.some((c) => c.includes("--stdin"))).toBe(true);
+  });
+
+  test("missing owner with existing credential blocks owner change as unknown", async () => {
+    const io = baseIo();
+    seedHappyFetches(io);
+    canAcknowledge(io);
+    canLiveProof(io);
+    saveEnrollmentProgress(io, installation, {
+      schemaVersion: 1,
+      installationId,
+      requestId,
+      pollSecret: "poll-secret-value",
+      backendUrl,
+      state: "pending",
+      intervalSeconds: 5,
+      // no installedOwnerId — credential alone ⇒ unknown, not fresh
+    });
+    io.writeFile(join(installation.dataRoot, ".secrets.json"), "{}\n", 0o600);
+
+    await expect(runEnrollment(io, installation, { backendUrl })).rejects.toThrow(
+      /installed owner is unknown while a credential exists/,
+    );
+    expect(io.calls.some((c) => c.includes("--stdin"))).toBe(false);
+  });
+
+  test("denied poll preserves prior attempt then fresh request can proceed later", async () => {
+    const io = baseIo();
+    io.fetch = async (url) => {
+      if (String(url).includes("/poll")) return Response.json({ state: "denied" });
+      return new Response("", { status: 404 });
+    };
+    saveEnrollmentProgress(io, installation, {
+      schemaVersion: 1,
+      installationId,
+      requestId,
+      pollSecret: "poll-secret-value",
+      backendUrl,
+      intervalSeconds: 5,
+      installedOwnerId: expectedOwnerId,
+      installedDaemonId: expectedDaemonId,
+    });
+    await expect(runEnrollment(io, installation, { backendUrl })).rejects.toThrow(/denied/);
+    expect(io.calls.some((c) => c.includes("--stdin"))).toBe(false);
+    const after = loadEnrollmentProgress(io, installation);
+    expect(after?.state).toBe("denied");
+    expect(after?.installedOwnerId).toBe(expectedOwnerId);
   });
 
   test("restores only matching installation progress", () => {
@@ -329,7 +369,6 @@ describe("runEnrollment — failure and resume paths", () => {
       backendUrl,
     };
     saveEnrollmentProgress(io, { ...installation, installationId: "other-install" }, progress);
-    // Same dataRoot file but different installation id in loader check:
     expect(loadEnrollmentProgress(io, installation)).toBeNull();
   });
 
@@ -343,6 +382,8 @@ describe("runEnrollment — failure and resume paths", () => {
       backendUrl,
       daemonId: expectedDaemonId,
       ownerId: expectedOwnerId,
+      installedDaemonId: expectedDaemonId,
+      installedOwnerId: expectedOwnerId,
       state: "activated",
     });
     clearEnrollmentSecrets(io, installation, {
@@ -353,11 +394,14 @@ describe("runEnrollment — failure and resume paths", () => {
       backendUrl,
       daemonId: expectedDaemonId,
       ownerId: expectedOwnerId,
+      installedDaemonId: expectedDaemonId,
+      installedOwnerId: expectedOwnerId,
       state: "activated",
     });
     expect(io.exists(progressFile(io))).toBe(true);
     expect(loadEnrollmentProgress(io, installation)?.pollSecret).toBeUndefined();
     expect(loadEnrollmentProgress(io, installation)?.daemonId).toBe(expectedDaemonId);
+    expect(loadEnrollmentProgress(io, installation)?.installedOwnerId).toBe(expectedOwnerId);
   });
 
   test("denied poll stops without writing a token", async () => {
@@ -383,5 +427,30 @@ describe("runEnrollment — failure and resume paths", () => {
     await expect(
       runEnrollment(io, installation, { backendUrl: "http://evil.example/app" }),
     ).rejects.toThrow(/HTTPS/);
+  });
+
+  test("installLoopbackRustToken refuses missing identity", async () => {
+    const io = baseIo();
+    await expect(
+      installLoopbackRustToken(io, installation, {
+        backendUrl,
+        token: issuedToken,
+      }),
+    ).rejects.toThrow(/missing daemon\/owner identity/);
+  });
+
+  test("installLoopbackRustToken already-active path proves via live status", async () => {
+    const io = baseIo();
+    canAcknowledge(io);
+    canLiveProof(io);
+    const identity = await installLoopbackRustToken(io, installation, {
+      backendUrl,
+      token: issuedToken,
+      daemonId: expectedDaemonId,
+      ownerId: expectedOwnerId,
+    });
+    expect(identity).toEqual({ daemonId: expectedDaemonId, ownerId: expectedOwnerId });
+    expect(io.calls.some((c) => c.includes("--stdin"))).toBe(true);
+    expect(loadEnrollmentProgress(io, installation)?.state).toBe("live_proof");
   });
 });

@@ -3,6 +3,7 @@ import { fakeIo } from "./testkit";
 import {
   chooseSetupAction,
   decideFromInventory,
+  probeRustLiveHealth,
   resolveRuntime,
   type Installation,
 } from "./runtime";
@@ -123,5 +124,48 @@ describe("resolveRuntime", () => {
     });
     await expect(resolveRuntime(io)).rejects.toThrow(/failed/);
     expect(Object.keys(io.files)).toHaveLength(0);
+  });
+});
+
+describe("probeRustLiveHealth", () => {
+  test("requires heartbeatOk plus identity fields from status --json", async () => {
+    const io = fakeIo({
+      bins: new Set(["kairokud"]),
+      canned: {
+        "/usr/bin/kairokud status --json": {
+          code: 0,
+          stdout: JSON.stringify({
+            installationId: "inst-1",
+            daemonId: "daemon-1",
+            ownerId: "owner-1",
+            processInstanceId: "proc-1",
+            heartbeatOk: true,
+          }),
+        },
+      },
+    });
+    const health = await probeRustLiveHealth(io, 1);
+    expect(health.ok).toBe(true);
+    expect(health.detail).toContain("daemon-1");
+  });
+
+  test("offline or incomplete status is not live proof", async () => {
+    const io = fakeIo({
+      bins: new Set(["kairokud"]),
+      canned: {
+        "/usr/bin/kairokud status --json": {
+          code: 0,
+          stdout: JSON.stringify({
+            installationId: "inst-1",
+            daemonId: "daemon-1",
+            ownerId: "owner-1",
+            processInstanceId: "proc-1",
+            heartbeatOk: false,
+          }),
+        },
+      },
+    });
+    const health = await probeRustLiveHealth(io, 1);
+    expect(health.ok).toBe(false);
   });
 });
