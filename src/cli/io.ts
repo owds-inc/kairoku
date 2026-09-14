@@ -25,8 +25,15 @@ export type Io = {
   /** A readline prompt; the answer, trimmed. */
   ask(question: string): Promise<string>;
   which(bin: string): string | null;
-  /** Run argv. `live` streams stdio to the terminal instead of capturing it. */
-  shell(argv: string[], opts?: { live?: boolean; env?: Record<string, string> }): Promise<ShellResult>;
+  /**
+   * Run argv. `live` streams stdio to the terminal instead of capturing it.
+   * Optional `stdin` feeds the child once then closes (for protected secret
+   * delivery — never put secrets in argv).
+   */
+  shell(
+    argv: string[],
+    opts?: { live?: boolean; env?: Record<string, string>; stdin?: string },
+  ): Promise<ShellResult>;
   exists(path: string): boolean;
   /** File text, or null when unreadable. */
   readFile(path: string): string | null;
@@ -57,12 +64,17 @@ export const io: Io = {
   },
   which: (bin) => Bun.which(bin, { PATH: process.env.PATH }),
   async shell(argv, opts = {}) {
+    const useStdin = opts.stdin !== undefined;
     const proc = Bun.spawn(argv, {
-      stdin: opts.live ? "inherit" : "ignore",
+      stdin: opts.live ? "inherit" : useStdin ? "pipe" : "ignore",
       stdout: opts.live ? "inherit" : "pipe",
       stderr: opts.live ? "inherit" : "pipe",
       env: { ...process.env, ...opts.env },
     });
+    if (useStdin && proc.stdin) {
+      proc.stdin.write(opts.stdin!);
+      proc.stdin.end();
+    }
     const text = (s: unknown) => (s instanceof ReadableStream ? new Response(s).text() : "");
     const [code, stdout, stderr] = await Promise.all([proc.exited, text(proc.stdout), text(proc.stderr)]);
     return { code, stdout, stderr };

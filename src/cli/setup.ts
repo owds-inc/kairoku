@@ -13,9 +13,11 @@ import { kairokuHome, migrateHome, normaliseAppUrl, parseTokenEnv } from "../dae
 import { version as cliVersion } from "../../package.json";
 import * as daemonCmd from "./daemon";
 import { daemonStatus, pluginPathFor, reachable } from "./doctor";
+import { EnrollmentIncompleteError, runEnrollment } from "./enrollment";
 import { linkDaemon } from "./link-callback";
 import type { Io } from "./io";
 import * as plugin from "./plugin";
+import { resolveRuntime } from "./runtime";
 import {
   appCheckoutDir,
   checkout,
@@ -223,15 +225,48 @@ export async function daemon(
     show(s);
   }
 
-  // Q12 — the browser half, before the heartbeat proof and before anything is
-  // installed: the operator is at the machine now, and a service started
-  // behind a link that never arrived is a daemon that does nothing.
+  // F03 — Rust enrollment (cross-device poll) when installation metadata exists;
+  // otherwise retain the Q12 loopback callback. Never treat a Bun app token as
+  // the Rust kairoku.token.
   if (opts.link) {
-    const linked = await linkDaemon(io, normaliseAppUrl(opts.appUrl ?? configuredAppUrl(io) ?? DEFAULT_APP_URL));
-    show(linked);
-    if (linked.outcome === "manual") {
-      io.out(`\n== stopped: ${linked.detail}`);
+    const appUrl = normaliseAppUrl(opts.appUrl ?? configuredAppUrl(io) ?? DEFAULT_APP_URL);
+    let installation = null;
+    try {
+      installation = await resolveRuntime(io);
+    } catch (e) {
+      show({
+        name: "daemon enrollment",
+        outcome: "manual",
+        detail: `could not resolve Rust installation — ${(e as Error).message}`,
+      });
+      io.out(`\n== stopped: Rust installation is ambiguous or unreadable`);
       return 1;
+    }
+    if (installation) {
+      try {
+        const identity = await runEnrollment(io, installation, { backendUrl: appUrl });
+        show({
+          name: "daemon enrollment",
+          outcome: "done",
+          detail: `Rust enrolled — daemon ${identity.daemonId}, owner ${identity.ownerId}`,
+        });
+      } catch (e) {
+        const detail =
+          e instanceof EnrollmentIncompleteError
+            ? e.message
+            : `enrollment failed — ${(e as Error).message}`;
+        show({ name: "daemon enrollment", outcome: "manual", detail });
+        io.out(`\n== stopped: ${detail}`);
+        io.out("   account setup is incomplete — rerun `kairoku setup --daemon --link` to resume");
+        return 1;
+      }
+    } else {
+      const linked = await linkDaemon(io, appUrl);
+      show(linked);
+      if (linked.outcome === "manual") {
+        io.out(`\n== stopped: ${linked.detail}`);
+        return 1;
+      }
     }
   }
 

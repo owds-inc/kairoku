@@ -18,6 +18,7 @@ import { AST_GREP, RULES_PATH } from "../daemon/rules";
 import { version as binVersion, type Io } from "./io";
 import { resolvePluginPath } from "../daemon/providers";
 import { installedPlugin, MARKETPLACE, MARKETPLACE_SOURCE } from "./plugin";
+import { resolveRuntime } from "./runtime";
 import { version as cliVersion } from "../../package.json";
 
 export const usage = `usage: kairoku doctor
@@ -394,8 +395,80 @@ interface DoctorConfig {
   ports?: string;
 }
 
+/**
+ * F03 — consume `kairokud status --json` / `instance --json` so doctor can
+ * distinguish missing provider prerequisites from Rust daemon health. Does not
+ * install Docker/Codex merely to determine daemon health. Absent kairokud is
+ * silent (Bun-only machines stay unchanged); presence drives the checks.
+ */
+export async function rustRuntimeChecks(io: Io): Promise<Check[]> {
+  const out: Check[] = [];
+  if (!io.which("kairokud")) {
+    return out;
+  }
+  let installation = null;
+  try {
+    installation = await resolveRuntime(io);
+  } catch (e) {
+    out.push(fail("rust daemon installation", (e as Error).message));
+    return out;
+  }
+  if (!installation) {
+    out.push(warn("rust daemon installation", "no installation.json — run kairokud instance configure / install.sh"));
+    return out;
+  }
+  out.push(
+    pass(
+      "rust daemon installation",
+      `${installation.installationId} ${installation.profile} ${installation.service.package}/${installation.service.label}`,
+    ),
+  );
+
+  const status = await io.shell(["kairokud", "status", "--json"]);
+  if (status.code !== 0) {
+    out.push(
+      warn(
+        "rust daemon health",
+        status.stderr.trim() || status.stdout.trim() || "status --json failed (daemon may be stopped)",
+      ),
+    );
+    return out;
+  }
+  try {
+    const body = JSON.parse(status.stdout) as {
+      service?: { running?: boolean | null };
+      connectivity?: string | null;
+      providerReady?: boolean | null;
+      providerReasons?: string[] | null;
+      daemonId?: string | null;
+    };
+    const running = body.service?.running;
+    if (running === true) {
+      out.push(pass("rust daemon health", `running; connectivity ${body.connectivity ?? "unknown"}`));
+    } else if (running === false) {
+      out.push(fail("rust daemon health", "installation present but service not running"));
+    } else {
+      out.push(warn("rust daemon health", "service.running unknown"));
+    }
+    if (body.providerReady === false) {
+      const reasons = Array.isArray(body.providerReasons) ? body.providerReasons.join("; ") : "provider not ready";
+      out.push(warn("rust provider prerequisites", reasons));
+    } else if (body.providerReady === true) {
+      out.push(pass("rust provider prerequisites", "ready"));
+    }
+    // providerReady null → unknown; do not coerce healthy and do not FAIL daemon health for it.
+    if (body.daemonId) {
+      out.push(pass("rust enrollment identity", body.daemonId));
+    }
+  } catch {
+    out.push(warn("rust daemon health", "status --json was not valid JSON"));
+  }
+  return out;
+}
+
 export async function checks(io: Io, probe?: PortDeps): Promise<Check[]> {
   const out: Check[] = [];
+  out.push(...(await rustRuntimeChecks(io)));
 
   // -- the plugin, everywhere
   const claude = await binVersion(io, "claude");

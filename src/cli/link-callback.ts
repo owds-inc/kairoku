@@ -34,8 +34,10 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 import { kairokuHome, parseEnvFile } from "../daemon/config";
+import { KAIROKUD_TOKEN_SETTING } from "./enrollment";
 import type { Io } from "./io";
 import type { Step } from "./provision";
+import { resolveRuntime } from "./runtime";
 
 /** §43.3/§43.9 — `kairokud` reads this key; the Bun daemon's own key stays. */
 export const LINK_TOKEN_KEY = "KAIROKUD_LINK_TOKEN";
@@ -229,6 +231,30 @@ async function openLink(io: Io, url: string): Promise<void> {
 }
 
 /**
+ * Persist a loopback-delivered Rust token through `kairokud settings
+ * kairoku.token --stdin` when a resolved installation exists. Still updates
+ * `token.env`'s KAIROKUD_LINK_TOKEN for compatibility without treating the Bun
+ * `KAIROKU_DAEMON_TOKEN` as a Rust credential.
+ */
+async function persistRustLinkToken(io: Io, token: string): Promise<void> {
+  setTokenEnv(io, LINK_TOKEN_KEY, token);
+  const installation = await resolveRuntime(io).catch(() => null);
+  if (!installation) return;
+  const bin = io.which("kairokud");
+  if (!bin) {
+    throw new Error("kairokud not on PATH — cannot write the Rust link token");
+  }
+  const result = await io.shell([bin, "settings", KAIROKUD_TOKEN_SETTING, "--stdin"], {
+    stdin: token,
+  });
+  if (result.code !== 0) {
+    throw new Error(
+      `kairokud settings ${KAIROKUD_TOKEN_SETTING} --stdin failed: ${result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`}`,
+    );
+  }
+}
+
+/**
  * The whole step: bind, print and open the URL, wait out the window, and hand
  * back a Step for `setup` to show. The listener is closed on every path.
  */
@@ -238,7 +264,7 @@ export async function linkDaemon(io: Io, appUrl: string, opts: { timeoutMs?: num
   try {
     listener = listenForLink({
       appUrl,
-      persist: (token) => setTokenEnv(io, LINK_TOKEN_KEY, token),
+      persist: (token) => persistRustLinkToken(io, token),
       ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
     });
   } catch (e) {
@@ -261,7 +287,7 @@ export async function linkDaemon(io: Io, appUrl: string, opts: { timeoutMs?: num
     return {
       name,
       outcome: "done",
-      detail: `linked${outcome.daemonName ? ` as ${outcome.daemonName}` : ""} — ${LINK_TOKEN_KEY} written to ~/.kairoku/token.env`,
+      detail: `linked${outcome.daemonName ? ` as ${outcome.daemonName}` : ""} — Rust token via ${KAIROKUD_TOKEN_SETTING}; ${LINK_TOKEN_KEY} kept in token.env`,
     };
   } finally {
     listener.close();
