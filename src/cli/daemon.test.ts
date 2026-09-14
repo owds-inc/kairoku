@@ -142,7 +142,69 @@ describe("kairoku daemon verbs", () => {
   test("an unknown verb prints usage and exits 2", async () => {
     const io = fakeIo();
     expect(await run(["frob"], io)).toBe(2);
-    expect(io.errors.join("\n")).toContain("kairoku daemon [install|start|stop|status|prune]");
+    expect(io.errors.join("\n")).toContain("kairoku daemon [install|start|stop|status|drain|prune]");
+  });
+});
+
+describe("kairoku daemon drain", () => {
+  test("legacy path POSTs /drain with drain.token and never logs the credential", async () => {
+    const home = "/home/neil/.kairoku";
+    const token = "a".repeat(64);
+    const io = fakeIo({ platform: "linux", home: "/home/neil", execPath: "/usr/local/bin/kairoku" });
+    io.files[`${home}/config.json`] = JSON.stringify({ listen: { host: "127.0.0.1", port: 7801 } });
+    io.files[`${home}/drain.token`] = `${token}\n`;
+    io.modes[home] = 0o700;
+    io.modes[`${home}/drain.token`] = 0o600;
+    const fetched: Array<{ url: string; auth?: string }> = [];
+    io.fetch = async (url, init) => {
+      fetched.push({ url, auth: (init?.headers as Record<string, string> | undefined)?.authorization });
+      return Response.json({ local: "draining", cloud: "pending", activeAttempts: 0, pendingReports: 1 });
+    };
+    expect(await run(["drain"], io)).toBe(0);
+    expect(fetched).toEqual([{ url: "http://127.0.0.1:7801/drain", auth: `Bearer ${token}` }]);
+    expect(io.lines.join("\n")).toContain('"local":"draining"');
+    expect(io.lines.join("\n")).not.toContain(token);
+    expect(io.errors.join("\n")).not.toContain(token);
+    expect(calls(io).join(" ")).not.toContain(token);
+  });
+
+  test("resolved Rust installation delegates to kairokud drain --json", async () => {
+    const io = fakeIo({ platform: "darwin", home: "/Users/neil", execPath: "/opt/homebrew/bin/kairoku" });
+    io.bins.add("kairokud");
+    io.canned["/usr/bin/kairokud instance --json"] = {
+      stdout: JSON.stringify({
+        schemaVersion: 1,
+        installationId: "inst-1",
+        dataRoot: "/Users/neil/.local/share/kairokud",
+        profile: "macos-personal",
+        executionUser: "neil",
+        executable: "/usr/bin/kairokud",
+        service: { manager: "launchd", scope: "user", label: "io.kairoku.daemon", package: "homebrew" },
+      }),
+    };
+    io.canned["/usr/bin/kairokud drain --json"] = {
+      stdout: JSON.stringify({ local: "draining", cloud: "pending", activeAttempts: 0, pendingReports: 0 }),
+    };
+    expect(await run(["drain"], io)).toBe(0);
+    expect(calls(io)).toEqual(["/usr/bin/kairokud instance --json", "/usr/bin/kairokud drain --json"]);
+    expect(io.lines.join("\n")).toContain('"local":"draining"');
+  });
+
+  test("unsafe drain.token is refused without calling fetch", async () => {
+    const home = "/home/neil/.kairoku";
+    const io = fakeIo({ platform: "linux", home: "/home/neil" });
+    io.files[`${home}/config.json`] = JSON.stringify({ listen: { host: "127.0.0.1", port: 7801 } });
+    io.files[`${home}/drain.token`] = `${"b".repeat(64)}\n`;
+    io.modes[home] = 0o700;
+    io.modes[`${home}/drain.token`] = 0o644;
+    let fetched = 0;
+    io.fetch = async () => {
+      fetched += 1;
+      return new Response("nope", { status: 500 });
+    };
+    expect(await run(["drain"], io)).toBe(1);
+    expect(fetched).toBe(0);
+    expect(io.errors.join("\n")).toContain("drain.token missing or unsafe");
   });
 });
 

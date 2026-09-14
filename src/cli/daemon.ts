@@ -11,13 +11,14 @@
  */
 
 import { dirname, join } from "node:path";
-import { kairokuHome } from "../daemon/config";
+import { isLoopbackHost, kairokuHome } from "../daemon/config";
 import { main as prune } from "../daemon/prune";
 import { serve } from "../daemon/server";
 import type { Io } from "./io";
+import { resolveRuntime } from "./runtime";
 import { LAUNCHD_LABEL, SYSTEMD_UNIT, systemdUnit } from "./service";
 
-export const usage = `usage: kairoku daemon [install|start|stop|status|prune]
+export const usage = `usage: kairoku daemon [install|start|stop|status|drain|prune]
 
   (no verb)  run the daemon in the foreground until SIGTERM
   install    linux: write the systemd unit and start it (rewritten only when
@@ -26,6 +27,8 @@ export const usage = `usage: kairoku daemon [install|start|stop|status|prune]
   start      start the service
   stop       stop the service
   status     is the service running? (nonzero when not)
+  drain      latch local claim drain and acknowledge cloud drain; heartbeat,
+             flush and cancellation continue
   prune      remove stale run worktrees — asks first, never touches a branch`;
 
 /** PATH for the service: the binary's dir, bun, node's dir, the usual bins. */
@@ -151,6 +154,64 @@ const mac: Record<string, Verb> = {
   },
 };
 
+async function drainLegacy(io: Io): Promise<number> {
+  const home = kairokuHome(io.home);
+  let host = "127.0.0.1";
+  let port = 7801;
+  try {
+    const parsed = JSON.parse(io.readFile(join(home, "config.json")) ?? "{}") as {
+      listen?: { host?: string; port?: number };
+    };
+    host = parsed.listen?.host ?? host;
+    port = parsed.listen?.port ?? port;
+  } catch {
+    io.err("kairoku daemon drain: unreadable config.json");
+    return 1;
+  }
+  if (!isLoopbackHost(host)) {
+    io.err("kairoku daemon drain: listener is not loopback");
+    return 1;
+  }
+  const tokenPath = join(home, "drain.token");
+  const token = io.readFile(tokenPath)?.trim() ?? "";
+  const fileMode = io.mode(tokenPath);
+  const dirMode = io.mode(home);
+  if (!/^[0-9a-f]{64}$/.test(token) || fileMode !== 0o600 || dirMode !== 0o700) {
+    io.err("kairoku daemon drain: drain.token missing or unsafe");
+    return 1;
+  }
+  try {
+    const res = await io.fetch(`http://${host}:${port}/drain`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    const body = await res.text();
+    if (body) io.out(body.trimEnd());
+    return res.ok ? 0 : 1;
+  } catch (e) {
+    io.err(`kairoku daemon drain: ${(e as Error).message}`);
+    return 1;
+  }
+}
+
+async function drainCommand(io: Io): Promise<number> {
+  let installation = null;
+  try {
+    installation = await resolveRuntime(io);
+  } catch (e) {
+    io.err(`kairoku daemon drain: ${(e as Error).message}`);
+    return 1;
+  }
+  if (installation) {
+    const bin = io.which("kairokud") ?? installation.executable;
+    const result = await io.shell([bin, "drain", "--json"]);
+    if (result.stdout.trim()) io.out(result.stdout.trim());
+    if (result.code !== 0 && result.stderr.trim()) io.err(result.stderr.trim());
+    return result.code;
+  }
+  return drainLegacy(io);
+}
+
 export async function run(args: string[], io: Io): Promise<number> {
   const [verb] = args;
   if (verb === undefined) {
@@ -162,6 +223,7 @@ export async function run(args: string[], io: Io): Promise<number> {
     }
   }
   if (verb === "prune") return prune(args.slice(1));
+  if (verb === "drain") return drainCommand(io);
   const table = io.platform === "darwin" ? mac : io.platform === "linux" ? linux : null;
   const fn = table?.[verb];
   if (!fn) {

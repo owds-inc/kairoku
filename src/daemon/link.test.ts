@@ -204,6 +204,37 @@ describe("backoff (RF-012)", () => {
     expect(await link.poll()).toBe(false);
     expect(claims(app)).toBe(0);
   });
+
+  test("setDraining inhibits claims only — heartbeat, flush and cancel continue", async () => {
+    const { link, app, store } = setup({ maxConcurrent: 2 });
+    await link.beat();
+    link.setDraining(true);
+    expect(link.status().draining).toBe(true);
+    expect(await link.poll()).toBe(false);
+    expect(claims(app)).toBe(0);
+
+    expect(await link.beat()).toBeGreaterThan(0);
+    expect(beats(app)).toBeGreaterThanOrEqual(2);
+
+    app.runs.set("r-drain", { dispatchId: "d-drain", taskType: "implement", status: "running", events: [] });
+    const finished = store.start({
+      dispatchId: "d-drain",
+      runId: "r-drain",
+      name: "r-drain",
+      execute: async (ctx) => {
+        ctx.events.push("text", "still flushing");
+        await Bun.sleep(400);
+        return { ok: true, summary: "done" };
+      },
+    });
+    await waitFor(() => store.list().length === 1, "the run");
+    await Bun.sleep(20);
+    await link.flush();
+    expect(updates(app).some((u) => u.runId === "r-drain")).toBe(true);
+
+    expect(store.cancel("r-drain")).toBe(true);
+    await finished;
+  });
 });
 
 describe("401 stops the loop and nothing else (RF-012)", () => {

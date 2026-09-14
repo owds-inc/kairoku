@@ -77,6 +77,8 @@ export interface LinkStatus {
   readonly runsInFlight: number;
   /** Terminal reports waiting for the app to accept them. */
   readonly pendingReports: number;
+  /** Human/cloud drain: claim polls inhibited; heartbeat/flush/cancel continue. */
+  readonly draining?: boolean;
 }
 
 export interface Link {
@@ -87,6 +89,8 @@ export interface Link {
   poll(): Promise<boolean>;
   /** One flush: drain and send curated events for every active run. A no-op while nothing is running. */
   flush(): Promise<void>;
+  /** Inhibit claim polls only. Heartbeat, flush and cancellation keep running. */
+  setDraining(draining: boolean): void;
   stop(): void;
 }
 
@@ -133,6 +137,7 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
   );
 
   let stopped: "token-rejected" | undefined;
+  let draining = false;
   let lastBeatOk = false;
   let lastBeatAt: string | undefined;
   let lastError: string | undefined;
@@ -171,6 +176,7 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     ...(lastBeatAt === undefined ? {} : { lastBeatAt }),
     ...(lastError === undefined ? {} : { lastError }),
     ...(stopped === undefined ? {} : { stopped }),
+    ...(draining ? { draining: true } : {}),
     runsInFlight: store.capacity().running,
     pendingReports: pending.length,
   });
@@ -330,7 +336,7 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
   }
 
   async function poll(): Promise<boolean> {
-    if (stopped || !client) return false;
+    if (stopped || draining || !client) return false;
     // Never claim into a link that is not working, and never past capacity.
     if (!lastBeatOk) return false;
     if (store.free() === 0) return false;
@@ -498,6 +504,9 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     beat,
     poll,
     flush,
+    setDraining(next) {
+      draining = next;
+    },
     stop() {
       clearTimeout(beatTimer);
       clearTimeout(claimTimer);
