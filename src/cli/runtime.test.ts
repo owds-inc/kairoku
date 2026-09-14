@@ -63,7 +63,8 @@ describe("resolveRuntime", () => {
     const io = fakeIo({
       bins: new Set(["kairokud"]),
       canned: {
-        "kairokud instance --json": {
+        // fakeIo.which returns `/usr/bin/<bin>`; shell argv uses that path.
+        "/usr/bin/kairokud instance --json": {
           code: 1,
           stderr: "error: no installation.json under /tmp/data — run configure first\n",
         },
@@ -77,7 +78,7 @@ describe("resolveRuntime", () => {
     const io = fakeIo({
       bins: new Set(["kairokud"]),
       canned: {
-        "kairokud instance --json": { stdout: JSON.stringify(sample) + "\n" },
+        "/usr/bin/kairokud instance --json": { stdout: JSON.stringify(sample) + "\n" },
       },
     });
     const got = await resolveRuntime(io);
@@ -89,7 +90,7 @@ describe("resolveRuntime", () => {
     const io = fakeIo({
       bins: new Set(["kairokud"]),
       canned: {
-        "kairokud instance --json": { stdout: "{not-json" },
+        "/usr/bin/kairokud instance --json": { stdout: "{not-json" },
       },
     });
     await expect(resolveRuntime(io)).rejects.toThrow(/corrupt JSON/);
@@ -100,7 +101,7 @@ describe("resolveRuntime", () => {
     const io = fakeIo({
       bins: new Set(["kairokud"]),
       canned: {
-        "kairokud instance --json": {
+        "/usr/bin/kairokud instance --json": {
           code: 1,
           stderr: "error: ambiguous service ownership (2 owners); refuse\n",
         },
