@@ -228,6 +228,20 @@ describe("runEnrollment — failure and resume paths", () => {
     expect(loadEnrollmentProgress(io, installation)?.requestId).toBe(requestId);
   });
 
+  function seedOwnerChangeProgress(io: FakeIo): void {
+    saveEnrollmentProgress(io, installation, {
+      schemaVersion: 1,
+      installationId,
+      requestId,
+      pollSecret: "poll-secret-value",
+      backendUrl,
+      intervalSeconds: 5,
+      ownerId: "user_previous_owner",
+      daemonId: "daemon-old",
+      state: "activated",
+    });
+  }
+
   test("owner-changing enrollment refuses while activeAttempts are reported", async () => {
     const io = baseIo();
     seedHappyFetches(io);
@@ -240,22 +254,69 @@ describe("runEnrollment — failure and resume paths", () => {
         pendingReports: 0,
       }),
     };
-    saveEnrollmentProgress(io, installation, {
-      schemaVersion: 1,
-      installationId,
-      requestId,
-      pollSecret: "poll-secret-value",
-      backendUrl,
-      intervalSeconds: 5,
-      ownerId: "user_previous_owner",
-      daemonId: "daemon-old",
-      state: "activated",
-    });
+    seedOwnerChangeProgress(io);
 
     await expect(runEnrollment(io, installation, { backendUrl })).rejects.toThrow(
       /owner-changing enrollment refused.*activeAttempts=2/,
     );
     expect(io.calls.some((c) => c.includes("--stdin"))).toBe(false);
+  });
+
+  test("owner-changing enrollment refuses when status counters are null/unknown", async () => {
+    const io = baseIo();
+    seedHappyFetches(io);
+    canAcknowledge(io);
+    // Matches F01 status --json today: counters stay null until durable stores exist.
+    io.canned["/usr/bin/kairokud status --json"] = {
+      code: 0,
+      stdout: JSON.stringify({
+        activeAttempts: null,
+        unresolvedAttempts: null,
+        pendingReports: null,
+      }),
+    };
+    seedOwnerChangeProgress(io);
+
+    await expect(runEnrollment(io, installation, { backendUrl })).rejects.toThrow(
+      /owner-changing enrollment refused: kairokud status counters unknown \(activeAttempts, unresolvedAttempts, pendingReports\)/,
+    );
+    expect(io.calls.some((c) => c.includes("--stdin"))).toBe(false);
+  });
+
+  test("owner-changing enrollment refuses when status counters are omitted", async () => {
+    const io = baseIo();
+    seedHappyFetches(io);
+    canAcknowledge(io);
+    io.canned["/usr/bin/kairokud status --json"] = {
+      code: 0,
+      stdout: JSON.stringify({}),
+    };
+    seedOwnerChangeProgress(io);
+
+    await expect(runEnrollment(io, installation, { backendUrl })).rejects.toThrow(
+      /owner-changing enrollment refused: kairokud status counters unknown/,
+    );
+    expect(io.calls.some((c) => c.includes("--stdin"))).toBe(false);
+  });
+
+  test("owner-changing enrollment proceeds when status counters are definitive zeros", async () => {
+    const io = baseIo();
+    seedHappyFetches(io);
+    canAcknowledge(io);
+    io.canned["/usr/bin/kairokud status --json"] = {
+      code: 0,
+      stdout: JSON.stringify({
+        activeAttempts: 0,
+        unresolvedAttempts: 0,
+        pendingReports: 0,
+      }),
+    };
+    seedOwnerChangeProgress(io);
+
+    const result = await runEnrollment(io, installation, { backendUrl });
+    expect(result).toEqual({ daemonId: expectedDaemonId, ownerId: expectedOwnerId });
+    expect(io.calls.some((c) => c.includes("status") && c.includes("--json"))).toBe(true);
+    expect(io.calls.some((c) => c.includes("--stdin"))).toBe(true);
   });
 
   test("restores only matching installation progress", () => {

@@ -373,7 +373,9 @@ export type RunEnrollmentOpts = {
 /**
  * Owner-changing enrollment refuses while status reports active/unresolved
  * work or pending reports. Same-owner credential rotation is always allowed.
- * Null counters (F01 unknown) do not block — only known positive counts do.
+ * Counters that are null, omitted, or non-finite are unknown — fail closed
+ * (refuse) rather than treating unknown as idle. F01 may still emit null;
+ * that must not open the gate.
  */
 export async function assertOwnerChangeAllowed(
   io: Io,
@@ -405,15 +407,24 @@ export async function assertOwnerChangeAllowed(
       "owner-changing enrollment refused: kairokud status --json was not valid JSON",
     );
   }
+  const counters: Array<[string, unknown]> = [
+    ["activeAttempts", body.activeAttempts],
+    ["unresolvedAttempts", body.unresolvedAttempts],
+    ["pendingReports", body.pendingReports],
+  ];
+  const unknown: string[] = [];
   const blockers: string[] = [];
-  if (typeof body.activeAttempts === "number" && body.activeAttempts > 0) {
-    blockers.push(`activeAttempts=${body.activeAttempts}`);
+  for (const [name, value] of counters) {
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      unknown.push(name);
+      continue;
+    }
+    if (value > 0) blockers.push(`${name}=${value}`);
   }
-  if (typeof body.unresolvedAttempts === "number" && body.unresolvedAttempts > 0) {
-    blockers.push(`unresolvedAttempts=${body.unresolvedAttempts}`);
-  }
-  if (typeof body.pendingReports === "number" && body.pendingReports > 0) {
-    blockers.push(`pendingReports=${body.pendingReports}`);
+  if (unknown.length > 0) {
+    throw new EnrollmentIncompleteError(
+      `owner-changing enrollment refused: kairokud status counters unknown (${unknown.join(", ")}) — cannot prove idle work`,
+    );
   }
   if (blockers.length > 0) {
     throw new EnrollmentIncompleteError(
