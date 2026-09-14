@@ -36,11 +36,11 @@ afterEach(() => {
   live = [];
 });
 
-function listener(over: { appUrl?: string; persist?: (t: string) => void | Promise<void>; timeoutMs?: number } = {}) {
+function listener(over: { appUrl?: string; persist?: (p: { token: string }) => void | Promise<void>; timeoutMs?: number } = {}) {
   const written: string[] = [];
   const l = listenForLink({
     appUrl: over.appUrl ?? APP,
-    persist: over.persist ?? ((t: string) => void written.push(t)),
+    persist: over.persist ?? ((p) => void written.push(p.token)),
     ...(over.timeoutMs === undefined ? {} : { timeoutMs: over.timeoutMs }),
   });
   live.push(l);
@@ -176,7 +176,8 @@ describe("everything that is not the happy path is a 400, and none of them leak"
     // a deadlock.
     let firstWrite = true;
     const { l } = listener({
-      persist: async (t: string) => {
+      persist: async (p) => {
+        const t = p.token;
         if (firstWrite) {
           firstWrite = false;
           writing();
@@ -220,7 +221,7 @@ describe("everything that is not the happy path is a 400, and none of them leak"
     const fake = fakeIo({ home });
     const before = "KAIROKU_DAEMON_TOKEN=kai_the_app_one\n";
     fake.files[tokenEnv] = before;
-    const { l } = listener({ persist: (t: string) => setTokenEnv(fake, LINK_TOKEN_KEY, t) });
+    const { l } = listener({ persist: (p) => setTokenEnv(fake, LINK_TOKEN_KEY, p.token) });
 
     const injected = `kai_evil\nKAIROKU_DAEMON_TOKEN=kai_attacker_owned`;
     const res = await post(l, good(l, { token: injected }));
@@ -239,7 +240,7 @@ describe("everything that is not the happy path is a 400, and none of them leak"
 
   test("a carriage return, a leading space and a trailing space are each 400, and nothing is written", async () => {
     const fake = fakeIo({ home });
-    const { l } = listener({ persist: (t: string) => setTokenEnv(fake, LINK_TOKEN_KEY, t) });
+    const { l } = listener({ persist: (p) => setTokenEnv(fake, LINK_TOKEN_KEY, p.token) });
     for (const token of [`kai_a\rKAIROKU_DAEMON_TOKEN=kai_b`, " kai_a", "kai_a ", "kai_a\n"]) {
       const res = await post(l, good(l, { token }));
       expect(res.status).toBe(400);
@@ -284,7 +285,8 @@ describe("persist before the 204 (item 3) — a 204 the CLI cannot honour is wor
   test("the write has RETURNED by the time the page is told 204", async () => {
     const written: string[] = [];
     const { l } = listener({
-      persist: async (t) => {
+      persist: async (p) => {
+        const t = p.token;
         await Bun.sleep(20);
         written.push(t);
       },
@@ -299,7 +301,8 @@ describe("persist before the 204 (item 3) — a 204 the CLI cannot honour is wor
     let fail = true;
     const written: string[] = [];
     const { l } = listener({
-      persist: (t) => {
+      persist: (p) => {
+        const t = p.token;
         if (fail) throw new Error("refusing to write ~/.kairoku/token.env");
         written.push(t);
       },
@@ -522,5 +525,24 @@ describe("linkDaemon — bind first, THEN open the browser (item 1)", () => {
     expect(step.outcome).toBe("manual");
     expect(fake.files[tokenEnv]).toBeUndefined();
     expect((fake.lines.join("\n") + fake.errors.join("\n"))).not.toContain(TOKEN);
+  });
+
+  test("a corrupt Rust installation refuses the callback before mutating credentials", async () => {
+    const fake = fakeIo({ platform: "linux", home });
+    fake.bins.add("xdg-open");
+    fake.bins.add("kairokud");
+    fake.canned["/usr/bin/kairokud instance --json"] = { stdout: "{not-json" };
+    browser(fake, (link) => ({
+      token: TOKEN,
+      nonce: link.searchParams.get("nonce"),
+      daemonId: "daemon-1",
+      ownerId: "owner-1",
+    }));
+
+    const step = await linkDaemon(fake, APP, { timeoutMs: 20 });
+
+    expect(step.outcome).toBe("manual");
+    expect(fake.files[tokenEnv]).toBeUndefined();
+    expect(fake.files[`${tokenEnv}.tmp`]).toBeUndefined();
   });
 });

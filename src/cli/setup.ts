@@ -13,9 +13,11 @@ import { kairokuHome, migrateHome, normaliseAppUrl, parseTokenEnv } from "../dae
 import { version as cliVersion } from "../../package.json";
 import * as daemonCmd from "./daemon";
 import { daemonStatus, pluginPathFor, reachable } from "./doctor";
+import { EnrollmentIncompleteError, runEnrollment } from "./enrollment";
 import { linkDaemon } from "./link-callback";
 import type { Io } from "./io";
 import * as plugin from "./plugin";
+import { probeRustLiveHealth, resolveRuntime } from "./runtime";
 import {
   appCheckoutDir,
   checkout,
@@ -223,49 +225,95 @@ export async function daemon(
     show(s);
   }
 
-  // Q12 — the browser half, before the heartbeat proof and before anything is
-  // installed: the operator is at the machine now, and a service started
-  // behind a link that never arrived is a daemon that does nothing.
+  // F03 / FRV08 — Rust enrollment (cross-device poll) when installation metadata
+  // exists; otherwise retain the Q12 loopback callback. Never treat a Bun app
+  // token as the Rust kairoku.token. When Rust enrollment completes, skip the
+  // Bun appLink heartbeat and final HTTP /status probe.
+  let rustEnrolled = false;
   if (opts.link) {
-    const linked = await linkDaemon(io, normaliseAppUrl(opts.appUrl ?? configuredAppUrl(io) ?? DEFAULT_APP_URL));
-    show(linked);
-    if (linked.outcome === "manual") {
-      io.out(`\n== stopped: ${linked.detail}`);
+    const appUrl = normaliseAppUrl(opts.appUrl ?? configuredAppUrl(io) ?? DEFAULT_APP_URL);
+    let installation = null;
+    try {
+      installation = await resolveRuntime(io);
+    } catch (e) {
+      show({
+        name: "daemon enrollment",
+        outcome: "manual",
+        detail: `could not resolve Rust installation — ${(e as Error).message}`,
+      });
+      io.out(`\n== stopped: Rust installation is ambiguous or unreadable`);
       return 1;
+    }
+    if (installation) {
+      try {
+        const identity = await runEnrollment(io, installation, { backendUrl: appUrl });
+        show({
+          name: "daemon enrollment",
+          outcome: "done",
+          detail: `Rust enrolled — daemon ${identity.daemonId}, owner ${identity.ownerId}`,
+        });
+        rustEnrolled = true;
+      } catch (e) {
+        const detail =
+          e instanceof EnrollmentIncompleteError
+            ? e.message
+            : `enrollment failed — ${(e as Error).message}`;
+        show({ name: "daemon enrollment", outcome: "manual", detail });
+        io.out(`\n== stopped: ${detail}`);
+        io.out("   account setup is incomplete — rerun `kairoku setup --daemon --link` to resume");
+        return 1;
+      }
+    } else {
+      const linked = await linkDaemon(io, appUrl);
+      show(linked);
+      if (linked.outcome === "manual") {
+        io.out(`\n== stopped: ${linked.detail}`);
+        return 1;
+      }
     }
   }
 
-  const link = await appLink(io, { yes: opts.yes, appUrl: opts.appUrl, appToken: opts.appToken });
-  show(link.step);
-  if (link.stop) {
-    // Nothing is installed behind a link that does not work.
-    io.out(`\n== stopped: ${link.stop}`);
-    io.out("   mint a fresh token in the app under Settings → Daemons and rerun with --app-token");
-    return 1;
+  if (!rustEnrolled) {
+    const link = await appLink(io, { yes: opts.yes, appUrl: opts.appUrl, appToken: opts.appToken });
+    show(link.step);
+    if (link.stop) {
+      // Nothing is installed behind a link that does not work.
+      io.out(`\n== stopped: ${link.stop}`);
+      io.out("   mint a fresh token in the app under Settings → Daemons and rerun with --app-token");
+      return 1;
+    }
   }
 
   io.out("== daemon service");
   const service = await daemonCmd.run(["install"], io);
   if (service !== 0) return service;
 
-  const home = kairokuHome(io.home);
-  let listen: { host?: string; port?: number } = {};
-  try {
-    listen = (JSON.parse(io.readFile(join(home, "config.json")) ?? "{}") as { listen?: typeof listen }).listen ?? {};
-  } catch {
-    // reported by the reachability check below
+  let finalOk = false;
+  if (rustEnrolled || (await resolveRuntime(io).catch(() => null))) {
+    const health = await probeRustLiveHealth(io, 10);
+    io.out(`   ${health.ok ? "PASS" : "FAIL"}  ${"rust daemon live".padEnd(34)} ${health.detail}`.trimEnd());
+    finalOk = health.ok;
+  } else {
+    const home = kairokuHome(io.home);
+    let listen: { host?: string; port?: number } = {};
+    try {
+      listen = (JSON.parse(io.readFile(join(home, "config.json")) ?? "{}") as { listen?: typeof listen }).listen ?? {};
+    } catch {
+      // reported by the reachability check below
+    }
+    const statusUrl = `http://${listen.host ?? "127.0.0.1"}:${listen.port ?? 7801}/status`;
+    // Ten tries: the service was started moments ago.
+    const check = reachable(statusUrl, await daemonStatus(io, statusUrl, 10));
+    io.out(`   ${check.status}  ${check.name.padEnd(34)} ${check.detail ?? ""}`.trimEnd());
+    finalOk = check.status === "PASS";
   }
-  const statusUrl = `http://${listen.host ?? "127.0.0.1"}:${listen.port ?? 7801}/status`;
-  // Ten tries: the service was started moments ago.
-  const check = reachable(statusUrl, await daemonStatus(io, statusUrl, 10));
-  io.out(`   ${check.status}  ${check.name.padEnd(34)} ${check.detail ?? ""}`.trimEnd());
 
   const owed = remainder(io, steps);
   io.out("");
   io.out(owed.length ? "== done. What is left is human-only:\n" : "== done. Nothing human-only is outstanding on this machine.");
   for (const item of owed) io.out(`  ${item}`);
   io.out("\nThen: kairoku doctor");
-  return check.status === "PASS" ? 0 : 1;
+  return finalOk ? 0 : 1;
 }
 
 export async function run(args: string[], io: Io): Promise<number> {

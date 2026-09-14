@@ -24,7 +24,16 @@
 
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import type { WorktreeOps } from "./worktree";
 import { DEFAULT_PORT_RANGE, parsePortRange } from "./compose";
 import { DEFAULT_KILL_GRACE_MS } from "./proc";
@@ -71,6 +80,11 @@ export interface Config {
    * source tree or the copy `kairoku plugin install` left under ~/.claude.
    */
   readonly pluginPath?: string;
+  /**
+   * Directory holding config.json, token.env, drain.token and human_drain.json.
+   * Absent in older fixtures: callers fall back to `dirname(runsDir)`.
+   */
+  readonly configDir?: string;
 
   /** Test-only: substitute real git worktree operations. */
   readonly worktreeOps?: WorktreeOps;
@@ -92,6 +106,117 @@ export function assertBindable(host: string): void {
       `refusing to bind to "${host}": RF-006 requires an explicit host address`,
     );
   }
+}
+
+/** Loopback hosts only — the authenticated drain mutation never rides a LAN bind. */
+export function isLoopbackHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  return h === "127.0.0.1" || h === "localhost" || h === "::1";
+}
+
+export function configDirOf(config: Pick<Config, "configDir" | "runsDir">): string {
+  return config.configDir ?? dirname(config.runsDir);
+}
+
+export function drainTokenPath(configDir: string): string {
+  return join(configDir, "drain.token");
+}
+
+export function humanDrainPath(configDir: string): string {
+  return join(configDir, "human_drain.json");
+}
+
+export function persistHumanDrain(configDir: string): void {
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(configDir, 0o700);
+  } catch {
+    // existing dir; permission check happens on read
+  }
+  const path = humanDrainPath(configDir);
+  writeFileSync(path, `${JSON.stringify({ humanDrain: true })}\n`, { mode: 0o600 });
+  chmodSync(path, 0o600);
+}
+
+export function loadHumanDrain(configDir: string): boolean {
+  try {
+    const parsed = JSON.parse(readFileSync(humanDrainPath(configDir), "utf8")) as { humanDrain?: unknown };
+    return parsed.humanDrain === true;
+  } catch {
+    return false;
+  }
+}
+
+export type DrainTokenOk = { ok: true; token: string };
+export type DrainTokenErr = { ok: false; reason: string };
+
+/**
+ * 256-bit local drain credential. Never the cloud/run token. File must be a
+ * regular 0600 file in a same-user 0700 directory; symlinks are refused.
+ */
+export function inspectDrainToken(configDir: string): DrainTokenOk | DrainTokenErr {
+  const uid = process.getuid?.();
+  if (uid === undefined) return { ok: false, reason: "drain.token requires a unix uid" };
+  let dirStat;
+  let fileStat;
+  try {
+    dirStat = lstatSync(configDir);
+  } catch {
+    return { ok: false, reason: "drain directory missing" };
+  }
+  if (dirStat.isSymbolicLink()) return { ok: false, reason: "drain directory is a symlink" };
+  if (!dirStat.isDirectory()) return { ok: false, reason: "drain directory is not a directory" };
+  if (dirStat.uid !== uid) return { ok: false, reason: "drain directory owner mismatch" };
+  if ((dirStat.mode & 0o777) !== 0o700) return { ok: false, reason: "drain directory must be mode 0700" };
+  const path = drainTokenPath(configDir);
+  try {
+    fileStat = lstatSync(path);
+  } catch {
+    return { ok: false, reason: "drain.token missing" };
+  }
+  if (fileStat.isSymbolicLink()) return { ok: false, reason: "drain.token is a symlink" };
+  if (!fileStat.isFile()) return { ok: false, reason: "drain.token is not a regular file" };
+  if (fileStat.uid !== uid) return { ok: false, reason: "drain.token owner mismatch" };
+  if ((fileStat.mode & 0o777) !== 0o600) return { ok: false, reason: "drain.token must be mode 0600" };
+  let token: string;
+  try {
+    token = readFileSync(path, "utf8").trim();
+  } catch {
+    return { ok: false, reason: "drain.token unreadable" };
+  }
+  if (!/^[0-9a-f]{64}$/.test(token)) return { ok: false, reason: "drain.token is not a 256-bit hex credential" };
+  return { ok: true, token };
+}
+
+/** Mint drain.token when missing. Leaves an unsafe existing file alone. */
+export function ensureDrainToken(configDir: string): DrainTokenOk | DrainTokenErr {
+  const existing = inspectDrainToken(configDir);
+  if (existing.ok) return existing;
+  if (existing.reason !== "drain.token missing" && existing.reason !== "drain directory missing") {
+    return existing;
+  }
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(configDir, 0o700);
+  } catch {
+    return { ok: false, reason: "cannot set drain directory mode 0700" };
+  }
+  const token = randomBytes(32).toString("hex");
+  const path = drainTokenPath(configDir);
+  writeFileSync(path, `${token}\n`, { mode: 0o600 });
+  chmodSync(path, 0o600);
+  return inspectDrainToken(configDir);
+}
+
+/** Constant-time compare of presented vs stored drain credentials. */
+export function drainTokensEqual(presented: string, stored: string): boolean {
+  const a = Buffer.from(presented);
+  const b = Buffer.from(stored);
+  if (a.length !== b.length) {
+    timingSafeEqual(a, a);
+    return false;
+  }
+  return timingSafeEqual(a, b);
 }
 
 export function defaultConfigPath(
@@ -233,5 +358,6 @@ export function loadConfig(
     ...(appUrl === undefined ? {} : { appUrl }),
     ...(token === undefined ? {} : { token }),
     ...(agentToken === undefined ? {} : { agentToken }),
+    configDir: dirname(path),
   };
 }

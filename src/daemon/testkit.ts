@@ -83,6 +83,7 @@ export function harness(overrides: Partial<Config> = {}): Harness {
     repoPath: join(dir, "repo"),
     worktreesDir,
     runsDir,
+    configDir: dir,
     envDir: join(dir, "env"),
     keepWorktreeOnFailure: false,
     defaultTimeoutSec: 30,
@@ -282,6 +283,9 @@ export interface FakeApp {
   readonly runs: Map<string, FakeRunRow>;
   readonly metas: any[];
   queue(dispatch: FakeDispatch): void;
+  /** Hold the next claim HTTP response until `releaseClaim()` (FRV09/C5). */
+  holdNextClaim(): void;
+  releaseClaim(): void;
   /** Answer every route with this status until it is set back to 0. */
   failWith: number;
   heartbeatIntervalMs: number;
@@ -296,6 +300,8 @@ export const FAKE_APP_TOKEN = "kai_fake_app_token";
 export function fakeApp(options: { token?: string; heartbeatIntervalMs?: number; protocol?: string } = {}): FakeApp {
   const token = options.token ?? FAKE_APP_TOKEN;
   const queued: FakeDispatch[] = [];
+  let claimGate: Promise<void> | undefined;
+  let releaseClaimGate: (() => void) | undefined;
 
   const unauthorized = () =>
     Response.json({ error: "unauthorized" }, { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
@@ -367,6 +373,11 @@ export function fakeApp(options: { token?: string; heartbeatIntervalMs?: number;
         POST: async (req) => {
           if (!authed(req)) return unauthorized();
           app.calls.push({ route: "claim", body: await body(req) });
+          if (claimGate) {
+            await claimGate;
+            claimGate = undefined;
+            releaseClaimGate = undefined;
+          }
           if (app.failWith) return Response.json({ error: "boom" }, { status: app.failWith });
           const next = queued.shift();
           if (!next) return Response.json({ dispatch: null });
@@ -407,6 +418,15 @@ export function fakeApp(options: { token?: string; heartbeatIntervalMs?: number;
           return Response.json({ error: "invalid", issues: result.issues }, { status: 422 });
         },
       },
+      "/api/daemon/drain": {
+        POST: async (req) => {
+          if (!authed(req)) return unauthorized();
+          const payload = await body(req);
+          app.calls.push({ route: "drain", body: payload });
+          if (app.failWith) return Response.json({ error: "boom" }, { status: app.failWith });
+          return Response.json({ ok: true, admissionMode: "draining" });
+        },
+      },
     },
     fetch: () => Response.json({ error: "not_found" }, { status: 404 }),
   });
@@ -431,6 +451,14 @@ export function fakeApp(options: { token?: string; heartbeatIntervalMs?: number;
         });
       }
       queued.push(dispatch);
+    },
+    holdNextClaim() {
+      claimGate = new Promise((resolve) => {
+        releaseClaimGate = resolve;
+      });
+    },
+    releaseClaim() {
+      releaseClaimGate?.();
     },
     stop: () => server.stop(true),
   };

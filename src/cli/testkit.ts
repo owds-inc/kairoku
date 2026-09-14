@@ -49,8 +49,10 @@ export function fakeIo(overrides: Partial<FakeIo> = {}): FakeIo {
       return fake.answers.shift()!;
     },
     which: (bin) => (fake.bins.has(bin) ? `/usr/bin/${bin}` : null),
-    async shell(argv) {
+    async shell(argv, opts = {}) {
+      // Record argv only — never persist opts.stdin (secrets stay off the call log).
       fake.calls.push(argv);
+      void opts.stdin;
       const line = argv.join(" ");
       const key = Object.keys(fake.canned).find((k) => line === k || line.startsWith(k + " "));
       const hit = key === undefined ? {} : fake.canned[key]!;

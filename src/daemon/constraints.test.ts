@@ -5,10 +5,10 @@
  * time.
  *
  * RF-007 has FLIPPED with SPEC v1 (§20.3). The daemon used to talk to nothing;
- * it now talks to exactly one place for exactly three things, and that is the
+ * it now talks to exactly one place for the pinned daemon routes, and that is the
  * property worth pinning: `app.ts` is the only module that may call `fetch`,
- * and the only URLs it may build are the three daemon routes under the
- * configured `appUrl`. A fourth route, a second outbound module, or a hardcoded
+ * and the only URLs it may build are the daemon routes under the
+ * configured `appUrl`. A stray route, a second outbound module, or a hardcoded
  * host all fail here rather than in production.
  *
  * THE ZERO-DEPENDENCY RULE IS AMENDED, NOT DROPPED (§20.2). The Claude Agent
@@ -113,7 +113,7 @@ describe("SPEC constraints", () => {
     }
   });
 
-  test("RF-011: app.ts calls the three daemon routes and nothing else", () => {
+  test("RF-011: app.ts calls the pinned daemon routes and nothing else", () => {
     const source = productionSources().find(([name]) => name === OUTBOUND_MODULE)?.[1] ?? "";
     const paths = [...source.matchAll(/["'`](\/api\/[^"'`]*)["'`]/g)].map((m) => m[1]!);
     expect([...new Set(paths)].sort()).toEqual([...DAEMON_ROUTES].sort());
@@ -132,12 +132,13 @@ describe("SPEC constraints", () => {
     }
   });
 
-  test("no module but app.ts, link.ts and config.ts even knows the app exists", () => {
-    // Keeping the surface this small is what makes a protocol change a change
-    // to two files rather than a sweep.
+  test("no module but app.ts, link.ts, config.ts and server.ts even knows the app exists", () => {
+    // server.ts may inject the app client for cloud drain; it must not build
+    // URLs or call fetch itself (RF-007). Keeping the surface small makes a
+    // protocol change a change to a few files rather than a sweep.
     const knows = /appUrl|api\/daemon|heartbeat|Bearer /;
     for (const [name, source] of productionSources()) {
-      const allowed = ["app.ts", "link.ts", "config.ts"].includes(name);
+      const allowed = ["app.ts", "link.ts", "config.ts", "server.ts"].includes(name);
       expect({ [name]: knows.test(source) && !allowed }).toEqual({ [name]: false });
     }
   });

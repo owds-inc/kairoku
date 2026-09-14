@@ -34,8 +34,19 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 import { kairokuHome, parseEnvFile } from "../daemon/config";
+import { EnrollmentIncompleteError, installLoopbackRustToken } from "./enrollment";
 import type { Io } from "./io";
 import type { Step } from "./provision";
+import { resolveRuntime } from "./runtime";
+
+/** Fields the app may POST with a loopback token (FRV08 identity for Rust install). */
+export type LinkPersistPayload = {
+  token: string;
+  daemonId?: string;
+  ownerId?: string;
+  requestId?: string;
+  daemonName?: string;
+};
 
 /** §43.3/§43.9 — `kairokud` reads this key; the Bun daemon's own key stays. */
 export const LINK_TOKEN_KEY = "KAIROKUD_LINK_TOKEN";
@@ -78,7 +89,7 @@ function equal(a: string, b: string): boolean {
 export function listenForLink(opts: {
   appUrl: string;
   /** Must have RETURNED before the page is told 204. Throwing means 400. */
-  persist: (token: string) => void | Promise<void>;
+  persist: (payload: LinkPersistPayload) => void | Promise<void>;
   timeoutMs?: number;
 }): LinkListener {
   // Before the bind: an app URL that is not a URL has no origin to allow, and
@@ -125,9 +136,20 @@ export function listenForLink(opts: {
       if (typeof token !== "string" || !ONE_LINE.test(token) || typeof given !== "string") return bad();
       if (!equal(given, nonce)) return bad();
 
+      const daemonId = typeof body.daemonId === "string" ? body.daemonId : undefined;
+      const ownerId = typeof body.ownerId === "string" ? body.ownerId : undefined;
+      const requestId = typeof body.requestId === "string" ? body.requestId : undefined;
+      const daemonName = typeof body.daemonName === "string" ? body.daemonName : undefined;
+
       state = "writing";
       try {
-        await opts.persist(token);
+        await opts.persist({
+          token,
+          ...(daemonId ? { daemonId } : {}),
+          ...(ownerId ? { ownerId } : {}),
+          ...(requestId ? { requestId } : {}),
+          ...(daemonName ? { daemonName } : {}),
+        });
       } catch {
         // The use is NOT spent: the page's retry is the only way back from a
         // write we refused, and it needs this nonce to still be live.
@@ -135,8 +157,7 @@ export function listenForLink(opts: {
         return bad();
       }
       state = "spent";
-      const daemonName = body.daemonName;
-      settle({ ok: true, ...(typeof daemonName === "string" ? { daemonName } : {}) });
+      settle({ ok: true, ...(daemonName ? { daemonName } : {}) });
       return new Response(null, { status: 204, headers: cors });
     },
   });
@@ -229,6 +250,37 @@ async function openLink(io: Io, url: string): Promise<void> {
 }
 
 /**
+ * Persist a loopback-delivered token. When a Rust installation is resolved,
+ * route through the shared enrollment finalizer (install + live proof). Missing
+ * daemon/owner identity cannot bypass owner-change protection. Without a Rust
+ * installation, keep `token.env` only (Bun Q12 path).
+ */
+async function persistLoopbackToken(
+  io: Io,
+  appUrl: string,
+  payload: LinkPersistPayload,
+): Promise<void> {
+  const installation = await resolveRuntime(io);
+  if (!installation) {
+    setTokenEnv(io, LINK_TOKEN_KEY, payload.token);
+    return;
+  }
+  try {
+    await installLoopbackRustToken(io, installation, {
+      backendUrl: appUrl,
+      token: payload.token,
+      ...(payload.daemonId ? { daemonId: payload.daemonId } : {}),
+      ...(payload.ownerId ? { ownerId: payload.ownerId } : {}),
+      ...(payload.requestId ? { requestId: payload.requestId } : {}),
+    });
+    setTokenEnv(io, LINK_TOKEN_KEY, payload.token);
+  } catch (e) {
+    if (e instanceof EnrollmentIncompleteError) throw e;
+    throw new Error((e as Error).message);
+  }
+}
+
+/**
  * The whole step: bind, print and open the URL, wait out the window, and hand
  * back a Step for `setup` to show. The listener is closed on every path.
  */
@@ -238,7 +290,7 @@ export async function linkDaemon(io: Io, appUrl: string, opts: { timeoutMs?: num
   try {
     listener = listenForLink({
       appUrl,
-      persist: (token) => setTokenEnv(io, LINK_TOKEN_KEY, token),
+      persist: (payload) => persistLoopbackToken(io, appUrl, payload),
       ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
     });
   } catch (e) {
@@ -261,7 +313,7 @@ export async function linkDaemon(io: Io, appUrl: string, opts: { timeoutMs?: num
     return {
       name,
       outcome: "done",
-      detail: `linked${outcome.daemonName ? ` as ${outcome.daemonName}` : ""} — ${LINK_TOKEN_KEY} written to ~/.kairoku/token.env`,
+      detail: `linked${outcome.daemonName ? ` as ${outcome.daemonName}` : ""} — Rust token via shared enrollment finalizer; ${LINK_TOKEN_KEY} kept in token.env`,
     };
   } finally {
     listener.close();

@@ -42,7 +42,7 @@ describe("kairoku cli", () => {
       ["update", "kairoku update"],
       ["doctor", "kairoku doctor"],
       ["plugin", "kairoku plugin install|update|status"],
-      ["daemon", "kairoku daemon [install|start|stop|status|prune]"],
+      ["daemon", "kairoku daemon [install|start|stop|status|drain|update|prune|migrate]"],
       ["setup", "kairoku setup [--plugin]"],
       ["env", "kairoku env <set|import|list|rm>"],
     ] as const;

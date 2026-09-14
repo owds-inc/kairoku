@@ -7,6 +7,13 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { chmodSync, readFileSync, symlinkSync, unlinkSync } from "node:fs";
+import {
+  drainTokenPath,
+  humanDrainPath,
+  inspectDrainToken,
+  loadHumanDrain,
+} from "./config";
 import { createDaemon, type Daemon } from "./server";
 import { harness, stubExec, waitFor, type Harness } from "./testkit";
 
@@ -135,5 +142,127 @@ describe("waitFor accepts async predicates", () => {
     setTimeout(() => (flipped = true), 20);
     await waitFor(async () => flipped, "the flag to flip");
     expect(flipped).toBe(true);
+  });
+});
+
+describe("listener — authenticated POST /drain (F08)", () => {
+  function tokenOf(h: Harness): string {
+    const inspected = inspectDrainToken(h.dir);
+    return inspected.ok ? inspected.token : "";
+  }
+
+  test("mints drain.token 0600 in a 0700 dir and never uses the cloud token", async () => {
+    const { h, d } = start();
+    const inspected = inspectDrainToken(h.dir);
+    expect(inspected.ok).toBe(true);
+    if (!inspected.ok) return;
+    expect(inspected.token).toHaveLength(64);
+    expect(inspected.token).not.toBe(h.config.token);
+    const raw = readFileSync(drainTokenPath(h.dir), "utf8");
+    expect(raw).toContain(inspected.token);
+    expect((await get(d, "/status")).status).toBe(200);
+  });
+
+  test("POST /drain latches local drain, keeps GET /status unauthenticated, cloud failure stays pending", async () => {
+    let set: boolean | undefined;
+    const { h, d } = start({}, {
+      link: {
+        status: () => ({ linked: true, pendingReports: 2, runsInFlight: 1 }),
+        setDraining: (next: boolean) => {
+          set = next;
+        },
+      },
+      cloudDrain: async () => "pending" as const,
+    });
+    const token = tokenOf(h);
+    const res = await get(d, "/drain", {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      local: "draining",
+      cloud: "pending",
+      activeAttempts: 0,
+      pendingReports: 2,
+      claimsInFlight: 0,
+    });
+    expect(set).toBe(true);
+    expect(loadHumanDrain(h.dir)).toBe(true);
+    expect((await get(d, "/status")).status).toBe(200);
+    expect(readFileSync(humanDrainPath(h.dir), "utf8")).not.toContain(token);
+  });
+
+  test("wrong or missing drain credential is 401; the cloud token is not accepted", async () => {
+    const { h, d } = start();
+    expect((await get(d, "/drain", { method: "POST" })).status).toBe(401);
+    expect(
+      (await get(d, "/drain", { method: "POST", headers: { authorization: "Bearer deadbeef" } })).status,
+    ).toBe(401);
+    expect(
+      (
+        await get(d, "/drain", {
+          method: "POST",
+          headers: { authorization: `Bearer ${h.config.token}` },
+        })
+      ).status,
+    ).toBe(401);
+  });
+
+  test("unexpected Host or Origin is refused", async () => {
+    const { h, d } = start();
+    const token = tokenOf(h);
+    expect(
+      (
+        await get(d, "/drain", {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, host: "192.168.1.9:80" },
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await get(d, "/drain", {
+          method: "POST",
+          headers: { authorization: `Bearer ${token}`, origin: "https://evil.example" },
+        })
+      ).status,
+    ).toBe(403);
+  });
+
+  test("symlink or world-readable drain.token is refused", async () => {
+    const { h, d } = start();
+    const path = drainTokenPath(h.dir);
+    const token = tokenOf(h);
+    chmodSync(path, 0o644);
+    expect(
+      (await get(d, "/drain", { method: "POST", headers: { authorization: `Bearer ${token}` } })).status,
+    ).toBe(403);
+    chmodSync(path, 0o600);
+    unlinkSync(path);
+    symlinkSync("/tmp/kairoku-drain-symlink", path);
+    expect(
+      (await get(d, "/drain", { method: "POST", headers: { authorization: `Bearer ${token}` } })).status,
+    ).toBe(403);
+  });
+
+  test("cloud acknowledgement draining is reported without re-enabling local work", async () => {
+    let draining = false;
+    const { h, d } = start({}, {
+      link: {
+        status: () => ({ linked: true, pendingReports: 0, runsInFlight: 0, draining }),
+        setDraining: (next: boolean) => {
+          draining = next;
+        },
+      },
+      cloudDrain: async () => "draining" as const,
+    });
+    const token = tokenOf(h);
+    const body = await (
+      await get(d, "/drain", { method: "POST", headers: { authorization: `Bearer ${token}` } })
+    ).json();
+    expect(body).toMatchObject({ local: "draining", cloud: "draining" });
+    expect(draining).toBe(true);
+    expect(loadHumanDrain(h.dir)).toBe(true);
   });
 });

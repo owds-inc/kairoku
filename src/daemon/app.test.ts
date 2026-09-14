@@ -33,11 +33,12 @@ const meta = {
 };
 
 describe("app client — the three routes and nothing else", () => {
-  test("the route table is exactly the three the app answers", () => {
+  test("the route table is exactly the pinned daemon routes", () => {
     expect([...DAEMON_ROUTES]).toEqual([
       "/api/daemon/heartbeat",
       "/api/daemon/claim",
       "/api/daemon/update",
+      "/api/daemon/drain",
     ]);
   });
 
