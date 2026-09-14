@@ -147,7 +147,8 @@ describe("waitFor accepts async predicates", () => {
 
 describe("listener — authenticated POST /drain (F08)", () => {
   function tokenOf(h: Harness): string {
-    return inspectDrainToken(h.dir).ok ? inspectDrainToken(h.dir).token : "";
+    const inspected = inspectDrainToken(h.dir);
+    return inspected.ok ? inspected.token : "";
   }
 
   test("mints drain.token 0600 in a 0700 dir and never uses the cloud token", async () => {
