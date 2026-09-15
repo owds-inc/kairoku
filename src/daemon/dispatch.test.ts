@@ -143,6 +143,24 @@ describe("dispatch — what the claim says to run", () => {
     // A claim that names no repo at all is the app saying "wherever you are".
     expect(checkoutMismatch(claim({ repo: null }), undefined)).toBeUndefined();
   });
+
+  test("FL01-E: sessionVisibility is carried on the type but acted on nowhere in this CLI", () => {
+    // This CLI predates protocol 2 (no claimId/processInstanceId either) and
+    // has no project-sharing feature to gate — see app.ts's provenance
+    // comment. The only claim here is that the field round-trips through a
+    // real JSON parse (the shape a daemon actually receives over HTTP, not
+    // just a TS object literal) without disturbing dispatch logic that has
+    // nothing to do with it.
+    const wire = JSON.parse(JSON.stringify(claim({ sessionVisibility: "project" })));
+    expect(wire.sessionVisibility).toBe("project");
+    expect(recipeName(wire)).toBe("build-verify");
+
+    // Absence — every OTHER test in this file already exercises this, since
+    // none of them set the field — is the same "private" fact `claim()`'s own
+    // defaults already produce; this just names that as deliberate rather
+    // than incidental.
+    expect(claim().sessionVisibility).toBeUndefined();
+  });
 });
 
 describe("dispatch — the refusals, each reported per run", () => {
