@@ -40,6 +40,17 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 // `src/lib/comms/protocol/index.ts` and the three route handlers. Every field
 // the app treats as optional is optional here too, so a daemon one version
 // ahead of its app and one version behind both parse.
+//
+// FL01-E ADDED `ClaimedDispatch.sessionVisibility` BY HAND, not by a full
+// re-vendor at a newer SHA — this file still otherwise reflects `eab363ea`
+// and, notably, predates protocol 2 entirely (no `claimId`/`processInstanceId`
+// here at all). Recording that honestly rather than bumping the SHA comment:
+// bumping it would claim a full re-sync this change did not do. The field is
+// additive and optional on the app's own wire (no protocol-version bump
+// there either), so this keeps the same "one version ahead, one version
+// behind, both parse" property the paragraph above already promises — this
+// CLI simply has nothing that reads the field, the same as it has nothing
+// that reads `claimId`.
 
 export interface SuiteCounts {
   readonly pass: number;
@@ -177,6 +188,18 @@ export interface ClaimedDispatch {
    */
   readonly env?: { profile?: string; secrets?: Record<string, string | { ref: string }> };
   readonly limits?: { runSeconds?: number | null };
+  /**
+   * FL01-E — the approval's session-observation policy. Additive and
+   * optional: an app ahead of this CLI always sends it explicitly (the
+   * column it comes from is `NOT NULL DEFAULT 'private'`); an app at or
+   * before `eab363ea` never sends it at all. Both read as "private" to
+   * anything that might one day check this field — this CLI does not yet
+   * check it, so today the field is carried for provenance-parity only, the
+   * same as `taskType`'s literal union is kept as a plain `string` here
+   * rather than re-narrowed: mirroring the SHAPE, not re-deriving the app's
+   * enforcement.
+   */
+  readonly sessionVisibility?: "private" | "project";
 }
 
 export interface ClaimResponse {
