@@ -55,7 +55,7 @@ export function advertisedDeliveryCapabilities(
 }
 
 /**
- * This process cannot admit delivery. The three routes below are the whole
+ * This process cannot admit delivery. The routes below are the whole
  * outbound surface; none of them is delivery admit. The supported admit path
  * is kairokud `deliver`, which this binary does not call.
  */
