@@ -8,7 +8,15 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { appClient, DAEMON_ROUTES, PROTOCOL_VERSION, type RunEvent } from "./app";
+import {
+  appClient,
+  DAEMON_ROUTES,
+  DELIVERY_CAPABILITIES,
+  PROTOCOL_VERSION,
+  RELEASE_DELIVERY_CAPABILITY,
+  RELEASE_DELIVERY_CAPABILITY_V2,
+  type RunEvent,
+} from "./app";
 import { fakeApp, fakeItem, type FakeApp } from "./testkit";
 
 let app: FakeApp | undefined;
@@ -59,6 +67,11 @@ describe("app client — heartbeat", () => {
     expect(result.body.protocol).toBe("1");
     expect(result.body.cancel).toEqual([]);
     expect(app.calls[0]).toEqual({ route: "heartbeat", body: { meta } });
+    expect(JSON.stringify(app.calls[0]?.body)).not.toContain("deliveryCapabilities");
+    expect(PROTOCOL_VERSION).toBe("1");
+    expect(RELEASE_DELIVERY_CAPABILITY).toBe("release-delivery-v1");
+    expect(RELEASE_DELIVERY_CAPABILITY_V2).toBe("release-delivery-v2");
+    expect([...DELIVERY_CAPABILITIES]).toEqual(["release-delivery-v1", "release-delivery-v2"]);
     // meta travels whole: the composer greys models off this and the claim
     // query filters on `repos`.
     expect(app.metas[0]).toEqual(meta);

@@ -23,6 +23,19 @@ import type { EventKind } from "./events";
 
 export const PROTOCOL_VERSION = "1";
 
+/**
+ * Exact strings from the app catalog. Protocol stays v1. This copy does not
+ * advertise either capability: a heartbeat omits `deliveryCapabilities` unless
+ * a later slice implements the matching delivery path.
+ */
+export const RELEASE_DELIVERY_CAPABILITY = "release-delivery-v1";
+export const RELEASE_DELIVERY_CAPABILITY_V2 = "release-delivery-v2";
+export const DELIVERY_CAPABILITIES = [
+  RELEASE_DELIVERY_CAPABILITY,
+  RELEASE_DELIVERY_CAPABILITY_V2,
+] as const;
+export type DeliveryCapability = (typeof DELIVERY_CAPABILITIES)[number];
+
 /** The whole outbound surface. Kept as literals so the constraint can read it. */
 export const DAEMON_ROUTES = [
   "/api/daemon/heartbeat",
@@ -110,6 +123,11 @@ export interface HeartbeatBody {
   readonly meta: DaemonMeta;
   /** The app caps this at 50; the loop never sends more. */
   readonly runs?: RunReport[];
+  /**
+   * Optional closed set copied from the app heartbeat schema. Absent means
+   * none. Production heartbeats do not populate this field.
+   */
+  readonly deliveryCapabilities?: readonly DeliveryCapability[];
 }
 
 /** One thing the app wants stopped. `runId` absent means the whole dispatch. */
