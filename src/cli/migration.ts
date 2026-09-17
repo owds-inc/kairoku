@@ -61,6 +61,7 @@ export type MigrationReceipt = {
   predecessor?: PredecessorIdentity;
   replacement?: ReplacementIdentity;
   migrationOperationId?: string;
+  predecessorDisabled?: boolean;
 };
 
 const RECEIPT = "migration-receipt.json";
@@ -73,6 +74,26 @@ const TRANSIENT_LEGACY_PROBE_FAILURES = new Set([
   "legacy_status_counters_unknown",
   "legacy_status_unreachable",
 ]);
+
+const POST_DISABLE_BLOCKERS = new Set([
+  "rust_not_proven",
+  "rust_identity_mismatch",
+  "rust_identity_unknown",
+  "replacement_release_failed",
+  "replacement_release_unverified",
+]);
+
+function sameIdentity<T>(left: T | undefined, right: T): boolean {
+  return left !== undefined && JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function predecessorStillDisabled(io: Io, predecessor: PredecessorIdentity): Promise<boolean> {
+  if (predecessor.manager !== "systemd" || predecessor.scope === "unknown") return false;
+  const ctl = predecessor.scope === "system" ? ["sudo", "systemctl"] : ["systemctl", "--user"];
+  const active = await io.shell([...ctl, "is-active", predecessor.label]);
+  const enabled = await io.shell([...ctl, "is-enabled", predecessor.label]);
+  return active.stdout.trim() === "inactive" && enabled.stdout.trim() === "disabled";
+}
 
 export function migrationReceiptPath(home: string): string {
   return join(kairokuHome(home), RECEIPT);
@@ -398,7 +419,7 @@ export async function runMigration(
 ): Promise<MigrationResult> {
   const dispositioned = [...(opts.dispositioned ?? [])];
   const prior = loadReceipt(io);
-  const receipt: MigrationReceipt = prior ?? {
+  const receipt: MigrationReceipt = prior ? structuredClone(prior) : {
     schemaVersion: 1,
     state: "inventory",
     blockers: [],
@@ -427,6 +448,25 @@ export async function runMigration(
     label: installation.service.label,
     installationId: installation.installationId,
   };
+  const priorPostDisable =
+    opts.cutover === true &&
+    prior?.state === "blocked" &&
+    prior.blockers.length === 1 &&
+    POST_DISABLE_BLOCKERS.has(prior.blockers[0]!) &&
+    prior.unresolved.length === 0 &&
+    predecessor !== null &&
+    sameIdentity(prior.predecessor, predecessor) &&
+    sameIdentity(prior.replacement, replacement);
+  const resumeAfterDisable =
+    priorPostDisable &&
+    (prior?.predecessorDisabled === true || POST_DISABLE_BLOCKERS.has(prior.blockers[0]!)) &&
+    (await predecessorStillDisabled(io, predecessor));
+  if (priorPostDisable && !resumeAfterDisable) {
+    receipt.state = "blocked";
+    receipt.blockers = ["predecessor_resume_unverified"];
+    saveReceipt(io, receipt);
+    return { state: "blocked", blockers: receipt.blockers };
+  }
   receipt.replacement = replacement;
   receipt.newOwners = [installation.executionUser];
   receipt.newDaemonId = installation.installationId;
@@ -456,52 +496,50 @@ export async function runMigration(
   receipt.migrationOperationId = opId;
   saveReceipt(io, receipt);
 
-  receipt.state = "draining";
-  saveReceipt(io, receipt);
-  const drain = await drainPredecessor(io, predecessor);
-  if (!drain.ok) {
-    receipt.state = "blocked";
-    receipt.blockers = ["drain_failed"];
+  if (!resumeAfterDisable) {
+    receipt.state = "draining";
     saveReceipt(io, receipt);
-    return { state: "blocked", blockers: receipt.blockers };
-  }
+    const drain = await drainPredecessor(io, predecessor);
+    if (!drain.ok) {
+      receipt.state = "blocked";
+      receipt.blockers = ["drain_failed"];
+      saveReceipt(io, receipt);
+      return { state: "blocked", blockers: receipt.blockers };
+    }
 
-  receipt.state = "reconciled";
-  const live = await probeLegacyActive(io, predecessor);
-  const unresolved: string[] = (prior?.unresolved ?? []).filter(
-    (id) => !TRANSIENT_LEGACY_PROBE_FAILURES.has(id),
-  );
-  if (!live.ok) {
-    unresolved.push(live.reason);
-  } else {
-    if (live.activeRuns > 0) unresolved.push("legacy_active_run");
-    if (live.pendingReports > 0) unresolved.push("legacy_pending_report");
-    if (live.claimsInFlight > 0 || drain.claimsInFlight > 0) unresolved.push("legacy_claim_in_flight");
-  }
-  receipt.unresolved = [...new Set(unresolved)];
-  receipt.dispositioned = dispositioned;
-  // Only exact recorded ids may be dispositioned — never a blanket "all".
-  const blockers = receipt.unresolved.filter((id) => !dispositioned.includes(id));
-  receipt.blockers = blockers;
-  if (blockers.length > 0) {
-    receipt.state = "blocked";
+    receipt.state = "reconciled";
+    const live = await probeLegacyActive(io, predecessor);
+    const unresolved: string[] = (prior?.unresolved ?? []).filter(
+      (id) => !TRANSIENT_LEGACY_PROBE_FAILURES.has(id),
+    );
+    if (!live.ok) unresolved.push(live.reason);
+    else {
+      if (live.activeRuns > 0) unresolved.push("legacy_active_run");
+      if (live.pendingReports > 0) unresolved.push("legacy_pending_report");
+      if (live.claimsInFlight > 0 || drain.claimsInFlight > 0) unresolved.push("legacy_claim_in_flight");
+    }
+    receipt.unresolved = [...new Set(unresolved)];
+    receipt.dispositioned = dispositioned;
+    const blockers = receipt.unresolved.filter((id) => !dispositioned.includes(id));
+    receipt.blockers = blockers;
+    if (blockers.length > 0) {
+      receipt.state = "blocked";
+      saveReceipt(io, receipt);
+      return { state: "blocked", blockers };
+    }
     saveReceipt(io, receipt);
-    return { state: "blocked", blockers };
-  }
-  saveReceipt(io, receipt);
+    if (!opts.cutover) return { state: "reconciled", blockers: [] };
 
-  if (!opts.cutover) {
-    return { state: "reconciled", blockers: [] };
-  }
-
-  // Explicit human-directed cutover only — disable the inventoried predecessor.
-  receipt.state = "legacy_disabled";
-  saveReceipt(io, receipt);
-  if (!(await disablePredecessor(io, predecessor))) {
-    receipt.state = "blocked";
-    receipt.blockers = ["legacy_disable_failed"];
+    receipt.state = "legacy_disabled";
     saveReceipt(io, receipt);
-    return { state: "blocked", blockers: receipt.blockers };
+    if (!(await disablePredecessor(io, predecessor))) {
+      receipt.state = "blocked";
+      receipt.blockers = ["legacy_disable_failed"];
+      saveReceipt(io, receipt);
+      return { state: "blocked", blockers: receipt.blockers };
+    }
+    receipt.predecessorDisabled = true;
+    saveReceipt(io, receipt);
   }
 
   receipt.state = "rust_proven";
@@ -519,6 +557,7 @@ export async function runMigration(
       service?: { running?: boolean | null };
       installationId?: string;
       dataRoot?: string;
+      installation?: { dataRoot?: string };
       daemonId?: string | null;
       ownerId?: string | null;
       processInstanceId?: string | null;
@@ -531,9 +570,17 @@ export async function runMigration(
       saveReceipt(io, receipt);
       return { state: "blocked", blockers: receipt.blockers };
     }
+    const nestedDataRoot = body.installation?.dataRoot;
+    if (body.dataRoot !== undefined && nestedDataRoot !== undefined && body.dataRoot !== nestedDataRoot) {
+      receipt.state = "blocked";
+      receipt.blockers = ["rust_identity_mismatch"];
+      saveReceipt(io, receipt);
+      return { state: "blocked", blockers: receipt.blockers };
+    }
+    const observedDataRoot = nestedDataRoot ?? body.dataRoot;
     if (
       (body.installationId !== undefined && body.installationId !== installation.installationId) ||
-      (body.dataRoot !== undefined && body.dataRoot !== installation.dataRoot)
+      (observedDataRoot !== undefined && observedDataRoot !== installation.dataRoot)
     ) {
       receipt.state = "blocked";
       receipt.blockers = ["rust_identity_mismatch"];
@@ -542,7 +589,7 @@ export async function runMigration(
     }
     if (
       body.installationId !== installation.installationId ||
-      body.dataRoot !== installation.dataRoot ||
+      observedDataRoot !== installation.dataRoot ||
       typeof body.daemonId !== "string" || !body.daemonId ||
       typeof body.ownerId !== "string" || !body.ownerId ||
       typeof body.processInstanceId !== "string" || !body.processInstanceId ||

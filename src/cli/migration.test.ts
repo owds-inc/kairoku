@@ -125,6 +125,64 @@ describe("runMigration", () => {
     expect(joined.some((c) => c.includes("kairokud drain"))).toBe(false);
   });
 
+  test("a post-disable retry accepts canonical nested Rust dataRoot without draining twice", async () => {
+    const io = fixture({ activeRuns: 0 });
+    io.canned["/usr/bin/kairokud status --json"] = {
+      stdout: JSON.stringify({
+        installationId: installation.installationId,
+        daemonId: "daemon-rust-1",
+        ownerId: "owner-rust-1",
+        processInstanceId: "process-rust-1",
+        backendUrl: "https://app.kairoku.dev",
+        heartbeatOk: true,
+        service: { running: true },
+      }),
+    };
+    expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["rust_identity_unknown"]);
+    expect(loadReceipt(io)?.predecessorDisabled).toBe(true);
+
+    io.canned["systemctl --user is-active kairoku-daemon"] = { stdout: "inactive\n" };
+    io.canned["systemctl --user is-enabled kairoku-daemon"] = { stdout: "disabled\n" };
+    io.canned["/usr/bin/kairokud status --json"] = {
+      stdout: JSON.stringify({
+        installation: { dataRoot: installation.dataRoot },
+        installationId: installation.installationId,
+        daemonId: "daemon-rust-1",
+        ownerId: "owner-rust-1",
+        processInstanceId: "process-rust-1",
+        backendUrl: "https://app.kairoku.dev",
+        heartbeatOk: true,
+        service: { running: true },
+      }),
+    };
+    const disableCallsBeforeRetry = io.calls.filter((call) =>
+      call.join(" ").includes("disable --now kairoku-daemon"),
+    ).length;
+    const retry = await runMigration(io, installation, { cutover: true });
+    expect(retry).toEqual({ state: "complete", blockers: [] });
+    expect(io.calls.filter((call) => call.join(" ").includes("disable --now kairoku-daemon"))).toHaveLength(
+      disableCallsBeforeRetry,
+    );
+  });
+
+  test("conflicting top-level and nested Rust data roots are refused", async () => {
+    const io = fixture({ activeRuns: 0 });
+    io.canned["/usr/bin/kairokud status --json"] = {
+      stdout: JSON.stringify({
+        installation: { dataRoot: installation.dataRoot },
+        installationId: installation.installationId,
+        dataRoot: "/different/root",
+        daemonId: "daemon-rust-1",
+        ownerId: "owner-rust-1",
+        processInstanceId: "process-rust-1",
+        backendUrl: "https://app.kairoku.dev",
+        heartbeatOk: true,
+        service: { running: true },
+      }),
+    };
+    expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["rust_identity_mismatch"]);
+  });
+
   test("unreachable or malformed /status is unknown — never treated as idle", async () => {
     const unreachable = fixture({ statusOk: false });
     const a = await runMigration(unreachable, installation);
