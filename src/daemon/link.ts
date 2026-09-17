@@ -185,7 +185,7 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     ...(lastError === undefined ? {} : { lastError }),
     ...(stopped === undefined ? {} : { stopped }),
     ...(draining ? { draining: true } : {}),
-    ...(claimsInFlight > 0 ? { claimsInFlight } : {}),
+    claimsInFlight,
     runsInFlight: store.capacity().running,
     pendingReports: pending.length,
   });
