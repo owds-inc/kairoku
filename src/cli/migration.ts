@@ -460,6 +460,21 @@ export async function runMigration(
     label: installation.service.label,
     installationId: installation.installationId,
   };
+  if (opts.cutover === true && prior?.predecessorDisabled === true) {
+    let checkpointBlocker: string | null = null;
+    if (prior.unresolved.length > 0) checkpointBlocker = prior.unresolved[0]!;
+    else if (predecessor === null || !samePredecessor(prior.predecessor, predecessor)) {
+      checkpointBlocker = "predecessor_identity_changed";
+    } else if (!sameReplacement(prior.replacement, replacement)) {
+      checkpointBlocker = "replacement_identity_changed";
+    }
+    if (checkpointBlocker) {
+      receipt.state = "blocked";
+      receipt.blockers = [checkpointBlocker];
+      saveReceipt(io, receipt);
+      return { state: "blocked", blockers: receipt.blockers };
+    }
+  }
   const identitiesMatch =
     predecessor !== null &&
     samePredecessor(prior?.predecessor, predecessor) &&

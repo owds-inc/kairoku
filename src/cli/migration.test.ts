@@ -187,6 +187,19 @@ describe("runMigration", () => {
     expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["rust_identity_mismatch"]);
   });
 
+  test("a post-disable checkpoint never rebinds to a changed predecessor", async () => {
+    const io = fixture({ activeRuns: 0 });
+    io.canned["/usr/bin/kairokud status --json"] = { code: 1 };
+    expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["rust_not_proven"]);
+    const original = loadReceipt(io)!;
+    delete io.files["/home/neil/.kairoku/token.env"];
+
+    expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["predecessor_identity_changed"]);
+    expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["predecessor_identity_changed"]);
+    expect(loadReceipt(io)?.predecessor).toEqual(original.predecessor);
+    expect(loadReceipt(io)?.predecessorDisabled).toBe(true);
+  });
+
   test("unreachable or malformed /status is unknown — never treated as idle", async () => {
     const unreachable = fixture({ statusOk: false });
     const a = await runMigration(unreachable, installation);
