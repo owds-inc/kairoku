@@ -194,7 +194,7 @@ describe("runMigration", () => {
     const original = loadReceipt(io)!;
     delete io.files["/home/neil/.kairoku/token.env"];
 
-    expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["predecessor_identity_changed"]);
+    expect((await runMigration(io, installation)).blockers).toEqual(["predecessor_identity_changed"]);
     expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["predecessor_identity_changed"]);
     expect(loadReceipt(io)?.predecessor).toEqual(original.predecessor);
     expect(loadReceipt(io)?.predecessorDisabled).toBe(true);

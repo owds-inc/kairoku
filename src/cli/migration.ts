@@ -460,7 +460,7 @@ export async function runMigration(
     label: installation.service.label,
     installationId: installation.installationId,
   };
-  if (opts.cutover === true && prior?.predecessorDisabled === true) {
+  if (prior?.predecessorDisabled === true) {
     let checkpointBlocker: string | null = null;
     if (prior.unresolved.length > 0) checkpointBlocker = prior.unresolved[0]!;
     else if (predecessor === null || !samePredecessor(prior.predecessor, predecessor)) {
