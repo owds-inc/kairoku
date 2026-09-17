@@ -140,9 +140,13 @@ describe("runMigration", () => {
     };
     expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["rust_identity_unknown"]);
     expect(loadReceipt(io)?.predecessorDisabled).toBe(true);
+    const interrupted = loadReceipt(io)!;
+    interrupted.state = "legacy_disabled";
+    interrupted.blockers = [];
+    io.files["/home/neil/.kairoku/migration-receipt.json"] = `${JSON.stringify(interrupted)}\n`;
 
-    io.canned["systemctl --user is-active kairoku-daemon"] = { stdout: "inactive\n" };
-    io.canned["systemctl --user is-enabled kairoku-daemon"] = { stdout: "disabled\n" };
+    io.canned["systemctl --user is-active kairoku-daemon"] = { code: 3, stdout: "inactive\n" };
+    io.canned["systemctl --user is-enabled kairoku-daemon"] = { code: 1, stdout: "disabled\n" };
     io.canned["/usr/bin/kairokud status --json"] = {
       stdout: JSON.stringify({
         installation: { dataRoot: installation.dataRoot },

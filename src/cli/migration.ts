@@ -83,8 +83,19 @@ const POST_DISABLE_BLOCKERS = new Set([
   "replacement_release_unverified",
 ]);
 
-function sameIdentity<T>(left: T | undefined, right: T): boolean {
-  return left !== undefined && JSON.stringify(left) === JSON.stringify(right);
+function samePredecessor(left: PredecessorIdentity | undefined, right: PredecessorIdentity): boolean {
+  return left !== undefined &&
+    left.executable === right.executable && left.dataRoot === right.dataRoot &&
+    left.executionUser === right.executionUser && left.manager === right.manager &&
+    left.scope === right.scope && left.label === right.label && left.enrolled === right.enrolled;
+}
+
+function sameReplacement(left: ReplacementIdentity | undefined, right: ReplacementIdentity): boolean {
+  return left !== undefined &&
+    left.executable === right.executable && left.dataRoot === right.dataRoot &&
+    left.executionUser === right.executionUser && left.manager === right.manager &&
+    left.scope === right.scope && left.label === right.label &&
+    left.installationId === right.installationId;
 }
 
 async function predecessorStillDisabled(io: Io, predecessor: PredecessorIdentity): Promise<boolean> {
@@ -92,7 +103,8 @@ async function predecessorStillDisabled(io: Io, predecessor: PredecessorIdentity
   const ctl = predecessor.scope === "system" ? ["sudo", "systemctl"] : ["systemctl", "--user"];
   const active = await io.shell([...ctl, "is-active", predecessor.label]);
   const enabled = await io.shell([...ctl, "is-enabled", predecessor.label]);
-  return active.stdout.trim() === "inactive" && enabled.stdout.trim() === "disabled";
+  return active.code === 3 && active.stdout.trim() === "inactive" &&
+    enabled.code === 1 && enabled.stdout.trim() === "disabled";
 }
 
 export function migrationReceiptPath(home: string): string {
@@ -448,20 +460,25 @@ export async function runMigration(
     label: installation.service.label,
     installationId: installation.installationId,
   };
-  const priorPostDisable =
+  const identitiesMatch =
+    predecessor !== null &&
+    samePredecessor(prior?.predecessor, predecessor) &&
+    sameReplacement(prior?.replacement, replacement);
+  const checkpointResume =
+    opts.cutover === true && prior?.predecessorDisabled === true &&
+    prior.unresolved.length === 0 && identitiesMatch;
+  const compatiblePostDisableResume =
     opts.cutover === true &&
     prior?.state === "blocked" &&
     prior.blockers.length === 1 &&
     POST_DISABLE_BLOCKERS.has(prior.blockers[0]!) &&
     prior.unresolved.length === 0 &&
-    predecessor !== null &&
-    sameIdentity(prior.predecessor, predecessor) &&
-    sameIdentity(prior.replacement, replacement);
-  const resumeAfterDisable =
-    priorPostDisable &&
-    (prior?.predecessorDisabled === true || POST_DISABLE_BLOCKERS.has(prior.blockers[0]!)) &&
+    identitiesMatch;
+  const hasPostDisableEvidence = checkpointResume || compatiblePostDisableResume;
+  if (compatiblePostDisableResume) receipt.predecessorDisabled = true;
+  const resumeAfterDisable = hasPostDisableEvidence && predecessor !== null &&
     (await predecessorStillDisabled(io, predecessor));
-  if (priorPostDisable && !resumeAfterDisable) {
+  if (hasPostDisableEvidence && !resumeAfterDisable) {
     receipt.state = "blocked";
     receipt.blockers = ["predecessor_resume_unverified"];
     saveReceipt(io, receipt);
