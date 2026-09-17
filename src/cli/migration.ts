@@ -65,6 +65,15 @@ export type MigrationReceipt = {
 
 const RECEIPT = "migration-receipt.json";
 
+const TRANSIENT_LEGACY_PROBE_FAILURES = new Set([
+  "legacy_config_missing",
+  "legacy_config_unreadable",
+  "legacy_config_malformed",
+  "legacy_status_http",
+  "legacy_status_counters_unknown",
+  "legacy_status_unreachable",
+]);
+
 export function migrationReceiptPath(home: string): string {
   return join(kairokuHome(home), RECEIPT);
 }
@@ -459,7 +468,9 @@ export async function runMigration(
 
   receipt.state = "reconciled";
   const live = await probeLegacyActive(io, predecessor);
-  const unresolved: string[] = [...(prior?.unresolved ?? [])];
+  const unresolved: string[] = (prior?.unresolved ?? []).filter(
+    (id) => !TRANSIENT_LEGACY_PROBE_FAILURES.has(id),
+  );
   if (!live.ok) {
     unresolved.push(live.reason);
   } else {

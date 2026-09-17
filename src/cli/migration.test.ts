@@ -137,6 +137,55 @@ describe("runMigration", () => {
     expect(b.blockers).toContain("legacy_status_counters_unknown");
   });
 
+  test("a fresh successful probe clears a stored transient observation", async () => {
+    const io = fixture({ statusBody: { capacity: {}, link: {} } });
+    const first = await runMigration(io, installation);
+    expect(first.blockers).toEqual(["legacy_status_counters_unknown"]);
+
+    io.fetch = async (url, init) => {
+      if (url === "http://127.0.0.1:7801/drain" && init?.method === "POST") {
+        return Response.json({ local: "draining", claimsInFlight: 0 });
+      }
+      if (url === "http://127.0.0.1:7801/status") {
+        return Response.json({
+          capacity: { running: 0 },
+          runs: [],
+          link: { pendingReports: 0, claimsInFlight: 0 },
+        });
+      }
+      return new Response("", { status: 404 });
+    };
+
+    const retry = await runMigration(io, installation, { cutover: true });
+    expect(retry).toEqual({ state: "complete", blockers: [] });
+    expect(loadReceipt(io)?.unresolved).toEqual([]);
+  });
+
+  test("refreshing transient observations preserves an unknown durable receipt entry", async () => {
+    const io = fixture({ statusBody: { capacity: {}, link: {} } });
+    await runMigration(io, installation);
+    const receipt = loadReceipt(io)!;
+    receipt.unresolved.push("future_durable_evidence");
+    io.files["/home/neil/.kairoku/migration-receipt.json"] = `${JSON.stringify(receipt)}\n`;
+    io.fetch = async (url, init) => {
+      if (url === "http://127.0.0.1:7801/drain" && init?.method === "POST") {
+        return Response.json({ local: "draining", claimsInFlight: 0 });
+      }
+      if (url === "http://127.0.0.1:7801/status") {
+        return Response.json({
+          capacity: { running: 0 },
+          runs: [],
+          link: { pendingReports: 0, claimsInFlight: 0 },
+        });
+      }
+      return new Response("", { status: 404 });
+    };
+
+    const retry = await runMigration(io, installation);
+    expect(retry.blockers).toEqual(["future_durable_evidence"]);
+    expect(loadReceipt(io)?.unresolved).toEqual(["future_durable_evidence"]);
+  });
+
   test("blanket disposition of a counter name does not clear unknown inventory", async () => {
     const io = fixture({ statusOk: false });
     const result = await runMigration(io, installation, {
