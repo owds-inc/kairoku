@@ -24,6 +24,45 @@ import type { EventKind } from "./events";
 
 export const PROTOCOL_VERSION = "1";
 
+/**
+ * Catalog names only. Copying them onto a heartbeat is not support.
+ * Protocol stays v1. `DAEMON_ROUTES` has no delivery admit path, so this
+ * process advertises nothing. Format 2 is not a path this build implements.
+ */
+export const RELEASE_DELIVERY_CAPABILITY = "release-delivery-v1";
+export const RELEASE_DELIVERY_CAPABILITY_V2 = "release-delivery-v2";
+export const DELIVERY_CAPABILITIES = [
+  RELEASE_DELIVERY_CAPABILITY,
+  RELEASE_DELIVERY_CAPABILITY_V2,
+] as const;
+export type DeliveryCapability = (typeof DELIVERY_CAPABILITIES)[number];
+
+/**
+ * A process may advertise a capability only when it can perform the matching
+ * admit. Manifest 1 is `release-delivery-v1`. Manifest 2 is not implemented
+ * here and is not advertised from a format-1 path.
+ */
+export type DeliveryPath = {
+  readonly admit: (body: unknown) => Promise<unknown>;
+  readonly manifestVersion: 1;
+};
+
+export function advertisedDeliveryCapabilities(
+  path: DeliveryPath | null,
+): readonly DeliveryCapability[] {
+  if (!path || path.manifestVersion !== 1) return [];
+  return [RELEASE_DELIVERY_CAPABILITY];
+}
+
+/**
+ * This process cannot admit delivery. The routes below are the whole
+ * outbound surface; none of them is delivery admit. The supported admit path
+ * is kairokud `deliver`, which this binary does not call.
+ */
+export function supportedDeliveryPath(): DeliveryPath | null {
+  return null;
+}
+
 /** The whole outbound surface. Kept as literals so the constraint can read it. */
 export const DAEMON_ROUTES = [
   "/api/daemon/heartbeat",
@@ -123,6 +162,11 @@ export interface HeartbeatBody {
   readonly meta: DaemonMeta;
   /** The app caps this at 50; the loop never sends more. */
   readonly runs?: RunReport[];
+  /**
+   * Optional closed set copied from the app heartbeat schema. Absent means
+   * none. Production heartbeats do not populate this field.
+   */
+  readonly deliveryCapabilities?: readonly DeliveryCapability[];
 }
 
 /** One thing the app wants stopped. `runId` absent means the whole dispatch. */

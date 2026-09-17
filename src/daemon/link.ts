@@ -30,7 +30,9 @@
  */
 
 import {
+  advertisedDeliveryCapabilities,
   appClient,
+  supportedDeliveryPath,
   type AppClient,
   type AppResult,
   type CancelInstruction,
@@ -258,6 +260,7 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
     const live = liveReports(MAX_RUNS_PER_BEAT - carried.length);
     const sent = [...carried, ...live];
 
+    const advertised = advertisedDeliveryCapabilities(supportedDeliveryPath());
     const result = await client.heartbeat({
       meta: await machineMeta(config, {
         capacity: () => store.capacity(),
@@ -265,6 +268,7 @@ export function startLink(store: RunStore, config: Config, options: LinkOptions 
         models,
       }),
       ...(sent.length === 0 ? {} : { runs: sent }),
+      ...(advertised.length === 0 ? {} : { deliveryCapabilities: advertised }),
     });
 
     if (halted(result)) return 0;

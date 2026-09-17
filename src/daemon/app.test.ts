@@ -8,7 +8,16 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { appClient, DAEMON_ROUTES, PROTOCOL_VERSION, type RunEvent } from "./app";
+import {
+  appClient,
+  advertisedDeliveryCapabilities,
+  DAEMON_ROUTES,
+  PROTOCOL_VERSION,
+  RELEASE_DELIVERY_CAPABILITY,
+  RELEASE_DELIVERY_CAPABILITY_V2,
+  supportedDeliveryPath,
+  type RunEvent,
+} from "./app";
 import { fakeApp, fakeItem, type FakeApp } from "./testkit";
 
 let app: FakeApp | undefined;
@@ -60,6 +69,18 @@ describe("app client — heartbeat", () => {
     expect(result.body.protocol).toBe("1");
     expect(result.body.cancel).toEqual([]);
     expect(app.calls[0]).toEqual({ route: "heartbeat", body: { meta } });
+    expect(JSON.stringify(app.calls[0]?.body)).not.toContain("deliveryCapabilities");
+    expect(JSON.stringify(app.calls[0]?.body)).not.toContain(RELEASE_DELIVERY_CAPABILITY);
+    expect(JSON.stringify(app.calls[0]?.body)).not.toContain(RELEASE_DELIVERY_CAPABILITY_V2);
+    expect(supportedDeliveryPath()).toBeNull();
+    expect(advertisedDeliveryCapabilities(supportedDeliveryPath())).toEqual([]);
+    expect(PROTOCOL_VERSION).toBe("1");
+    const format1 = {
+      manifestVersion: 1 as const,
+      admit: async () => ({ permit: "reconcile" }),
+    };
+    expect(advertisedDeliveryCapabilities(format1)).toEqual([RELEASE_DELIVERY_CAPABILITY]);
+    expect(advertisedDeliveryCapabilities(format1)).not.toContain(RELEASE_DELIVERY_CAPABILITY_V2);
     // meta travels whole: the composer greys models off this and the claim
     // query filters on `repos`.
     expect(app.metas[0]).toEqual(meta);
