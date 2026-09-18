@@ -92,11 +92,12 @@ describe("kairoku setup — plugin", () => {
 
   test("the wizard asks two questions; defaults are plugin yes, daemon no", async () => {
     const io = withClaude();
-    io.answers = ["", ""];
+    io.answers = ["", "", ""];
     expect(await run([], io)).toBe(0);
-    expect(io.questions).toHaveLength(2);
+    expect(io.questions).toHaveLength(3);
     expect(io.questions[0]).toMatch(/plugin.*\[Y\/n\]/i);
     expect(io.questions[1]).toMatch(/daemon.*\[y\/N\]/i);
+    expect(io.questions[2]).toMatch(/mcp access.*\[y\/N\]/i);
     expect(calls(io)).toEqual(pluginInstallCalls);
     expect(io.lines.join("\n")).not.toContain("== daemon");
   });
@@ -266,7 +267,7 @@ describe("kairoku setup — daemon", () => {
 
   test("the wizard's daemon answer and --all / --yes alone reach the daemon flow after the plugin", async () => {
     const wizard = provisionedVm();
-    wizard.answers = ["n", "y"];
+    wizard.answers = ["n", "y", "n"];
     expect(await run([], wizard)).toBe(0);
     expect(wizard.lines.join("\n")).toContain("== daemon");
     expect(calls(wizard).some((c) => c.startsWith("claude plugin install"))).toBe(false);

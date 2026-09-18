@@ -379,8 +379,8 @@ command and move on:
 
 | Client | Sign in with |
 |---|---|
-| Claude Code | `/mcp` → **kairoku** → **Authenticate**, or `claude mcp login kairoku` |
-| OpenAI Codex CLI | `codex mcp login kairoku` |
+| Claude Code (plugin's own HTTP entry) | `/mcp` → **kairoku** → **Authenticate**, or `claude mcp login kairoku` |
+| Claude Code / OpenAI Codex CLI (stdio, via `kairoku mcp-bridge`) | `kairoku login` once, then `kairoku mcp setup` — no per-agent OAuth ceremony |
 | Augment auggie | the TUI's `/mcp` popover, which offers it once the server 401s |
 
 Headless runs have no browser, so a token from Settings → MCP access still works there — but the

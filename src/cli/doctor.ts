@@ -10,12 +10,14 @@ import { join } from "node:path";
 import { appClient, PROTOCOL_VERSION } from "../daemon/app";
 import { DEFAULT_PORT_RANGE, parsePortRange, type PortDeps } from "../daemon/compose";
 import { CODEGRAPH } from "../daemon/codegraph";
-import { normaliseAppUrl, parseTokenEnv } from "../daemon/config";
+import { normaliseAppUrl, parseEnvFile, parseTokenEnv } from "../daemon/config";
 import { availableResolvers } from "../daemon/env";
 import { ACTIVE_FLUSH_MS } from "../daemon/link";
 import { parseManifest, MANIFEST_FILE } from "../daemon/manifest";
 import { AST_GREP, RULES_PATH } from "../daemon/rules";
 import { version as binVersion, type Io } from "./io";
+import { readMcpLogin } from "./login";
+import { mcpCall } from "./mcp-http";
 import { resolvePluginPath } from "../daemon/providers";
 import { installedPlugin, MARKETPLACE, MARKETPLACE_SOURCE } from "./plugin";
 import { resolveRuntime } from "./runtime";
@@ -813,6 +815,54 @@ export async function checks(io: Io, probe?: PortDeps): Promise<Check[]> {
           ? pass(name, "OAuth; a run brings its own credential")
           : warn(name, "no kairoku MCP entry — `codex mcp add kairoku --url <app>/api/mcp` then `codex mcp login kairoku`"),
   );
+
+  // §3B — a codex/claude entry still pointed at the HTTP `/api/mcp` URL is the
+  // pre-`kairoku mcp setup` shape (§21 item 5b's OAuth ceremony this lane
+  // retires); it still works, but doctor names the stdio replacement rather
+  // than staying silent about a config two commands could simplify.
+  if (resolvedCodexUrl?.includes("/api/mcp") && !resolvedCodexUrl.includes("${")) {
+    out.push(
+      warn(
+        "codex MCP entry is the stale URL form",
+        `still \`--url ${resolvedCodexUrl}\` — run \`kairoku mcp setup --agent codex\` for the stdio bridge`,
+      ),
+    );
+  }
+
+  // §3B — human MCP access (`kairoku login`), distinct from the daemon link
+  // above: whether this machine has one, which workspace, and whether the
+  // bridge can actually reach the app with it.
+  {
+    const mcpLogin = readMcpLogin(io);
+    if (!mcpLogin) {
+      out.push(warn("kairoku login (MCP access)", "not signed in — run `kairoku login`"));
+    } else {
+      out.push(pass("kairoku login (MCP access)", `${mcpLogin.appUrl} — workspace ${mcpLogin.ownerId}`));
+      const mcpToken = parseEnvFile(io.readFile(join(home, "token.env")) ?? "").KAIROKU_MCP_TOKEN;
+      if (!mcpToken) {
+        out.push(fail("kairoku mcp-bridge reachable", "KAIROKU_MCP_TOKEN missing from token.env — run `kairoku login --replace`"));
+      } else {
+        try {
+          const url = new URL("/api/mcp", mcpLogin.appUrl).toString();
+          const init = await mcpCall(io, url, mcpToken, {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "kairoku-doctor", version: "0" } },
+          });
+          out.push(
+            init.status === 401
+              ? fail("kairoku mcp-bridge reachable", "401 unauthorized — the token was revoked; run `kairoku login --replace`")
+              : init.status >= 200 && init.status < 300
+                ? pass("kairoku mcp-bridge reachable", `initialize OK at ${mcpLogin.appUrl}`)
+                : fail("kairoku mcp-bridge reachable", `HTTP ${init.status} from ${mcpLogin.appUrl}`),
+          );
+        } catch (e) {
+          out.push(fail("kairoku mcp-bridge reachable", (e as Error).message));
+        }
+      }
+    }
+  }
 
   const configPath = join(home, "config.json");
   const tokenPath = join(home, "token.env");

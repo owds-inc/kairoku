@@ -52,9 +52,14 @@ export const DEFAULT_APP_URL = "https://kairoku.io";
  * its own OAuth login was ignored (found 2026-09-03 on Neil's Mac). The run's
  * credential now lives in the run's own `.codex/config.toml`, written per
  * dispatch by `providers/codex.ts`, and the machine keeps none of it.
+ *
+ * §3B — the URL+OAuth ceremony this used to print (`codex mcp add --url …`
+ * then `codex mcp login kairoku`) is retired. Human MCP access is now one
+ * sign-in (`kairoku login`) plus a stdio wire-up (`kairoku mcp setup`) that
+ * covers codex and claude together; see login.ts / mcp-setup.ts.
  */
-export const CODEX_MCP_ADD = "timeout 15 codex mcp add kairoku --url https://kairoku.io/api/mcp";
-export const CODEX_MCP_LOGIN = "codex mcp login kairoku            # (browser)";
+export const CODEX_MCP_ADD = "kairoku login && kairoku mcp setup --agent codex";
+export const CODEX_MCP_LOGIN = "kairoku mcp setup --agent codex";
 
 const sudoOk = async (io: Io) => (await io.shell(["sudo", "-n", "true"])).code === 0;
 
@@ -250,7 +255,7 @@ export async function codexConfig(io: Io): Promise<Step> {
   if (text === null) {
     return manual(
       name,
-      `no ~/.codex/config.toml yet — run \`codex login\`, then:\n     ${CODEX_MCP_ADD}\n     ${CODEX_MCP_LOGIN}`,
+      `no ~/.codex/config.toml yet — run \`codex login\`, then:\n     ${CODEX_MCP_ADD}`,
     );
   }
   if (/bearer_token_env_var\s*=\s*"KAIROKU_PAT"/.test(text)) {
@@ -258,12 +263,11 @@ export async function codexConfig(io: Io): Promise<Step> {
       name,
       "the kairoku MCP entry in ~/.codex/config.toml carries bearer_token_env_var — that variable is only set\n" +
         "     inside a run, so your own Codex gets 401 and ignores its OAuth login. Remove it and re-add:\n" +
-        "     codex mcp remove kairoku\n" +
-        `     ${CODEX_MCP_ADD}\n     ${CODEX_MCP_LOGIN}`,
+        `     codex mcp remove kairoku\n     ${CODEX_MCP_ADD}`,
     );
   }
   if (!text.includes("[mcp_servers.kairoku]")) {
-    return manual(name, `kairoku MCP entry not found in ${path} — add it with:\n     ${CODEX_MCP_ADD}\n     ${CODEX_MCP_LOGIN}`);
+    return manual(name, `kairoku MCP entry not found in ${path} — add it with:\n     ${CODEX_MCP_ADD}`);
   }
   return skipped(name, "OAuth entry, no bearer — a run brings its own credential");
 }
@@ -404,7 +408,7 @@ export function remainder(io: Io, steps: Step[]): string[] {
   if (!io.exists(join(io.home, ".claude"))) owed.push("claude                       # then /login (browser)");
   if (!io.exists(join(io.home, ".codex", "auth.json"))) owed.push("codex login                  # (browser)");
   if (!(io.readFile(join(io.home, ".codex", "config.toml")) ?? "").includes("[mcp_servers.kairoku]")) {
-    owed.push(`${CODEX_MCP_ADD}\n     # the add command hangs after writing; the config still lands.\n     ${CODEX_MCP_LOGIN}`);
+    owed.push(CODEX_MCP_ADD);
   }
   for (const s of steps) if (s.outcome === "manual") owed.push(`${s.name}: ${s.detail}`);
   return owed;
