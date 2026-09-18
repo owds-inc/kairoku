@@ -46,6 +46,8 @@ export type LinkPersistPayload = {
   ownerId?: string;
   requestId?: string;
   daemonName?: string;
+  /** MCP purpose only — the canonical protected-resource id the app minted the token against. */
+  resource?: string;
 };
 
 /** §43.3/§43.9 — `kairokud` reads this key; the Bun daemon's own key stays. */
@@ -91,6 +93,10 @@ export function listenForLink(opts: {
   /** Must have RETURNED before the page is told 204. Throwing means 400. */
   persist: (payload: LinkPersistPayload) => void | Promise<void>;
   timeoutMs?: number;
+  /** Second /link purpose (e.g. "mcp"). Daemon linking omits this. */
+  purpose?: string;
+  /** The `name` query param the page shows the human, e.g. `cli:<hostname>`. */
+  name?: string;
 }): LinkListener {
   // Before the bind: an app URL that is not a URL has no origin to allow, and
   // failing here leaves nothing listening and nothing opened.
@@ -140,6 +146,7 @@ export function listenForLink(opts: {
       const ownerId = typeof body.ownerId === "string" ? body.ownerId : undefined;
       const requestId = typeof body.requestId === "string" ? body.requestId : undefined;
       const daemonName = typeof body.daemonName === "string" ? body.daemonName : undefined;
+      const resource = typeof body.resource === "string" ? body.resource : undefined;
 
       state = "writing";
       try {
@@ -149,6 +156,7 @@ export function listenForLink(opts: {
           ...(ownerId ? { ownerId } : {}),
           ...(requestId ? { requestId } : {}),
           ...(daemonName ? { daemonName } : {}),
+          ...(resource ? { resource } : {}),
         });
       } catch {
         // The use is NOT spent: the page's retry is the only way back from a
@@ -165,8 +173,10 @@ export function listenForLink(opts: {
   const port = server.port!;
   const callbackUrl = `http://127.0.0.1:${port}${CALLBACK_PATH}`;
   const link = new URL("/link", opts.appUrl);
+  if (opts.purpose) link.searchParams.set("purpose", opts.purpose);
   link.searchParams.set("callback", callbackUrl);
   link.searchParams.set("nonce", nonce);
+  if (opts.name) link.searchParams.set("name", opts.name);
 
   const windowMs = opts.timeoutMs ?? LINK_WINDOW_MS;
   const timer = setTimeout(
@@ -244,7 +254,7 @@ export function setTokenEnv(io: Io, key: string, value: string): void {
 }
 
 /** `open` on macOS, `xdg-open` elsewhere; absent is normal on a headless box. */
-async function openLink(io: Io, url: string): Promise<void> {
+export async function openLink(io: Io, url: string): Promise<void> {
   const opener = io.platform === "darwin" ? "open" : "xdg-open";
   if (io.which(opener)) await io.shell([opener, url]);
 }
