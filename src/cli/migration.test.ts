@@ -125,6 +125,81 @@ describe("runMigration", () => {
     expect(joined.some((c) => c.includes("kairokud drain"))).toBe(false);
   });
 
+  test("a post-disable retry accepts canonical nested Rust dataRoot without draining twice", async () => {
+    const io = fixture({ activeRuns: 0 });
+    io.canned["/usr/bin/kairokud status --json"] = {
+      stdout: JSON.stringify({
+        installationId: installation.installationId,
+        daemonId: "daemon-rust-1",
+        ownerId: "owner-rust-1",
+        processInstanceId: "process-rust-1",
+        backendUrl: "https://app.kairoku.dev",
+        heartbeatOk: true,
+        service: { running: true },
+      }),
+    };
+    expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["rust_identity_unknown"]);
+    expect(loadReceipt(io)?.predecessorDisabled).toBe(true);
+    const interrupted = loadReceipt(io)!;
+    interrupted.state = "legacy_disabled";
+    interrupted.blockers = [];
+    io.files["/home/neil/.kairoku/migration-receipt.json"] = `${JSON.stringify(interrupted)}\n`;
+
+    io.canned["systemctl --user is-active kairoku-daemon"] = { code: 3, stdout: "inactive\n" };
+    io.canned["systemctl --user is-enabled kairoku-daemon"] = { code: 1, stdout: "disabled\n" };
+    io.canned["/usr/bin/kairokud status --json"] = {
+      stdout: JSON.stringify({
+        installation: { dataRoot: installation.dataRoot },
+        installationId: installation.installationId,
+        daemonId: "daemon-rust-1",
+        ownerId: "owner-rust-1",
+        processInstanceId: "process-rust-1",
+        backendUrl: "https://app.kairoku.dev",
+        heartbeatOk: true,
+        service: { running: true },
+      }),
+    };
+    const disableCallsBeforeRetry = io.calls.filter((call) =>
+      call.join(" ").includes("disable --now kairoku-daemon"),
+    ).length;
+    const retry = await runMigration(io, installation, { cutover: true });
+    expect(retry).toEqual({ state: "complete", blockers: [] });
+    expect(io.calls.filter((call) => call.join(" ").includes("disable --now kairoku-daemon"))).toHaveLength(
+      disableCallsBeforeRetry,
+    );
+  });
+
+  test("conflicting top-level and nested Rust data roots are refused", async () => {
+    const io = fixture({ activeRuns: 0 });
+    io.canned["/usr/bin/kairokud status --json"] = {
+      stdout: JSON.stringify({
+        installation: { dataRoot: installation.dataRoot },
+        installationId: installation.installationId,
+        dataRoot: "/different/root",
+        daemonId: "daemon-rust-1",
+        ownerId: "owner-rust-1",
+        processInstanceId: "process-rust-1",
+        backendUrl: "https://app.kairoku.dev",
+        heartbeatOk: true,
+        service: { running: true },
+      }),
+    };
+    expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["rust_identity_mismatch"]);
+  });
+
+  test("a post-disable checkpoint never rebinds to a changed predecessor", async () => {
+    const io = fixture({ activeRuns: 0 });
+    io.canned["/usr/bin/kairokud status --json"] = { code: 1 };
+    expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["rust_not_proven"]);
+    const original = loadReceipt(io)!;
+    delete io.files["/home/neil/.kairoku/token.env"];
+
+    expect((await runMigration(io, installation)).blockers).toEqual(["predecessor_identity_changed"]);
+    expect((await runMigration(io, installation, { cutover: true })).blockers).toEqual(["predecessor_identity_changed"]);
+    expect(loadReceipt(io)?.predecessor).toEqual(original.predecessor);
+    expect(loadReceipt(io)?.predecessorDisabled).toBe(true);
+  });
+
   test("unreachable or malformed /status is unknown — never treated as idle", async () => {
     const unreachable = fixture({ statusOk: false });
     const a = await runMigration(unreachable, installation);
@@ -135,6 +210,55 @@ describe("runMigration", () => {
     const b = await runMigration(malformed, installation);
     expect(b.state).toBe("blocked");
     expect(b.blockers).toContain("legacy_status_counters_unknown");
+  });
+
+  test("a fresh successful probe clears a stored transient observation", async () => {
+    const io = fixture({ statusBody: { capacity: {}, link: {} } });
+    const first = await runMigration(io, installation);
+    expect(first.blockers).toEqual(["legacy_status_counters_unknown"]);
+
+    io.fetch = async (url, init) => {
+      if (url === "http://127.0.0.1:7801/drain" && init?.method === "POST") {
+        return Response.json({ local: "draining", claimsInFlight: 0 });
+      }
+      if (url === "http://127.0.0.1:7801/status") {
+        return Response.json({
+          capacity: { running: 0 },
+          runs: [],
+          link: { pendingReports: 0, claimsInFlight: 0 },
+        });
+      }
+      return new Response("", { status: 404 });
+    };
+
+    const retry = await runMigration(io, installation, { cutover: true });
+    expect(retry).toEqual({ state: "complete", blockers: [] });
+    expect(loadReceipt(io)?.unresolved).toEqual([]);
+  });
+
+  test("refreshing transient observations preserves an unknown durable receipt entry", async () => {
+    const io = fixture({ statusBody: { capacity: {}, link: {} } });
+    await runMigration(io, installation);
+    const receipt = loadReceipt(io)!;
+    receipt.unresolved.push("future_durable_evidence");
+    io.files["/home/neil/.kairoku/migration-receipt.json"] = `${JSON.stringify(receipt)}\n`;
+    io.fetch = async (url, init) => {
+      if (url === "http://127.0.0.1:7801/drain" && init?.method === "POST") {
+        return Response.json({ local: "draining", claimsInFlight: 0 });
+      }
+      if (url === "http://127.0.0.1:7801/status") {
+        return Response.json({
+          capacity: { running: 0 },
+          runs: [],
+          link: { pendingReports: 0, claimsInFlight: 0 },
+        });
+      }
+      return new Response("", { status: 404 });
+    };
+
+    const retry = await runMigration(io, installation);
+    expect(retry.blockers).toEqual(["future_durable_evidence"]);
+    expect(loadReceipt(io)?.unresolved).toEqual(["future_durable_evidence"]);
   });
 
   test("blanket disposition of a counter name does not clear unknown inventory", async () => {

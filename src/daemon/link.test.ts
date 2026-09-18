@@ -239,6 +239,7 @@ describe("backoff (RF-012)", () => {
   test("a late claim after drain latches does not start provider work (FRV09/C5)", async () => {
     const { link, app, store } = setup({ maxConcurrent: 2 });
     await link.beat();
+    expect(link.status().claimsInFlight).toBe(0);
     app.queue({
       id: "d-late",
       taskType: "implement",
@@ -253,7 +254,7 @@ describe("backoff (RF-012)", () => {
     expect(link.drainReady()).toBe(false);
     app.releaseClaim();
     expect(await pollPromise).toBe(false);
-    await waitFor(() => (link.status().claimsInFlight ?? 0) === 0, "claim settled");
+    await waitFor(() => link.status().claimsInFlight === 0, "claim settled");
     expect(link.drainReady()).toBe(true);
     expect(store.list()).toEqual([]);
     await waitFor(
