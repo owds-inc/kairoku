@@ -97,7 +97,7 @@ describe("daemon process", () => {
     try {
       expect(await reachable(port)).toBe(true);
       const status = await (await fetch(`http://127.0.0.1:${port}/status`)).json();
-      expect(status.link).toEqual({ linked: false, runsInFlight: 0, pendingReports: 0 });
+      expect(status.link).toEqual({ linked: false, runsInFlight: 0, pendingReports: 0, claimsInFlight: 0 });
       proc.kill("SIGTERM");
       expect(await proc.exited).toBe(0);
       expect(await new Response(proc.stdout).text()).toContain("not linking");
