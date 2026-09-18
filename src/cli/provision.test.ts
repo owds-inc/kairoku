@@ -126,7 +126,7 @@ describe("codex MCP entry", () => {
   test("without the kairoku MCP entry the add command is handed back", async () => {
     const io = vm();
     io.files[cfg] = "model = \"o3\"\n";
-    expect(await codexConfig(io)).toMatchObject({ outcome: "manual", detail: expect.stringContaining("codex mcp add kairoku") });
+    expect(await codexConfig(io)).toMatchObject({ outcome: "manual", detail: expect.stringContaining("kairoku mcp setup") });
   });
 });
 
@@ -317,10 +317,11 @@ describe("§21 — the language server, for a repo that has a tsconfig", () => {
 describe("§21 item 5b — the machine-wide codex MCP entry stops carrying a bearer", () => {
   const cfg = `${home}/.codex/config.toml`;
 
-  test("the add command is OAuth, with no bearer flag, followed by a login", () => {
+  test("the instruction is kairoku login + kairoku mcp setup, not a bearer flag", () => {
     expect(CODEX_MCP_ADD).not.toContain("bearer");
-    expect(CODEX_MCP_ADD).toContain("codex mcp add kairoku --url https://kairoku.io/api/mcp");
-    expect(CODEX_MCP_LOGIN).toContain("codex mcp login kairoku");
+    expect(CODEX_MCP_ADD).toContain("kairoku login");
+    expect(CODEX_MCP_ADD).toContain("kairoku mcp setup --agent codex");
+    expect(CODEX_MCP_LOGIN).toContain("kairoku mcp setup --agent codex");
   });
 
   test("a global entry carrying the bearer env var is reported, and never rewritten in place", async () => {

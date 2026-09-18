@@ -16,6 +16,8 @@ import { daemonStatus, pluginPathFor, reachable } from "./doctor";
 import { EnrollmentIncompleteError, runEnrollment } from "./enrollment";
 import { linkDaemon } from "./link-callback";
 import type { Io } from "./io";
+import * as login from "./login";
+import * as mcpSetup from "./mcp-setup";
 import * as plugin from "./plugin";
 import { probeRustLiveHealth, resolveRuntime } from "./runtime";
 import {
@@ -330,6 +332,10 @@ export async function run(args: string[], io: Io): Promise<number> {
   }
   let wantPlugin = Boolean(values.plugin || values.all);
   let wantDaemon = Boolean(values.daemon || values.all);
+  // The bare wizard (no selecting flag) also offers the MCP sign-in below —
+  // an explicit `--daemon`/`--plugin`/`--all`/`--yes` run stays exactly what
+  // it was asking for, and is never made to answer one more prompt.
+  const bareWizard = !wantPlugin && !wantDaemon && !values.yes;
   if (!wantPlugin && !wantDaemon) {
     if (values.yes) {
       wantPlugin = wantDaemon = true;
@@ -348,13 +354,26 @@ export async function run(args: string[], io: Io): Promise<number> {
     if (code !== 0) return code;
   }
   if (wantDaemon) {
-    return daemon(io, {
+    const code = await daemon(io, {
       yes: Boolean(values.yes),
       repo: values.repo,
       appUrl: values["app-url"],
       appToken: values["app-token"],
       link: Boolean(values.link),
     });
+    if (code !== 0) return code;
+  }
+
+  // §3B — human MCP access is a separate credential from the daemon link
+  // above, so it is offered rather than folded into it; `--yes` and any
+  // explicit selecting flag never sign a human in on their behalf.
+  if (bareWizard && (await confirm(io, "Sign in for coding-agent MCP access (kairoku login)? [y/N] ", false))) {
+    io.out("== kairoku login");
+    const loginCode = await login.run(values["app-url"] ? ["--app-url", values["app-url"]] : [], io);
+    if (loginCode === 0) {
+      io.out("== kairoku mcp setup");
+      await mcpSetup.run([], io);
+    }
   }
   return 0;
 }

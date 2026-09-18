@@ -74,6 +74,9 @@ export function fakeIo(overrides: Partial<FakeIo> = {}): FakeIo {
       }
     },
     fetch: () => Promise.reject(new Error("unscripted fetch")),
+    async *stdinLines() {
+      // empty by default — tests override with their own scripted lines
+    },
     ...overrides,
   };
   return fake;

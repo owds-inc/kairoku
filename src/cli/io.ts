@@ -43,6 +43,8 @@ export type Io = {
   writeFile(path: string, data: Uint8Array | string, mode?: number): void;
   rename(from: string, to: string): void;
   fetch(url: string, init?: RequestInit): Promise<Response>;
+  /** stdin, one line at a time (no trailing newline) — `mcp-bridge`'s JSON-RPC framing. */
+  stdinLines(): AsyncIterable<string>;
 };
 
 export const io: Io = {
@@ -101,6 +103,10 @@ export const io: Io = {
   },
   rename: renameSync,
   fetch: (url, init) => globalThis.fetch(url, init),
+  stdinLines() {
+    const rl = createInterface({ input: process.stdin });
+    return rl[Symbol.asyncIterator]();
+  },
 };
 
 /** First line of `<bin> --version`, or null when the binary is not on PATH. */

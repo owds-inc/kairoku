@@ -35,6 +35,31 @@ also work by hand inside Claude Code:
 checkout, `claude plugin marketplace add /path/to/kairoku` then the same
 install line. Plugin releases are tagged `kairoku--v<version>`.
 
+## Coding-agent MCP access (codex, Claude Code)
+
+A coding agent that talks to Kairoku's MCP server over stdio (rather than
+through the plugin's own HTTP/OAuth entry) needs one human sign-in, done
+once per machine:
+
+```
+kairoku login                # one browser hop, mints an owner-scoped MCP token
+kairoku mcp setup             # wires kairoku mcp-bridge into codex and/or claude
+```
+
+`kairoku login` writes `KAIROKU_MCP_TOKEN` to `~/.kairoku/token.env` (mode
+600) and `mcp: {appUrl, ownerId, resource}` to `~/.kairoku/config.json`
+(no secret); it verifies the app's published resource metadata and does one
+MCP `initialize` + `tools/list` round trip before writing anything. `kairoku
+mcp setup [--agent codex|claude|all]` then registers `kairoku mcp-bridge` as
+each agent's `kairoku` MCP server — no bearer, no per-agent OAuth. `kairoku
+logout` removes the local token and prints the Settings → Tokens URL to
+revoke it server side (`cli:<hostname>`). `kairoku doctor` reports the login
+state and a live bridge round trip.
+
+This is a *different* credential from the daemon link below: the daemon's
+`KAIROKU_DAEMON_TOKEN` runs orchestration; `KAIROKU_MCP_TOKEN` is the human's
+own MCP access, scoped to one workspace, revocable independently.
+
 ## The daemon
 
 One daemon per machine. It **links itself to a Kairoku app** and dials out only:

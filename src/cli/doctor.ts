@@ -10,12 +10,14 @@ import { join } from "node:path";
 import { appClient, PROTOCOL_VERSION } from "../daemon/app";
 import { DEFAULT_PORT_RANGE, parsePortRange, type PortDeps } from "../daemon/compose";
 import { CODEGRAPH } from "../daemon/codegraph";
-import { normaliseAppUrl, parseTokenEnv } from "../daemon/config";
+import { normaliseAppUrl, parseEnvFile, parseTokenEnv } from "../daemon/config";
 import { availableResolvers } from "../daemon/env";
 import { ACTIVE_FLUSH_MS } from "../daemon/link";
 import { parseManifest, MANIFEST_FILE } from "../daemon/manifest";
 import { AST_GREP, RULES_PATH } from "../daemon/rules";
 import { version as binVersion, type Io } from "./io";
+import { readMcpLogin } from "./login";
+import { fetchResourceMetadata, mcpCall } from "./mcp-http";
 import { resolvePluginPath } from "../daemon/providers";
 import { installedPlugin, MARKETPLACE, MARKETPLACE_SOURCE } from "./plugin";
 import { resolveRuntime } from "./runtime";
@@ -802,7 +804,7 @@ export async function checks(io: Io, probe?: PortDeps): Promise<Check[]> {
     /bearer_token_env_var\s*=\s*"KAIROKU_PAT"/.test(codexConfig)
       ? fail(
           name,
-          "the global kairoku entry carries bearer_token_env_var — that variable is only set inside a run, so your own Codex gets 401. `codex mcp remove kairoku`, re-add with no bearer flag, then `codex mcp login kairoku`",
+          "the global kairoku entry carries bearer_token_env_var — that variable is only set inside a run, so your own Codex gets 401. `codex mcp remove kairoku`, then `kairoku mcp setup --agent codex`",
         )
       : resolvedCodexUrl?.includes("${")
         ? fail(
@@ -811,8 +813,73 @@ export async function checks(io: Io, probe?: PortDeps): Promise<Check[]> {
           )
         : codexConfig.includes("[mcp_servers.kairoku]") || resolvedCodexUrl !== undefined
           ? pass(name, "OAuth; a run brings its own credential")
-          : warn(name, "no kairoku MCP entry — `codex mcp add kairoku --url <app>/api/mcp` then `codex mcp login kairoku`"),
+          : warn(name, "no kairoku MCP entry — `kairoku login` then `kairoku mcp setup --agent codex`"),
   );
+
+  // §3B — a codex/claude entry still pointed at the HTTP `/api/mcp` URL is the
+  // pre-`kairoku mcp setup` shape (§21 item 5b's OAuth ceremony this lane
+  // retires); it still works, but doctor names the stdio replacement rather
+  // than staying silent about a config two commands could simplify.
+  if (resolvedCodexUrl?.includes("/api/mcp") && !resolvedCodexUrl.includes("${")) {
+    out.push(
+      warn(
+        "codex MCP entry is the stale URL form",
+        `still \`--url ${resolvedCodexUrl}\` — run \`kairoku mcp setup --agent codex\` for the stdio bridge`,
+      ),
+    );
+  }
+
+  // §3B — human MCP access (`kairoku login`), distinct from the daemon link
+  // above: whether this machine has one, which workspace, and whether the
+  // bridge can actually reach the app with it.
+  {
+    const mcpLogin = readMcpLogin(io);
+    if (!mcpLogin) {
+      out.push(warn("kairoku login (MCP access)", "not signed in — run `kairoku login`"));
+    } else {
+      out.push(pass("kairoku login (MCP access)", `${mcpLogin.appUrl} — workspace ${mcpLogin.ownerId}`));
+      const mcpToken = parseEnvFile(io.readFile(join(home, "token.env")) ?? "").KAIROKU_MCP_TOKEN;
+      if (!mcpToken) {
+        // A recorded login with no token is a broken LOCAL state, not a
+        // network condition — that stays a FAIL, unlike the WARN below.
+        out.push(fail("kairoku mcp-bridge reachable", "KAIROKU_MCP_TOKEN missing from token.env — run `kairoku login --replace`"));
+      } else {
+        // §3B fix round 1, Issue #4 — an unreachable app (offline laptop, a CI
+        // box with no network) is a WARN, not a FAIL: only an explicit 401 or
+        // a resource-metadata mismatch says the login itself is bad. Every
+        // other network condition (timeout, DNS, connection refused) means
+        // "could not tell", not "signed out".
+        try {
+          const metadataResource = await fetchResourceMetadata(io, mcpLogin.appUrl);
+          if (metadataResource !== mcpLogin.resource) {
+            out.push(
+              fail(
+                "kairoku mcp-bridge reachable",
+                `resource metadata mismatch: the app now says ${metadataResource}, \`kairoku login\` recorded ${mcpLogin.resource} — run \`kairoku login --replace\``,
+              ),
+            );
+          } else {
+            const url = new URL("/api/mcp", mcpLogin.appUrl).toString();
+            const init = await mcpCall(io, url, mcpToken, {
+              jsonrpc: "2.0",
+              id: 1,
+              method: "initialize",
+              params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "kairoku-doctor", version: "0" } },
+            });
+            out.push(
+              init.status === 401
+                ? fail("kairoku mcp-bridge reachable", "401 unauthorized — the token was revoked; run `kairoku login --replace`")
+                : init.status >= 200 && init.status < 300
+                  ? pass("kairoku mcp-bridge reachable", `initialize OK at ${mcpLogin.appUrl}`)
+                  : warn("kairoku mcp-bridge reachable", `HTTP ${init.status} from ${mcpLogin.appUrl} — could not confirm either way`),
+            );
+          }
+        } catch (e) {
+          out.push(warn("kairoku mcp-bridge reachable", `could not reach ${mcpLogin.appUrl} — ${(e as Error).message}`));
+        }
+      }
+    }
+  }
 
   const configPath = join(home, "config.json");
   const tokenPath = join(home, "token.env");
