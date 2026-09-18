@@ -17,6 +17,7 @@ import {
 } from "./enrollment";
 import type { Installation } from "./runtime";
 import { fakeIo, type FakeIo } from "./testkit";
+import { kairokuHome } from "../daemon/config";
 
 const issuedToken = "kai_issued_secret_token_never_print_me";
 const expectedDaemonId = "daemon-abc";
@@ -349,7 +350,55 @@ describe("runEnrollment — failure and resume paths", () => {
       intervalSeconds: 5,
       // no installedOwnerId — credential alone ⇒ unknown, not fresh
     });
-    io.writeFile(join(installation.dataRoot, ".secrets.json"), "{}\n", 0o600);
+    io.writeFile(
+      join(installation.dataRoot, ".secrets.json"),
+      '{"kairoku.token":"kai_x"}\n',
+      0o600,
+    );
+
+    await expect(runEnrollment(io, installation, { backendUrl })).rejects.toThrow(
+      /installed owner is unknown while a credential exists/,
+    );
+    expect(io.calls.some((c) => c.includes("--stdin"))).toBe(false);
+  });
+
+  test("fresh enrollment proceeds when only a Bun predecessor token and server.auth.token exist", async () => {
+    const io = baseIo();
+    seedHappyFetches(io);
+    canAcknowledge(io);
+    canLiveProof(io);
+    io.writeFile(
+      join(kairokuHome(io.home), "token.env"),
+      "KAIROKU_DAEMON_TOKEN=legacy\n",
+      0o600,
+    );
+    io.writeFile(
+      join(installation.dataRoot, ".secrets.json"),
+      '{"server.auth.token":"x"}\n',
+      0o600,
+    );
+
+    const result = await runEnrollment(io, installation, { backendUrl });
+    expect(result).toEqual({ daemonId: expectedDaemonId, ownerId: expectedOwnerId });
+    expect(io.calls.some((c) => c.includes("--stdin"))).toBe(true);
+  });
+
+  test("KAIROKUD_LINK_TOKEN in token.env still counts as a credential", async () => {
+    const io = baseIo();
+    seedHappyFetches(io);
+    canAcknowledge(io);
+    canLiveProof(io);
+    saveEnrollmentProgress(io, installation, {
+      schemaVersion: 1,
+      installationId,
+      requestId,
+      pollSecret: "poll-secret-value",
+      backendUrl,
+      state: "pending",
+      intervalSeconds: 5,
+      // no installedOwnerId — credential alone ⇒ unknown, not fresh
+    });
+    io.writeFile(join(kairokuHome(io.home), "token.env"), "KAIROKUD_LINK_TOKEN=x\n", 0o600);
 
     await expect(runEnrollment(io, installation, { backendUrl })).rejects.toThrow(
       /installed owner is unknown while a credential exists/,
