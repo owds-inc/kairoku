@@ -14,7 +14,14 @@ import { fakeIo, type FakeIo } from "./testkit";
 const RESOURCE = "https://dev.kairoku.io/api/mcp";
 const TOKEN = "kai_bridge_token";
 
-function fakeApp(opts: { unauthorizedOn?: string } = {}) {
+/** `event: message\ndata: <json>\n\n` per frame, plus a leading `: keepalive` comment — mcp-handler's actual shape. */
+function sseBody(frames: unknown[]): string {
+  return ": keepalive\n\n" + frames.map((f) => `event: message\ndata: ${JSON.stringify(f)}\n\n`).join("");
+}
+
+/** The real app server (`mcp-handler` legacy-stateless mode) answers every POST with SSE, never bare JSON —
+ * this fake matches that production framing so the bridge's actual code path is what these tests exercise. */
+function fakeApp(opts: { unauthorizedOn?: string; framesFor?: (method: string) => unknown[] } = {}) {
   const seen: string[] = [];
   const server = Bun.serve({
     hostname: "127.0.0.1",
@@ -30,13 +37,12 @@ function fakeApp(opts: { unauthorizedOn?: string } = {}) {
         const body = (await req.json()) as { id: number; method: string };
         seen.push(body.method);
         if (opts.unauthorizedOn === body.method) return new Response(null, { status: 401 });
-        if (body.method === "initialize") {
-          return Response.json({ jsonrpc: "2.0", id: body.id, result: {} }, { headers: { "mcp-session-id": "sess-9" } });
-        }
-        if (body.method === "tools/list") {
-          return Response.json({ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "x" }] } });
-        }
-        return Response.json({ jsonrpc: "2.0", id: body.id, result: {} });
+        const frames =
+          opts.framesFor?.(body.method) ??
+          (body.method === "tools/list"
+            ? [{ jsonrpc: "2.0", id: body.id, result: { tools: [{ name: "x" }] } }]
+            : [{ jsonrpc: "2.0", id: body.id, result: {} }]);
+        return new Response(sseBody(frames), { headers: { "content-type": "text/event-stream", "mcp-session-id": "sess-9" } });
       }
       return new Response(null, { status: 404 });
     },
@@ -115,6 +121,24 @@ describe("kairoku mcp-bridge", () => {
     const code = await run([], io);
     expect(code).toBe(1);
     expect(io.errors.join("\n")).toContain("not logged in");
+  });
+
+  test("a multi-frame SSE response (mid-call notification + result) forwards EVERY frame, in order", async () => {
+    const notification = { jsonrpc: "2.0", method: "notifications/progress", params: { progress: 1 } };
+    const app = fakeApp({
+      framesFor: (method) =>
+        method === "tools/call" ? [notification, { jsonrpc: "2.0", id: 3, result: { content: [] } }] : undefined!,
+    });
+    servers.push(app);
+    const io = loggedInIo(app.appUrl, RESOURCE, {
+      stdinLines: () => lines(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: {} })),
+    });
+
+    const code = await run([], io);
+    expect(code).toBe(0);
+    expect(io.lines.length).toBe(2);
+    expect(JSON.parse(io.lines[0]!)).toEqual(notification);
+    expect(JSON.parse(io.lines[1]!)).toEqual({ jsonrpc: "2.0", id: 3, result: { content: [] } });
   });
 
   test("401 mid-stream: error frame on stdout, nonzero exit", async () => {

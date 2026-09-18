@@ -11,7 +11,7 @@
 
 import { join } from "node:path";
 import { kairokuHome, parseEnvFile } from "../daemon/config";
-import { mcpCall } from "./mcp-http";
+import { BRIDGE_TIMEOUT_MS, fetchResourceMetadata, mcpCall } from "./mcp-http";
 import { readMcpLogin } from "./login";
 import type { Io } from "./io";
 
@@ -39,16 +39,11 @@ export async function run(_args: string[], io: Io): Promise<number> {
     return 1;
   }
 
-  const metadataUrl = new URL("/.well-known/oauth-protected-resource/api/mcp", mcp.appUrl).toString();
   let metadataResource: string;
   try {
-    const res = await io.fetch(metadataUrl);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const body = (await res.json()) as { resource?: unknown };
-    if (typeof body.resource !== "string" || !body.resource) throw new Error("no resource field");
-    metadataResource = body.resource;
+    metadataResource = await fetchResourceMetadata(io, mcp.appUrl);
   } catch (e) {
-    io.err(`mcp-bridge: could not fetch ${metadataUrl} — ${(e as Error).message}`);
+    io.err(`mcp-bridge: could not fetch resource metadata — ${(e as Error).message}`);
     return 1;
   }
   if (metadataResource !== mcp.resource) {
@@ -73,7 +68,7 @@ export async function run(_args: string[], io: Io): Promise<number> {
       continue;
     }
     try {
-      const result = await mcpCall(io, url, token, message, sessionId);
+      const result = await mcpCall(io, url, token, message, sessionId, BRIDGE_TIMEOUT_MS);
       if (result.sessionId) sessionId = result.sessionId;
       if (result.status === 401) {
         sawUnauthorized = true;
@@ -84,8 +79,11 @@ export async function run(_args: string[], io: Io): Promise<number> {
         io.out(errorFrame(message.id, `HTTP ${result.status} from the Kairoku app`));
         continue;
       }
-      // A notification (no `id`) gets no reply on the wire either way.
-      if (result.json !== undefined) io.out(JSON.stringify(result.json));
+      // EVERY frame the response carried, in order — a response plus any
+      // mid-call notification or server→client request the app sent before
+      // it, not just the last one (§3B fix round 1, Issue #5). A 202 with no
+      // body (a notification's own ack) yields an empty array and no output.
+      for (const rpc of result.messages) io.out(JSON.stringify(rpc));
     } catch (e) {
       io.out(errorFrame(message.id, `bridge request failed: ${(e as Error).message}`));
     }

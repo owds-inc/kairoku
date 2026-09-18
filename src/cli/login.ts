@@ -15,7 +15,7 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { kairokuHome, normaliseAppUrl } from "../daemon/config";
 import { listenForLink, openLink, setTokenEnv, type LinkPersistPayload } from "./link-callback";
-import { mcpCall } from "./mcp-http";
+import { fetchResourceMetadata, mcpCall } from "./mcp-http";
 import { DEFAULT_APP_URL } from "./provision";
 import type { Io } from "./io";
 
@@ -69,13 +69,9 @@ function writeMcpLogin(io: Io, mcp: McpLoginConfig | null): void {
   io.writeFile(configPath(io), JSON.stringify(config, null, 2) + "\n");
 }
 
-async function fetchMetadataResource(io: Io, appUrl: string): Promise<string> {
-  const url = new URL("/.well-known/oauth-protected-resource/api/mcp", appUrl).toString();
-  const res = await io.fetch(url);
-  if (!res.ok) throw new Error(`metadata fetch failed: HTTP ${res.status} from ${url}`);
-  const body = (await res.json()) as { resource?: unknown };
-  if (typeof body.resource !== "string" || !body.resource) throw new Error(`metadata at ${url} has no resource field`);
-  return body.resource;
+/** The last JSON-RPC message of a call's response — an SSE stream may also carry notifications first. */
+function lastMessage(messages: unknown[]): { result?: unknown; error?: { message?: string } } | undefined {
+  return messages[messages.length - 1] as { result?: unknown; error?: { message?: string } } | undefined;
 }
 
 /** One initialize + tools/list, over the bearer just minted. Never logs the token. */
@@ -89,7 +85,7 @@ async function proveMcpAccess(io: Io, appUrl: string, token: string): Promise<{ 
   });
   if (init.status === 401) throw new Error("unauthorized (401) — the app rejected the minted token");
   if (init.status < 200 || init.status >= 300) throw new Error(`initialize failed: HTTP ${init.status}`);
-  const initBody = init.json as { error?: { message?: string } } | undefined;
+  const initBody = lastMessage(init.messages);
   if (initBody?.error) throw new Error(`initialize error: ${initBody.error.message ?? "unknown"}`);
 
   const list = await mcpCall(
@@ -101,7 +97,7 @@ async function proveMcpAccess(io: Io, appUrl: string, token: string): Promise<{ 
   );
   if (list.status === 401) throw new Error("unauthorized (401) — the app rejected the minted token");
   if (list.status < 200 || list.status >= 300) throw new Error(`tools/list failed: HTTP ${list.status}`);
-  const listBody = list.json as { result?: { tools?: unknown[] }; error?: { message?: string } } | undefined;
+  const listBody = lastMessage(list.messages) as { result?: { tools?: unknown[] }; error?: { message?: string } } | undefined;
   if (listBody?.error) throw new Error(`tools/list error: ${listBody.error.message ?? "unknown"}`);
   return { toolCount: listBody?.result?.tools?.length ?? 0 };
 }
@@ -171,7 +167,7 @@ export async function run(args: string[], io: Io): Promise<number> {
   const expectedResource = values.resource ?? captured.resource;
 
   try {
-    const metadataResource = await fetchMetadataResource(io, appUrl);
+    const metadataResource = await fetchResourceMetadata(io, appUrl);
     if (metadataResource !== expectedResource) {
       throw new Error(`resource metadata mismatch: the app says ${metadataResource}, expected ${expectedResource}`);
     }

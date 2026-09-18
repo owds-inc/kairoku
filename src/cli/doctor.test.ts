@@ -281,6 +281,9 @@ describe("kairoku doctor", () => {
     io.modes["/home/tester/.kairoku/token.env"] = 0o600;
     const realFetch = io.fetch;
     io.fetch = async (url, init) => {
+      if (url === "https://mcp.test/.well-known/oauth-protected-resource/api/mcp") {
+        return Response.json({ resource: "https://mcp.test/api/mcp" });
+      }
       if (url === "https://mcp.test/api/mcp") {
         return Response.json({ jsonrpc: "2.0", id: 1, result: {} });
       }
@@ -303,11 +306,57 @@ describe("kairoku doctor", () => {
     io.modes["/home/tester/.kairoku/token.env"] = 0o600;
     const realFetch = io.fetch;
     io.fetch = async (url, init) => {
+      if (url === "https://mcp.test/.well-known/oauth-protected-resource/api/mcp") {
+        return Response.json({ resource: "https://mcp.test/api/mcp" });
+      }
       if (url === "https://mcp.test/api/mcp") return new Response(null, { status: 401 });
       return realFetch(url, init);
     };
     const list = await checks(io, { probe: () => true });
     expect(byName(list, "kairoku mcp-bridge reachable")).toMatchObject({ status: "FAIL", detail: expect.stringContaining("kairoku login --replace") });
+  });
+
+  test("§3B fix round 1 #4 — an unreachable app is a WARN, not a FAIL (doctor stays a usable offline gate)", async () => {
+    const io = linuxDaemon();
+    io.files["/home/tester/.kairoku/config.json"] = JSON.stringify({
+      listen: { host: "10.0.0.5", port: 7801 },
+      appUrl: "https://app.test",
+      repoPath: "/home/tester/work/kairoku",
+      mcp: { appUrl: "https://mcp.test", ownerId: "org_1", resource: "https://mcp.test/api/mcp" },
+    });
+    io.files["/home/tester/.kairoku/token.env"] = "KAIROKU_DAEMON_TOKEN=secret\nKAIROKU_MCP_TOKEN=kai_bridge\n";
+    io.modes["/home/tester/.kairoku/token.env"] = 0o600;
+    const realFetch = io.fetch;
+    io.fetch = async (url, init) => {
+      if (url === "https://mcp.test/.well-known/oauth-protected-resource/api/mcp") {
+        throw new Error("fetch failed: network is unreachable");
+      }
+      return realFetch(url, init);
+    };
+    const list = await checks(io, { probe: () => true });
+    expect(byName(list, "kairoku mcp-bridge reachable")).toMatchObject({ status: "WARN" });
+    expect(await run([], io)).toBe(0);
+  });
+
+  test("§3B fix round 1 #4 — a post-login resource-metadata mismatch FAILs the bridge check", async () => {
+    const io = linuxDaemon();
+    io.files["/home/tester/.kairoku/config.json"] = JSON.stringify({
+      listen: { host: "10.0.0.5", port: 7801 },
+      appUrl: "https://app.test",
+      repoPath: "/home/tester/work/kairoku",
+      mcp: { appUrl: "https://mcp.test", ownerId: "org_1", resource: "https://mcp.test/api/mcp" },
+    });
+    io.files["/home/tester/.kairoku/token.env"] = "KAIROKU_DAEMON_TOKEN=secret\nKAIROKU_MCP_TOKEN=kai_bridge\n";
+    io.modes["/home/tester/.kairoku/token.env"] = 0o600;
+    const realFetch = io.fetch;
+    io.fetch = async (url, init) => {
+      if (url === "https://mcp.test/.well-known/oauth-protected-resource/api/mcp") {
+        return Response.json({ resource: "https://different.test/api/mcp" });
+      }
+      return realFetch(url, init);
+    };
+    const list = await checks(io, { probe: () => true });
+    expect(byName(list, "kairoku mcp-bridge reachable")).toMatchObject({ status: "FAIL", detail: expect.stringContaining("resource metadata mismatch") });
   });
 
   test("§3B — a stale codex `--url .../api/mcp` entry is a WARN naming `kairoku mcp setup`", async () => {
