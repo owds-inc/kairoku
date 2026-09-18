@@ -175,16 +175,30 @@ export function installedAuthorityOwner(progress: EnrollmentProgress | null): st
     : undefined);
 }
 
+function hasRustSecretsToken(io: Io, path: string): boolean {
+  if (!io.exists(path)) return false;
+  const raw = io.readFile(path);
+  if (!raw) return true; // unreadable → fail safe, treat as credential present
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed?.["kairoku.token"] === "string" && parsed["kairoku.token"].length > 0;
+  } catch {
+    return true; // malformed JSON → fail safe, treat as credential present
+  }
+}
+
 function hasCredentialHint(io: Io, installation: Installation): boolean {
-  // Secrets live under the Rust data root; also accept legacy token.env link key.
+  // Only Rust link credentials count here. The Bun predecessor's
+  // KAIROKU_DAEMON_TOKEN is inventoried by migration, not a Rust credential —
+  // a linked Bun predecessor must be able to enroll Rust for the first time.
   const secrets = join(installation.dataRoot, ".secrets.json");
   const legacySecrets = join(installation.dataRoot, "secrets.json");
-  if (io.exists(secrets) || io.exists(legacySecrets)) return true;
+  if (hasRustSecretsToken(io, secrets) || hasRustSecretsToken(io, legacySecrets)) return true;
   const tokenEnv = join(kairokuHome(io.home), "token.env");
   const raw = io.readFile(tokenEnv);
   if (!raw) return false;
   const parsed = parseEnvFile(raw);
-  return Boolean(parsed.KAIROKUD_LINK_TOKEN || parsed.KAIROKU_DAEMON_TOKEN);
+  return Boolean(parsed.KAIROKUD_LINK_TOKEN);
 }
 
 /**
