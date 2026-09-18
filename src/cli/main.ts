@@ -10,6 +10,9 @@ import { io, type Io } from "./io";
 import * as daemon from "./daemon";
 import * as doctor from "./doctor";
 import * as env from "./env";
+import * as login from "./login";
+import * as mcpBridge from "./mcp-bridge";
+import * as mcpSetup from "./mcp-setup";
 import * as plugin from "./plugin";
 import * as setup from "./setup";
 import * as update from "./update";
@@ -22,6 +25,12 @@ export const usage = `kairoku ${version} — the Kairoku CLI
   kairoku doctor                   verify this machine, change nothing; nonzero on FAIL
   kairoku daemon [install|start|stop|status|drain|update|prune|migrate]
                                    the orchestration daemon: foreground, or as a service
+  kairoku login [--app-url <url>] [--resource <url>] [--replace]
+                                   sign in for MCP access (a coding agent's Kairoku tools)
+  kairoku logout                   remove the local MCP token; prints the revoke URL
+  kairoku mcp setup [--agent codex|claude|all]
+                                   wire kairoku mcp-bridge into a coding agent as stdio MCP
+  kairoku mcp-bridge                stdio↔HTTP MCP bridge; run by a coding agent, not by hand
   kairoku plugin install|update|status
                                    the Claude Code plugin, through the claude CLI
   kairoku env set|import|list|rm [--repo <owner/name>] [--profile <name>]
@@ -30,6 +39,15 @@ export const usage = `kairoku ${version} — the Kairoku CLI
   kairoku version
   kairoku help`;
 
+async function mcpRun(args: string[], io: Io): Promise<number> {
+  const [sub, ...rest] = args;
+  if (sub !== "setup") {
+    io.err(`kairoku mcp: unknown subcommand ${JSON.stringify(sub ?? "")}\n\n${mcpSetup.usage}`);
+    return 2;
+  }
+  return mcpSetup.run(rest, io);
+}
+
 const commands: Record<string, { usage: string; run: (args: string[], io: Io) => Promise<number> }> = {
   setup,
   doctor,
@@ -37,6 +55,10 @@ const commands: Record<string, { usage: string; run: (args: string[], io: Io) =>
   plugin,
   env,
   update,
+  login: { usage: login.usage, run: login.run },
+  logout: { usage: login.logoutUsage, run: login.logoutRun },
+  mcp: { usage: mcpSetup.usage, run: mcpRun },
+  "mcp-bridge": { usage: mcpBridge.usage, run: mcpBridge.run },
 };
 
 export async function main(argv: string[], io: Io): Promise<number> {
